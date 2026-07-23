@@ -1,0 +1,13 @@
+{
+  "name": "Lumen — Document Intelligence",
+  "short_name": "Lumen",
+  "description": "Turns billing documents into an auditable database. Runs entirely in your browser.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#EDF0F2",
+  "theme_color": "#4C2082",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
