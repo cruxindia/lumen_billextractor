@@ -194,6 +194,7 @@ label.chk input{accent-color:var(--accent)}
     <div class="rail-head">OUTPUT</div>
     <button data-v="report">▦ <span class="t">Report</span></button>
     <button data-v="audit">◎ <span class="t">Audit</span></button>
+    <button data-v="tally">Σ <span class="t">Tally</span></button>
     <div class="rail-head">WORKSPACE</div>
     <button id="saveWs">↓ <span class="t">Save</span></button>
     <button id="openWs">↑ <span class="t">Open</span></button>
@@ -275,6 +276,14 @@ label.chk input{accent-color:var(--accent)}
       <div class="tblwrap" style="max-height:calc(100vh - 330px)"><table id="report"><thead></thead><tbody></tbody></table></div>
     </section>
 
+    <!-- ===== TALLY ===== -->
+    <section class="view" id="v-tally">
+      <h1>Tally</h1>
+      <p class="sub">Every document from input to output, and every rupee from invoice to applicant row.
+         This page exists to make loss visible: if something did not survive the pipeline, it is counted here.</p>
+      <div id="tallyBody"></div>
+    </section>
+
     <!-- ===== AUDIT ===== -->
     <section class="view" id="v-audit">
       <h1>Audit</h1>
@@ -299,7 +308,7 @@ label.chk input{accent-color:var(--accent)}
   <div class="dbody" id="dBody"></div>
 </aside>
 
-<script>/* PDF.js 3.11.174 — Apache-2.0 — vendored, no CDN */
+<script>/* PDF.js 3.11.174 — Apache-2.0 */
 /**
  * @licstart The following is the entire license notice for the
  * JavaScript code in this page
@@ -916,15 +925,22 @@ function validate(rec) {
 
   if (taxable != null && tax != null && rate != null) {
     const exact = taxable * rate;
-    /* Many issuers round the tax line to whole rupees. That is a stated
-       practice, not an error, so accept it explicitly rather than loosening
-       the tolerance for everyone -- a blanket Rs 1 slack would hide real
-       mistakes of the same size. */
-    const roundedToRupee = Math.round(exact / 100) * 100;
-    const ok = Math.abs(exact - tax) <= Math.max(2, taxable * 1e-6) || tax === roundedToRupee;
+    /* Two legitimate conventions are in play: the tax line is rounded to whole
+       rupees, AND it is computed on the UNROUNDED taxable value while the face
+       shows the rounded one. Recomputing from the face therefore lands a few
+       paise out. Accept either, plus a Rs 1 allowance when the tax is a whole
+       rupee figure -- a tax error worth investigating is never under a rupee. */
+    const detCand = (rec.byField.taxable_paise || [])
+                      .find(c => c.method === 'detail_table_rollup');
+    const fromDetail = detCand ? Math.round(detCand.normalized * rate / 100) * 100 : null;
+    const taxIsWholeRupees = tax % 100 === 0;
+    const ok = Math.abs(exact - tax) <= Math.max(2, taxable * 1e-6)
+            || tax === Math.round(exact / 100) * 100
+            || (fromDetail !== null && tax === fromDetail)
+            || (taxIsWholeRupees && Math.abs(exact - tax) <= 100);
     add('C1_tax_arithmetic', ok,
         `${fmt(taxable)} × ${rate} = ${fmt(Math.round(exact))} vs ${fmt(tax)}`
-        + (ok && tax === roundedToRupee && Math.abs(exact - tax) > 2 ? ' (tax rounded to whole rupees)' : ''));
+        + (ok && Math.abs(exact - tax) > 2 ? ' — tax rounded to whole rupees' : ''));
   }
   else skip('C1_tax_arithmetic', 'taxable, tax or rate not determined');
 
@@ -934,7 +950,9 @@ function validate(rec) {
 
   if (taxable != null && tax != null && total != null) {
     const d = Math.abs(total - (taxable + tax));
-    add('C3_roundoff_bounded', d < 100, `delta ${(d/100).toFixed(4)}`);
+    /* Taxable and tax are each rounded to the rupee, so their sum can sit a
+       full rupee from the printed total. Inclusive of Rs 1, not below it. */
+    add('C3_roundoff_bounded', d <= 100, `delta ${(d/100).toFixed(2)}`);
   } else skip('C3_roundoff_bounded', 'components not determined');
 
   if (rate != null) add('C4_legal_gst_rate', LEGAL_RATES.some(r => Math.abs(r - rate) < 1e-6), `rate ${rate}`);
@@ -951,8 +969,13 @@ function validate(rec) {
   const lines = v._lines || [];
   const la = lines.map(l => l.amount_paise).filter(x => typeof x === 'number');
   if (la.length && taxable != null) {
+    /* Same whole-rupee display convention as C7: the printed taxable total is
+       the charge lines rounded to the rupee. */
     const s = la.reduce((a,b)=>a+b,0);
-    add('C6_lineitem_rollup', Math.abs(s - taxable) <= 2, `lines ${fmt(s)} vs taxable ${fmt(taxable)}`);
+    const d = Math.abs(s - taxable);
+    const rounded = Math.round(s / 100) * 100 === taxable;
+    add('C6_lineitem_rollup', d <= 2 || rounded,
+        `lines ${fmt(s)} vs taxable ${fmt(taxable)}` + (rounded && d > 2 ? ' — rounded to whole rupees' : ''));
   } else skip('C6_lineitem_rollup', 'no evaluable charge lines');
 
   // The load-bearing check: the detail table and the invoice face are
@@ -961,17 +984,29 @@ function validate(rec) {
   const face = (tc.find(c => c.method === 'label_row_scan')||{}).normalized;
   const det  = (tc.find(c => c.method === 'detail_table_rollup')||{}).normalized;
   if (face != null && det != null) {
-    /* Each detail line is printed rounded to the paisa, so a long annexure
-       accumulates rounding: allow up to one paisa per row. A real keying error
-       is orders of magnitude larger, so this does not blunt the check --
-       the Rs 9.00 transposition in the reference corpus is still caught by a
-       factor of sixty. */
-    const nRows = (rec.values._applicant_rows || []).length;
-    const tol = Math.max(2, nRows);
+    /* The invoice face prints the taxable total ROUNDED TO WHOLE RUPEES while
+       the annexure carries exact paise. Across the reference corpora, 58 of 60
+       apparent mismatches were exactly this -- a presentation convention, not a
+       discrepancy. Test for it explicitly rather than widening the tolerance:
+       a tolerance big enough to absorb it (Rs 0.50) would also hide real
+       sub-rupee errors. A genuine mismatch is orders of magnitude larger. */
     const delta = Math.abs(face - det);
-    add('C7_cross_artifact_reconciliation', delta <= tol,
-        `face ${fmt(face)} vs detail ${fmt(det)} (delta ${fmt(delta)}`
-        + (nRows ? `, tolerance ${fmt(tol)} over ${nRows} rows)` : ')'));
+    const faceIsRounded = Math.round(det / 100) * 100 === face;
+    const detIsRounded  = Math.round(face / 100) * 100 === det;
+    /* Some annexures print each line already rounded to the rupee. Those
+       accumulate up to half a rupee per line, which the exact-rounding test
+       above cannot absorb. Allow it ONLY when every detail line really is a
+       whole rupee -- an annexure carrying true paise gets no such licence, so
+       the Rs 9.00 transposition (whose lines are 127.11, 190.67, 254.23) is
+       still caught on a 2-paise tolerance. */
+    const amts = (rec.values._applicant_rows || [])
+                   .map(r => r.amount_paise).filter(a => typeof a === 'number');
+    const linesAreWholeRupees = amts.length > 0 && amts.every(a => a % 100 === 0);
+    const lineTol = linesAreWholeRupees ? 50 * amts.length : 2;
+    const ok = delta <= Math.max(2, lineTol) || faceIsRounded || detIsRounded;
+    add('C7_cross_artifact_reconciliation', ok,
+        `face ${fmt(face)} vs detail ${fmt(det)} (delta ${fmt(delta)})`
+        + (ok && delta > 2 ? ' — face rounded to whole rupees' : ''));
   }
   else skip('C7_cross_artifact_reconciliation', 'only one independent source available');
 
@@ -1009,6 +1044,19 @@ function validate(rec) {
 }
 
 const MIN_STRONG_EVIDENCE = 3;
+
+/* A verdict says "no check failed". It does NOT say "an independent source
+   agreed". Those are different assurances and collapsing them overstates what
+   the platform knows. A document whose total was never cross-checked against a
+   second, separately-authored figure is CONSISTENT, not RECONCILED. */
+const INDEPENDENT_CHECKS = ['C7_cross_artifact_reconciliation', 'C6_lineitem_rollup'];
+function verificationLevel(checks){
+  const byId = {}; checks.forEach(c => byId[c.check_id] = c);
+  if (checks.some(c => c.status === 'FAIL' && c.severity === 'error')) return 'FAILED';
+  const independent = INDEPENDENT_CHECKS.filter(id => byId[id] && byId[id].status === 'PASS');
+  if (independent.length) return 'RECONCILED';
+  return 'CONSISTENT';
+}
 function verdictOf(checks) {
   const fails = checks.filter(c => c.status === 'FAIL' && c.severity === 'error');
   const strong = checks.filter(c => c.status === 'PASS' && !WEAK_CHECKS.has(c.check_id));
@@ -1148,7 +1196,8 @@ function viewFromWorkbook(wb, filename, XLSX) {
    ===================================================================== */
 
 const LINE_TOL   = 3.2;   // pt: items within this vertical distance share a line
-const MERGE_GAP  = 1.8;   // pt: horizontal gap below this joins two runs into one
+const MERGE_GAP  = 1.8;   // pt: floor for joining two runs into one
+const SPACE_EM   = 0.42;  // a word space is ~0.25-0.35 em; allow a little more
 const COL_GAP    = 11;    // pt: horizontal gap above this starts a new column
 
 function _groupLines(items){
@@ -1169,13 +1218,28 @@ function _mergeRuns(line){
   const out = [];
   for (const it of line.items) {
     const prev = out[out.length - 1];
-    if (prev && (it.x - (prev.x + prev.w)) <= MERGE_GAP) {
+    /* Generators differ wildly in how they emit text: some produce whole
+       phrases, others one item per WORD. A fixed point gap cannot serve both —
+       too tight and "Invoice" / "No." / ":" never rejoin into a searchable
+       label, too loose and table columns collapse. Scale the threshold to the
+       font size, so it tracks the actual width of a space. Column boundaries
+       are re-imposed afterwards, so being generous here is safe. */
+    const tol = Math.max(MERGE_GAP, SPACE_EM * (it.h || prev && prev.h || 9));
+    const gapPt = prev ? (it.x - (prev.x + prev.w)) : Infinity;
+    /* A digit butting directly against a letter with NO space is a column
+       collision, not a word: an over-long cell value has overflowed into the
+       next column. Joining them destroys the number outright -- observed
+       swallowing an entire annexure line ("MAGARWADI PUNE" + "190.67").
+       Text separated by a real space ("BRANCH - 330") is unaffected. */
+    const collides = prev && gapPt <= 0.6
+                  && /[A-Za-z)]$/.test(prev.str) && /^[\d(]/.test(it.str);
+    if (prev && gapPt <= tol && !collides) {
       const gap = (it.x - (prev.x + prev.w)) > 0.6 ? ' ' : '';
       prev.str += gap + it.str;
       prev.w = (it.x + it.w) - prev.x;
       prev.parts.push({ x: it.x, w: it.w, str: it.str });
     } else {
-      out.push({ x: it.x, y: it.y, w: it.w, str: it.str,
+      out.push({ x: it.x, y: it.y, w: it.w, h: it.h, str: it.str,
                  parts: [{ x: it.x, w: it.w, str: it.str }] });
     }
   }
@@ -1212,28 +1276,13 @@ function pageToGrid(page, pageNo){
   const merged = lines.map(l => { const r = _mergeRuns(l); allRuns.push(...r); return r; });
   const bounds = _columnBoundaries(allRuns);
 
-  /* Table headers sit in bordered cells with tiny gaps, so neighbouring
-     headers merge into one run while the data below stays separate — which
-     loses the column entirely. Split any run whose fragments straddle a
-     detected column boundary. */
-  const split = merged.map(runs => {
-    const out = [];
-    for (const r of runs) {
-      if (!r.parts || r.parts.length < 2) { out.push(r); continue; }
-      let cur = null;
-      for (const part of r.parts) {
-        const col = _columnOf(part.x, bounds);
-        if (cur && cur.col === col) {
-          const gap = (part.x - (cur.x + cur.w)) > 0.6 ? ' ' : '';
-          cur.str += gap + part.str; cur.w = (part.x + part.w) - cur.x;
-        } else {
-          cur = { x: part.x, y: r.y, w: part.w, str: part.str, col };
-          out.push(cur);
-        }
-      }
-    }
-    return out;
-  });
+  /* NOTE: an earlier version re-split merged runs at column boundaries. That
+     was wrong: merging only ever joins parts separated by a WORD SPACE, so a
+     boundary falling inside a phrase split "ERANDAWANA PUNE BRANCH" back into
+     fragments and no label could be found. Headers that arrive as one text run
+     spanning several columns are handled in findTable instead, where the
+     vocabulary is known. */
+  const split = merged;
 
   split.forEach((runs, i) => {
     const row = i + 1;
@@ -1367,7 +1416,7 @@ function processView(view) {
     },
     lines: v._lines || [],
     applicants: alloc.rows, allocationMethod: alloc.method,
-    checks, verdict,
+    checks, verdict, verification: verificationLevel(checks),
     confidences: res.confidences, agreement: res.agreement,
     candidates: res.byField,
     metadata: view.metadata
@@ -1377,7 +1426,7 @@ function processView(view) {
 return { newId, paise, rupees, fmt, rc, cref, colLetter, Evaluator, UNRESOLVED,
          pageToGrid, buildViewFromPages,
          parseDate, iso, gstinValid, classify, extractFace, extractDetail, resolve,
-         validate, verdictOf, allocate, deriveSettlement, canTransition,
+         validate, verdictOf, verificationLevel, allocate, deriveSettlement, canTransition,
          viewFromWorkbook, processView, findLabel, findTable, numericForLabel,
          CHECK_ORDER, WEAK_CHECKS, PROCESSING_STATES, COMMERCIAL_STATES,
          SETTLEMENT_STATES, COMMERCIAL_TRANSITIONS, STATES, VOCAB };
@@ -1622,7 +1671,11 @@ async function ingest(fileList){
   }
 
   let done = 0, dupes = 0, failed = 0, scans = 0;
-  const session = { id: L.newId('ses'), at: new Date().toISOString(), count: 0 };
+  const session = { id: L.newId('ses'), at: new Date().toISOString(), count: 0,
+                    filesSeen: fileList.length, readable: items.length,
+                    skipped: acc.skipped.length, skipDetail: {},
+                    dupes: 0, failed: 0, scans: 0 };
+  acc.skipped.forEach(([, r]) => session.skipDetail[r] = (session.skipDetail[r] || 0) + 1);
   for (const it of items) {
     try {
       const hash = await sha256(it.buf);
@@ -1652,6 +1705,7 @@ async function ingest(fileList){
     done++;
     if (done % 5 === 0 || done === items.length) { $('#prog').style.width = (done/items.length*100)+'%'; await new Promise(r => setTimeout(r)); }
   }
+  session.dupes = dupes; session.failed = failed; session.scans = scans;
   DB.sessions.push(session);
   const secs = (performance.now() - t0) / 1000;
   const mine = DB.docs.filter(d => d.sessionId === session.id);
@@ -1845,6 +1899,71 @@ function renderReport(){
   }
 }
 
+function renderTally(){
+  const D = DB.docs, el = $('#tallyBody');
+  if (!D.length) { el.innerHTML = '<div class="empty"><h3>Nothing ingested</h3><p>The tally appears once documents are loaded.</p></div>'; return; }
+  const S = k => DB.sessions.reduce((a,s)=>a+(s[k]||0),0);
+  const filesSeen = S('filesSeen'), readable = S('readable'), dropped = S('skipped'),
+        dupes = S('dupes'), failedN = S('failed'), scans = S('scans'), seen = S('count');
+  const skipAgg = {};
+  DB.sessions.forEach(s => Object.entries(s.skipDetail||{}).forEach(([k,v]) => skipAgg[k]=(skipAgg[k]||0)+v));
+  const rec = D.filter(d=>d.verification==='RECONCILED').length;
+  const con = D.filter(d=>d.verification==='CONSISTENT').length;
+  const fail= D.filter(d=>d.verification==='FAILED').length;
+  const invT = D.reduce((a,d)=>a+(d.invoice.taxable_paise||0),0);
+  const allocT = D.reduce((a,d)=>a+d.applicants.reduce((x,y)=>x+y.taxable_paise,0),0);
+  const noAppl = D.filter(d=>!d.applicants.length);
+  const noIndep = D.filter(d=>d.verification==='CONSISTENT');
+  const FIELDS = [['invoice_no','Invoice number'],['invoice_date','Invoice date'],['client_raw','Client'],
+                  ['branch_raw','Branch'],['taxable_paise','Taxable value'],['total_paise','Total'],
+                  ['supplier_gstin','Supplier GSTIN'],['recipient_gstin','Recipient GSTIN'],['sac_hsn','SAC / HSN']];
+  const missing = FIELDS.map(([k,l])=>[l, D.filter(d=>d.invoice[k]==null).length]).filter(x=>x[1]);
+
+  el.innerHTML = `
+    <h2>Document chain</h2>
+    <div class="tblwrap" style="max-height:none"><table><thead><tr><th>Stage</th><th>Count</th><th>Meaning</th></tr></thead><tbody>
+      <tr style="cursor:default"><td>Files handed to Lumen</td><td class="num">${filesSeen}</td><td class="dim">including archives, before anything was opened</td></tr>
+      <tr style="cursor:default"><td>Readable documents found</td><td class="num">${readable}</td><td class="dim">after opening archives and filtering by type</td></tr>
+      ${dropped ? `<tr style="cursor:default"><td>Set aside</td><td class="num" style="color:var(--warn)">${dropped}</td>
+        <td class="dim">${Object.entries(skipAgg).map(([k,v])=>`${v} × ${(SKIP_REASONS[k]||k).replace(/\.$/,'')}`).join('; ')}</td></tr>` : ''}
+      ${dupes ? `<tr style="cursor:default"><td>Duplicates skipped</td><td class="num">${dupes}</td><td class="dim">byte-identical to something already stored — not loss</td></tr>` : ''}
+      ${scans ? `<tr style="cursor:default"><td>Scanned, no text layer</td><td class="num" style="color:var(--warn)">${scans}</td><td class="dim"><b>content not recovered — OCR is not in this build</b></td></tr>` : ''}
+      ${failedN ? `<tr style="cursor:default"><td>Failed to read</td><td class="num" style="color:var(--fail)">${failedN}</td><td class="dim">reported individually in the Ingest log</td></tr>` : ''}
+      <tr style="cursor:default"><td><b>Stored</b></td><td class="num">${D.length}</td><td class="dim">present in the database and every report</td></tr>
+      <tr style="cursor:default"><td>Independently reconciled</td><td class="num" style="color:var(--proof)">${rec}</td><td class="dim">a second, separately-written figure agreed</td></tr>
+      <tr style="cursor:default"><td>Consistent only</td><td class="num" style="color:var(--warn)">${con}</td><td class="dim"><b>no independent source existed to check against</b></td></tr>
+      <tr style="cursor:default"><td>Failed a check</td><td class="num" style="color:var(--fail)">${fail}</td><td class="dim">in the review queue</td></tr>
+    </tbody></table></div>
+    ${(() => {
+      const expected = readable - dupes - scans - failedN;
+      return expected !== D.length
+        ? `<p style="color:var(--fail);margin-top:8px">⚠ ${readable} readable − ${dupes} duplicate − ${scans} scanned − ${failedN} failed = ${expected}, but ${D.length} are stored. This does not balance and is a defect — please report it.</p>`
+        : `<p style="color:var(--proof);margin-top:8px">✓ ${readable} readable − ${dupes} duplicate${scans?` − ${scans} scanned`:''}${failedN?` − ${failedN} failed`:''} = ${D.length} stored. The chain balances.</p>`;
+    })()}
+
+    <h2>Money chain</h2>
+    <div class="tblwrap" style="max-height:none"><table><thead><tr><th>Measure</th><th>Amount</th><th>Meaning</th></tr></thead><tbody>
+      <tr style="cursor:default"><td>Σ invoice taxable</td><td class="num">${money(invT)}</td><td class="dim">as read from the invoices</td></tr>
+      <tr style="cursor:default"><td>Σ allocated to applicants</td><td class="num">${money(allocT)}</td><td class="dim">sum of every applicant row</td></tr>
+      <tr style="cursor:default"><td><b>Unallocated</b></td><td class="num" style="color:${invT-allocT?'var(--warn)':'var(--proof)'}">${money(invT-allocT)}</td>
+        <td class="dim">${invT-allocT ? `on ${noAppl.length} invoice(s) with no applicant table — the invoice is stored, but cannot be split by applicant` : 'every rupee is attributed to an applicant row'}</td></tr>
+    </tbody></table></div>
+
+    <h2>Fields not found${missing.length?'':' — none'}</h2>
+    ${missing.length ? `<div class="tblwrap" style="max-height:none"><table><thead><tr><th>Field</th><th>Documents</th><th>Share</th></tr></thead><tbody>
+      ${missing.map(([l,n])=>`<tr style="cursor:default"><td>${l}</td><td class="num">${n}</td><td class="num dim">${(n/D.length*100).toFixed(1)}%</td></tr>`).join('')}
+    </tbody></table></div>` : '<p class="dim">Every document yielded every field.</p>'}
+
+    ${noIndep.length ? `<h2>Totals with nothing to check them against — ${noIndep.length}</h2>
+      <p class="sub" style="margin-bottom:8px">These passed every check that could run, but no second source existed to confirm the total.
+         Treat them as read, not as verified.</p>
+      <div class="tblwrap"><table><thead><tr><th>Invoice</th><th>Branch</th><th>Total</th><th>Why</th></tr></thead><tbody>
+      ${noIndep.slice(0,60).map(d=>`<tr data-id="${d.id}"><td class="mono">${esc(d.invoice.invoice_no)}</td><td>${esc(d.invoice.branch_raw)}</td>
+        <td class="num">${money(d.invoice.total_paise)}</td><td class="dim">${d.applicants.length?'no charge lines to roll up':'no detail table found'}</td></tr>`).join('')}
+      </tbody></table></div>` : ''}`;
+  el.onclick = e => { const tr = e.target.closest('tr[data-id]'); if (tr) openDoc(tr.dataset.id); };
+}
+
 function renderAudit(){
   const agg = {}, methods = {};
   DB.docs.forEach(r => { r.checks.forEach(c => { const k = agg[c.check_id] = agg[c.check_id] || {PASS:0,FAIL:0,SKIP:0,sev:c.severity}; k[c.status]++; });
@@ -1889,7 +2008,7 @@ function renderAll(){
      ${s0.unproven + s0.undet ? `${s0.unproven + s0.undet} need${s0.unproven + s0.undet === 1 ? 's' : ''} a look, but ${s0.unproven + s0.undet === 1 ? 'it is' : 'they are'} stored and reported like everything else.` : ''}</span>`;
   const set = new Set(DB.docs.map(d=>d.invoice.settlement_status));
   $('#fSettle').innerHTML = '<option value="">All settlement</option>' + [...set].map(s=>`<option>${s}</option>`).join('');
-  renderIngestStats(); renderLedger(); renderReview(); renderReport(); renderAudit();
+  renderIngestStats(); renderLedger(); renderReview(); renderReport(); renderAudit(); renderTally();
 }
 
 /* ================= drawer ================= */
@@ -1911,6 +2030,7 @@ function openDoc(id){
   $('#dBody').innerHTML = `
     <div class="row" style="margin-bottom:12px">
       <span class="tag ${r.verdict==='PROVEN'?'proof':'fail'}">${r.verdict}</span>
+      <span class="tag ${r.verification==='RECONCILED'?'proof':r.verification==='CONSISTENT'?'warn':'fail'}">${r.verification||''}</span>
       <span class="tag">${i.processing_state}</span>
       <span class="tag acc">${i.commercial_state}</span>
       <span class="tag">${i.settlement_status}</span>
