@@ -9,7 +9,7 @@
   style-src 'unsafe-inline';
   img-src 'self' data:;
   font-src 'self';
-  connect-src 'self' http://127.0.0.1:8420 http://localhost:8420;
+  connect-src 'self' http://127.0.0.1:8420 http://localhost:8420 https://czdjbbhxboweawqbjywr.supabase.co;
   worker-src 'self' blob:;
   manifest-src 'self';
   frame-ancestors 'none';
@@ -195,6 +195,8 @@ label.chk input{accent-color:var(--accent)}
     <button data-v="report">▦ <span class="t">Report</span></button>
     <button data-v="audit">◎ <span class="t">Audit</span></button>
     <button data-v="tally">Σ <span class="t">Tally</span></button>
+    <div class="rail-head">DATABASE</div>
+    <button data-v="cloud">⛁ <span class="t">Sync</span><span class="num" id="nCloud"></span></button>
     <div class="rail-head">WORKSPACE</div>
     <button id="saveWs">↓ <span class="t">Save</span></button>
     <button id="openWs">↑ <span class="t">Open</span></button>
@@ -275,6 +277,26 @@ label.chk input{accent-color:var(--accent)}
         <button class="btn" id="expDef">Export definition</button>
       </div>
       <div class="tblwrap" style="max-height:calc(100vh - 330px)"><table id="report"><thead></thead><tbody></tbody></table></div>
+    </section>
+
+    <!-- ===== CLOUD SYNC ===== -->
+    <section class="view" id="v-cloud">
+      <h1>Central database</h1>
+      <p class="sub">Push every ingested bill to the shared Supabase database, and pull the whole history back
+         down so this tool shows everything ever processed — not just this session. Duplicates are handled by
+         the database itself: the same bill can never be stored twice.</p>
+
+      <div class="assure">
+        <span>⛁</span><span>Connected to <b>cruxindia's Project</b>. The key used here is the <b>publishable</b>
+        key, which is safe in a browser — the database's own row-security rules decide what it can touch.</span></div>
+
+      <div class="row" style="margin:14px 0">
+        <button class="btn pri" id="cloudPush">Push this session to database</button>
+        <button class="btn" id="cloudPull">Pull full history down</button>
+        <span class="pill" id="cloudStatus"><i class="dot"></i> Ready</span>
+      </div>
+
+      <div id="cloudBody"></div>
     </section>
 
     <!-- ===== TALLY ===== -->
@@ -1720,6 +1742,74 @@ function stripHTML(checks){
   }).join('') + '</span>';
 }
 
+/* ================= central database (Supabase) ================= */
+const Cloud = {
+  url: 'https://czdjbbhxboweawqbjywr.supabase.co/rest/v1',
+  key: 'sb_publishable_J7fFRVLVB_h5SHZcquWfXA_p_O30PkF',
+
+  headers(extra){ return Object.assign({
+    'apikey': this.key, 'Authorization': 'Bearer ' + this.key,
+    'Content-Type': 'application/json' }, extra || {}); },
+
+  /* map a processed doc to the flat invoice row the schema expects */
+  invoiceRow(doc){
+    const i = doc.invoice;
+    return {
+      content_hash: doc.hash,
+      invoice_no: i.invoice_no, invoice_date: i.invoice_date,
+      client_raw: i.client_raw, branch_raw: i.branch_raw, branch_email: i.branch_email,
+      supplier_gstin: i.supplier_gstin, recipient_gstin: i.recipient_gstin, sac_hsn: i.sac_hsn,
+      taxable_paise: i.taxable_paise, cgst_paise: i.cgst_paise, sgst_paise: i.sgst_paise,
+      igst_paise: i.igst_paise, tax_total_paise: i.tax_total_paise, round_off_paise: i.round_off_paise,
+      total_paise: i.total_paise, tax_rate: i.tax_rate,
+      face_total_paise: i.face_total_paise, annexure_total_paise: i.annexure_total_paise,
+      match_status: i.match_status, match_diff_paise: i.match_diff_paise,
+      rows_read: i.rows_read, rows_printed: i.rows_printed,
+      verdict: doc.verdict, verification: doc.verification, source_file: doc.filename
+    };
+  },
+
+  /* raw per-verification lines — the zero-loss detail */
+  lineRows(doc){
+    const raw = ((doc.candidates && doc.candidates._applicant_rows || [])[0] || {}).normalized || [];
+    if (raw.length) return raw.map((r,idx) => ({
+      line_no: parseInt(r.serial,10) || (idx+1),
+      applicant_name: r.applicant_name || null, receipt_date: r.receipt_date || null,
+      service_type: r.service_type || null, location: r.location || null,
+      amount_paise: r.amount_paise ?? null, tax_paise: r.tax_paise ?? null,
+      gross_paise: (r.amount_paise!=null?r.amount_paise:0) + (r.tax_paise!=null?r.tax_paise:0) || null
+    }));
+    // fall back to allocation rows if no raw annexure
+    return doc.applicants.map((a,idx) => ({
+      line_no: idx+1, applicant_name: a.applicant_name || null, receipt_date: a.receipt_date || null,
+      service_type: a.service_type || null, location: a.location || null,
+      amount_paise: a.taxable_paise ?? null,
+      tax_paise: ((a.cgst_paise||0)+(a.sgst_paise||0)+(a.igst_paise||0)) || null,
+      gross_paise: a.total_paise ?? null
+    }));
+  },
+
+  checkRows(doc){
+    return doc.checks.map(c => ({ check_id: c.check_id, status: c.status,
+      severity: c.severity || null, detail: (c.detail||'').slice(0,500) }));
+  },
+
+  async pushOne(doc){
+    const body = { p: this.invoiceRow(doc), lines: this.lineRows(doc), chk: this.checkRows(doc) };
+    const r = await fetch(this.url + '/rpc/sync_invoice', {
+      method: 'POST', headers: this.headers(), body: JSON.stringify(body) });
+    if (!r.ok) { const t = await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
+    return (await r.json());   // 'inserted' | 'updated' | 'unchanged'
+  },
+
+  async pullAll(){
+    const r = await fetch(this.url + '/invoices?select=*&order=invoice_date.desc', {
+      headers: this.headers({ 'Range': '0-9999' }) });
+    if (!r.ok) { const t = await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
+    return await r.json();
+  }
+};
+
 /* ================= pdf ================= */
 /* PDF.js runs its parser in a worker. The worker source is embedded and handed
    over as a Blob URL, so the application remains a single file and the CSP
@@ -2285,6 +2375,7 @@ function renderAll(){
   const set = new Set(DB.docs.map(d=>d.invoice.settlement_status));
   $('#fSettle').innerHTML = '<option value="">All settlement</option>' + [...set].map(s=>`<option>${s}</option>`).join('');
   renderIngestStats(); renderLedger(); renderReview(); renderReport(); renderAudit(); renderTally();
+  if(typeof setCloud==='function') setCloud('Ready');
 }
 
 /* ================= drawer ================= */
@@ -2769,6 +2860,59 @@ $('#openWs').onclick = () => { const i = document.createElement('input'); i.type
   } catch(e){ log('Could not read that workspace file', 'er'); } }; i.click(); };
 $('#clearWs').onclick = () => { if (!confirm('Clear all ingested documents from this workspace?')) return;
   DB.docs = []; DB.hashes = new Set(); DB.sessions = []; renderAll(); persist(); log('Workspace cleared', 'wn'); };
+
+/* ---- Cloud sync wiring ---- */
+function setCloud(msg, kind){
+  const p = $('#cloudStatus'); if(!p) return;
+  const col = kind==='ok'?'var(--proof)':kind==='er'?'var(--fail)':kind==='wn'?'var(--warn)':'var(--text-3)';
+  p.innerHTML = `<i class="dot ${kind==='ok'?'on':''}"></i> <span style="color:${col}">${esc(msg)}</span>`;
+  const n = DB.docs.length; const el=$('#nCloud'); if(el) el.textContent = n||'';
+}
+$('#cloudPush') && ($('#cloudPush').onclick = async () => {
+  if(!DB.docs.length) return setCloud('Nothing ingested to push', 'wn');
+  const btn = $('#cloudPush'); btn.disabled = true;
+  const tally = { inserted:0, updated:0, unchanged:0, failed:0 };
+  const fails = [];
+  for(let i=0;i<DB.docs.length;i++){
+    const d = DB.docs[i];
+    setCloud(`Pushing ${i+1} of ${DB.docs.length}…`, 'dim');
+    try { const res = await Cloud.pushOne(d); tally[res] = (tally[res]||0)+1; }
+    catch(e){ tally.failed++; fails.push([d.filename, e.message]); }
+  }
+  btn.disabled = false;
+  const ok = tally.failed===0;
+  setCloud(`${tally.inserted} new · ${tally.updated} updated · ${tally.unchanged} already there`
+    + (tally.failed?` · ${tally.failed} failed`:''), ok?'ok':'er');
+  renderCloud(fails);
+});
+$('#cloudPull') && ($('#cloudPull').onclick = async () => {
+  const btn=$('#cloudPull'); btn.disabled=true; setCloud('Pulling…','dim');
+  try {
+    const rows = await Cloud.pullAll();
+    setCloud(`Database holds ${rows.length} invoice(s)`, 'ok');
+    renderCloud(null, rows);
+  } catch(e){ setCloud('Pull failed: '+e.message, 'er'); }
+  btn.disabled=false;
+});
+function renderCloud(fails, pulled){
+  const el = $('#cloudBody'); if(!el) return;
+  let html = '';
+  if (pulled) {
+    html += `<h2>In the database — ${pulled.length}</h2>
+      <div class="tblwrap"><table><thead><tr><th>Invoice</th><th>Date</th><th>Branch</th><th>Total</th><th>Verdict</th><th>Rev</th></tr></thead><tbody>
+      ${pulled.slice(0,200).map(r=>`<tr style="cursor:default"><td class="mono">${esc(r.invoice_no)}</td><td>${esc(r.invoice_date)}</td>
+        <td>${esc(r.branch_raw)}</td><td class="num">${r.total_paise!=null?money(r.total_paise):''}</td>
+        <td>${esc(r.verdict)}</td><td class="num">${r.revision>1?'v'+r.revision:''}</td></tr>`).join('')}
+      </tbody></table></div>`;
+  }
+  if (fails && fails.length) {
+    html += `<h2>Failed to push — ${fails.length}</h2>
+      <div class="tblwrap"><table><thead><tr><th>File</th><th>Reason</th></tr></thead><tbody>
+      ${fails.map(([f,m])=>`<tr style="cursor:default"><td class="mono">${esc(f)}</td><td class="dim">${esc(m)}</td></tr>`).join('')}
+      </tbody></table></div>`;
+  }
+  el.innerHTML = html || '<p class="dim">Push this session, or pull the full history, using the buttons above.</p>';
+}
 
 /* engine detection — optional acceleration, never required */
 (async () => {
