@@ -1778,8 +1778,15 @@ const Drive = {
       const client = google.accounts.oauth2.initTokenClient({
         client_id: clientId,
         scope: 'https://www.googleapis.com/auth/drive.file',
-        callback: t => { if (t && t.access_token) { this.token = t.access_token; this.ready = true; res(true); }
-                         else rej(new Error('no token returned')); },
+        callback: t => {
+          if (!t || !t.access_token) return rej(new Error('no token returned'));
+          /* Google returns the scopes actually granted. If the user unticked
+             the Drive permission, we hold a token that cannot upload — better to
+             refuse now than to fail silently on every file later. */
+          if (t.scope && !/drive\.file|\bdrive\b/.test(t.scope))
+            return rej(new Error('the Drive permission was not granted — reconnect and leave the Drive checkbox ticked'));
+          this.token = t.access_token; this.ready = true; res(true);
+        },
         error_callback: e => rej(new Error(e && e.type ? e.type : 'authorisation cancelled'))
       });
       try { client.requestAccessToken(); }
@@ -1844,7 +1851,16 @@ const Drive = {
     const r = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink,size', {
       method: 'POST', headers: { Authorization: 'Bearer ' + this.token,
                                  'Content-Type': 'multipart/related; boundary=' + boundary }, body });
-    if (!r.ok) throw new Error(`upload failed (${r.status})`);
+    if (!r.ok) {
+      /* Surface WHAT Google objected to. A bare status turns every failure into
+         a guess; the message body says whether it was scope, quota, or auth. */
+      let why = '';
+      try { const e = await r.json(); why = e.error && (e.error.message || e.error.status) || ''; }
+      catch (_) { try { why = (await r.text()).slice(0, 140); } catch (__) {} }
+      if (r.status === 403 && /insufficient|scope|permission/i.test(why))
+        why = 'the granted permission does not allow file upload — disconnect, reconnect, and be sure to tick the Drive permission on the consent screen';
+      throw new Error(`upload failed (${r.status})${why ? ': ' + why : ''}`);
+    }
     const out = await r.json();
     /* Verify the byte count Drive reports against what we sent. An upload that
        silently truncates would leave a link to a broken file, which is worse
