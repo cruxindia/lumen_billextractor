@@ -271,7 +271,7 @@ label.chk input{accent-color:var(--accent)}
         <span class="spacer"></span>
         <button class="btn" id="expCsv">Export CSV</button>
         <button class="btn" id="expXlsx">Export Excel</button>
-        <button class="btn" id="expOutstanding">BOM Outstanding Report</button>
+        <label class="chk" title="Group rows by applicant and add a Sub total line after each"><input type="checkbox" id="optSubtotal"> Group with sub-totals</label>
         <button class="btn" id="expDef">Export definition</button>
       </div>
       <div class="tblwrap" style="max-height:calc(100vh - 330px)"><table id="report"><thead></thead><tbody></tbody></table></div>
@@ -2082,12 +2082,19 @@ const FIELD_MAP = {
   invoice_status:{l:'INVOICE STATUS', g:r=>r.invoice.commercial_state},
   verdict:{l:'VERDICT', g:r=>r.verdict},
   source_file:{l:'SOURCE FILE', g:r=>r.filename},
+  sr_no:{perApplicant:1, l:'Sr No', g:(r,a)=>a.__sr||''},
+  sent_date:{perApplicant:1, l:'Case Sent Date', g:()=>''},
+  branch_code:{l:'Branch Code', g:r=>r.invoice.branch_code||''},
+  visit_location:{perApplicant:1, l:'Visit Location', g:(r,a)=>a.location||''},
+  receipt_date:{perApplicant:1, l:'Case Receive Date', g:(r,a)=>a.receipt_date||''},
+  gross_amount:{perApplicant:1, n:1, l:'Gross Total Amount', g:(r,a)=>((a.taxable_paise||a.amount_paise||0)+((a.cgst_paise||0)+(a.sgst_paise||0)+(a.igst_paise||0)||Math.round((a.taxable_paise||a.amount_paise||0)*(r.invoice.tax_rate||0.18))))/100},
 };
 const PRESETS = {
   'Pending bills (reference layout)': ['report_date','state','zone','bank_name','branch_name','branch_email','applicant_name','invoice_number','payment_date','amount','tax_total','total_amount','payment_status'],
   'Applicant billing detail': ['invoice_number','invoice_date','bank_name','branch_name','applicant_name','service_type','location','amount','tax_total','total_amount','allocation_method'],
   'Audit trail': ['invoice_number','invoice_date','branch_name','applicant_name','amount','total_amount','verdict','source_file'],
   'Bill check — face vs annexure': ['invoice_number','invoice_date','bank_name','branch_name','face_total','annexure_total','match_diff','match_status','rows_read','rows_printed','verdict','source_file'],
+  'Outstanding report': ['sr_no','receipt_date','sent_date','location','zone','bank_name','branch_name','branch_code','branch_email','applicant_name','service_type','invoice_number','invoice_date','visit_location','payment_date','amount','tax_total','gross_amount'],
 };
 let reportCols = PRESETS['Pending bills (reference layout)'].slice();
 // The reference report labels a single ~18% column 'SGST'. That label is
@@ -2492,6 +2499,96 @@ function buildWorkbook(){
   return wb;
 }
 
+/* ---------- styled XLSX writer ----------
+   The bundled community SheetJS drops cell styling on write, so a plain export
+   is unformatted. To deliver a genuinely formatted workbook we let SheetJS lay
+   out the data, then post-process the .xlsx (it is a zip) to inject a real
+   styles.xml and tag each cell with a style index. No new dependency — JSZip is
+   already vendored. */
+const LumenStyle = (() => {
+  const PURPLE = '4C2082', PURPLE_DK = '3A1866', AMBER = 'F5A800',
+        GREY = 'F4F2F8', GREY2 = 'FBFAFD', LINE = 'D9D2E9', TEXT = '2A2035';
+
+  // fixed style palette; index into <cellXfs>
+  const XF = [
+    {},                                                                   // 0 default
+    {font:{b:1,color:'FFFFFF',sz:11,name:'Calibri'}, fill:PURPLE, align:'center', border:1, wrap:1}, // 1 header
+    {font:{color:TEXT,sz:10,name:'Calibri'}, border:1},                   // 2 body
+    {font:{color:TEXT,sz:10,name:'Calibri'}, border:1, fill:GREY2},       // 3 body zebra
+    {font:{color:TEXT,sz:10,name:'Calibri'}, border:1, numFmt:1},         // 4 money
+    {font:{color:TEXT,sz:10,name:'Calibri'}, border:1, fill:GREY2, numFmt:1}, // 5 money zebra
+    {font:{b:1,color:PURPLE_DK,sz:10,name:'Calibri'}, fill:GREY, border:1, numFmt:1}, // 6 subtotal money
+    {font:{b:1,color:PURPLE_DK,sz:10,name:'Calibri'}, fill:GREY, border:1}, // 7 subtotal label
+    {font:{b:1,color:'FFFFFF',sz:11,name:'Calibri'}, fill:PURPLE_DK, border:1, numFmt:1}, // 8 grand money
+    {font:{b:1,color:'FFFFFF',sz:11,name:'Calibri'}, fill:PURPLE_DK, border:1}, // 9 grand label
+  ];
+
+  function stylesXml(){
+    const fonts = XF.map(x => {
+      const f = x.font || {};
+      return `<font>${f.b?'<b/>':''}<sz val="${f.sz||10}"/><color rgb="FF${f.color||TEXT}"/><name val="${f.name||'Calibri'}"/></font>`;
+    });
+    const fills = ['<fill><patternFill patternType="none"/></fill>',
+                   '<fill><patternFill patternType="gray125"/></fill>'];
+    const fillIdx = {};
+    XF.forEach(x => { if (x.fill && !(x.fill in fillIdx)) { fillIdx[x.fill] = fills.length;
+      fills.push(`<fill><patternFill patternType="solid"><fgColor rgb="FF${x.fill}"/></patternFill></fill>`); } });
+    const border = `<border><left style="thin"><color rgb="FF${LINE}"/></left><right style="thin"><color rgb="FF${LINE}"/></right><top style="thin"><color rgb="FF${LINE}"/></top><bottom style="thin"><color rgb="FF${LINE}"/></bottom></border>`;
+    const borders = ['<border/>', border];
+    const numFmts = '<numFmts count="1"><numFmt numFmtId="164" formatCode="#,##0.00"/></numFmts>';
+    const xfs = XF.map(x => {
+      const fillId = x.fill ? fillIdx[x.fill] : 0;
+      const borderId = x.border ? 1 : 0;
+      const numId = x.numFmt ? 164 : 0;
+      const align = x.align || x.wrap
+        ? `<alignment${x.align?` horizontal="${x.align}"`:''} vertical="center"${x.wrap?' wrapText="1"':''}/>` : '';
+      return `<xf numFmtId="${numId}" fontId="${XF.indexOf(x)}" fillId="${fillId}" borderId="${borderId}" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1" applyNumberFormat="${numId?1:0}">${align}</xf>`;
+    });
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">${numFmts}<fonts count="${fonts.length}">${fonts.join('')}</fonts><fills count="${fills.length}">${fills.join('')}</fills><borders count="${borders.length}">${borders.join('')}</borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="${xfs.length}">${xfs.join('')}</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`;
+  }
+
+  /* write: rows = array of {cells:[...], style:'header'|'body'|'subtotal'|'grand', zebra:bool},
+     cols = column widths. Returns a Blob. */
+  async function write(sheetName, header, dataRows, colWidths, filename){
+    const aoa = [header.map(h=>h.label), ...dataRows.map(r=>r.cells)];
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = colWidths.map(w => ({ wch: w }));
+    ws['!freeze'] = { xSplit:0, ySplit:1 };
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    const raw = XLSX.write(wb, { type:'array', bookType:'xlsx' });
+
+    const zip = await JSZip.loadAsync(raw);
+    // inject styles.xml
+    zip.file('xl/styles.xml', stylesXml());
+    // tag every cell with a style index in sheet1.xml
+    let xml = await zip.file('xl/worksheets/sheet1.xml').async('string');
+    const styleOf = (rowIdx, colIdx) => {
+      if (rowIdx === 0) return 1;                         // header
+      const r = dataRows[rowIdx - 1]; if (!r) return 2;
+      const money = header[colIdx] && header[colIdx].money;
+      if (r.style === 'subtotal') return money ? 6 : 7;
+      if (r.style === 'grand')    return money ? 8 : 9;
+      if (money) return r.zebra ? 5 : 4;
+      return r.zebra ? 3 : 2;
+    };
+    xml = xml.replace(/<c r="([A-Z]+)(\d+)"( s="\d+")?( t="[^"]*")?>/g, (m, col, row, sAttr, tAttr) => {
+      const colIdx = col.split('').reduce((a,ch)=>a*26+(ch.charCodeAt(0)-64),0) - 1;
+      const rowIdx = parseInt(row,10) - 1;
+      return `<c r="${col}${row}" s="${styleOf(rowIdx,colIdx)}"${tAttr||''}>`;
+    });
+    // row heights: taller header
+    xml = xml.replace(/<row r="1"([^>]*)>/, '<row r="1"$1 ht="26" customHeight="1">');
+    zip.file('xl/worksheets/sheet1.xml', xml);
+
+    const out = await zip.generateAsync({ type:'blob',
+      mimeType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    download(filename, out);
+  }
+  return { write };
+})();
+
 /* BOM Outstanding Report — matches the bank's own layout exactly:
    one line per verification, grouped by applicant, a numbered Sr No on the
    group's first line only, and a per-applicant "Sub total" row. Column order
@@ -2557,13 +2654,65 @@ const gross = basic + gst;   /* gross is basic+tax by definition; never a stray 
   return wb;
 }
 
-$('#expOutstanding').onclick = () => { if(!window.XLSX) return log('Excel writer unavailable offline','er');
-  XLSX.writeFile(buildOutstandingReport(), 'BOM-Outstanding-Report.xlsx');
-  log('Exported the BOM Outstanding Report (bank template layout)', 'ok'); };
+$('#expXlsx').onclick = async () => { if(!window.XLSX) return log('Excel writer unavailable offline','er');
+  const wantSub = $('#optSubtotal') && $('#optSubtotal').checked;
+  const header = reportCols.map(k => ({ label: colLabel(k), money: !!FIELD_MAP[k].n }));
+  const widths = reportCols.map(k => {
+    const l = colLabel(k).length;
+    if (/applicant|branch name|mail|visit|location/i.test(colLabel(k))) return 26;
+    return Math.max(11, Math.min(l + 4, 22));
+  });
 
-$('#expXlsx').onclick = () => { if(!window.XLSX) return log('Excel writer unavailable offline','er');
-  XLSX.writeFile(buildWorkbook(), 'lumen-billing.xlsx');
-  log('Exported 4 sheets — Invoice Summary, Applicant Detail (RAW), Exceptions, Tally', 'ok'); };
+  const dataRows = [];
+  const perApplicant = reportCols.some(k => FIELD_MAP[k].perApplicant);
+  const grand = {};   // money column totals
+
+  const pushCells = (arr, style, zebra) => {
+    reportCols.forEach((k, i) => { if (FIELD_MAP[k].n && typeof arr[i] === 'number') grand[i] = (grand[i]||0) + arr[i]; });
+    dataRows.push({ cells: arr, style, zebra });
+  };
+
+  let z = false, sr = 0;
+  DB.docs.forEach(doc => {
+    const blank = {applicant_name:'', taxable_paise:doc.invoice.taxable_paise||0, cgst_paise:0, sgst_paise:0,
+                   igst_paise:doc.invoice.tax_total_paise||0, total_paise:doc.invoice.total_paise||0, allocation_method:'—'};
+    // choose source rows (raw per-verification if available and per-applicant view)
+    let src;
+    if (perApplicant) {
+      const raw = ((doc.candidates && doc.candidates._applicant_rows || [])[0] || {}).normalized || [];
+      src = raw.length ? raw : (doc.applicants.length ? doc.applicants : [blank]);
+    } else src = [blank];
+
+    if (wantSub && perApplicant) {
+      // group consecutive rows by applicant
+      const groups = [];
+      src.forEach(row => { const nm=(row.applicant_name||'(unnamed)').trim(); const last=groups[groups.length-1];
+        if(last&&last.nm===nm) last.rows.push(row); else groups.push({nm, rows:[row]}); });
+      groups.forEach(({nm, rows}) => {
+        sr += 1; z = !z;
+        const sub = {};
+        rows.forEach((row, idx) => {
+          row.__sr = idx===0 ? String(sr).padStart(4,'0') : '';
+          const cells = reportCols.map(k => FIELD_MAP[k].g(doc, row) ?? '');
+          reportCols.forEach((k,i)=>{ if(FIELD_MAP[k].n && typeof cells[i]==='number') sub[i]=(sub[i]||0)+cells[i]; });
+          pushCells(cells, 'body', z);
+        });
+        // sub total row
+        const stotal = reportCols.map((k,i)=> i===0 ? 'Sub total' : (sub[i]!==undefined ? sub[i] : ''));
+        dataRows.push({ cells: stotal, style:'subtotal' });
+      });
+    } else {
+      src.forEach(row => { z = !z; pushCells(reportCols.map(k => FIELD_MAP[k].g(doc,row) ?? ''), 'body', z); });
+    }
+  });
+
+  // grand total row
+  const gt = reportCols.map((k,i)=> i===0 ? 'TOTAL' : (grand[i]!==undefined ? grand[i] : ''));
+  dataRows.push({ cells: gt, style:'grand' });
+
+  await LumenStyle.write('Report', header, dataRows, widths, 'lumen-report.xlsx');
+  log(`Exported a formatted report — ${dataRows.length} rows${wantSub?' with sub-totals':''}`, 'ok');
+};
 $('#expDef').onclick = () => download('report-definition.json', new Blob([JSON.stringify(
   { id:'rpt_custom', columns: reportCols.map((k,i)=>({key:k, label:colLabel(k), order:i})) }, null, 1)], {type:'application/json'}));
 
