@@ -2573,11 +2573,28 @@ const LumenStyle = (() => {
       if (money) return r.zebra ? 5 : 4;
       return r.zebra ? 3 : 2;
     };
-    xml = xml.replace(/<c r="([A-Z]+)(\d+)"( s="\d+")?( t="[^"]*")?>/g, (m, col, row, sAttr, tAttr) => {
-      const colIdx = col.split('').reduce((a,ch)=>a*26+(ch.charCodeAt(0)-64),0) - 1;
-      const rowIdx = parseInt(row,10) - 1;
-      return `<c r="${col}${row}" s="${styleOf(rowIdx,colIdx)}"${tAttr||''}>`;
-    });
+    /* Process each COMPLETE cell. Two things happen here:
+       1. tag it with a style index;
+       2. convert t="str" (formula-string) cells to proper inline strings.
+          SheetJS writes plain text as t="str", which tells Excel the cell holds
+          a FORMULA result. Finding a literal there, Excel shows a "repaired
+          content" prompt on open — the file works, but it looks broken. Inline
+          strings (t="inlineStr" with <is><t>) are the correct type for literal
+          text and open silently. */
+    xml = xml.replace(/<c r="([A-Z]+)(\d+)"([^>]*?)(\/>|>([\s\S]*?)<\/c>)/g,
+      (m, col, row, attrs, tail, inner) => {
+        const colIdx = col.split('').reduce((a,ch)=>a*26+(ch.charCodeAt(0)-64),0) - 1;
+        const rowIdx = parseInt(row,10) - 1;
+        const sIdx = styleOf(rowIdx, colIdx);
+        const isStr = /t="str"/.test(attrs) || /t="s"/.test(attrs);
+        if (tail === '/>') return `<c r="${col}${row}" s="${sIdx}"/>`;
+        if (isStr) {
+          const vm = /<v>([\s\S]*?)<\/v>/.exec(inner);
+          const text = vm ? vm[1] : '';
+          return `<c r="${col}${row}" s="${sIdx}" t="inlineStr"><is><t xml:space="preserve">${text}</t></is></c>`;
+        }
+        return `<c r="${col}${row}" s="${sIdx}">${inner}</c>`;
+      });
     // row heights: taller header
     xml = xml.replace(/<row r="1"([^>]*)>/, '<row r="1"$1 ht="26" customHeight="1">');
     zip.file('xl/worksheets/sheet1.xml', xml);
