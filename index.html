@@ -173,6 +173,27 @@ label.chk input{accent-color:var(--accent)}
 .assure b{color:var(--proof)}
 .legend i{display:inline-block;width:9px;height:9px;border-radius:1px;margin-right:4px;vertical-align:-1px}
 @media(max-width:860px){.app{grid-template-columns:56px 1fr}.rail button span.t,.rail-head,.tagline{display:none}.rail button{justify-content:center}}
+
+/* review toolbar + segmented toggle */
+.reviewbar{display:flex;align-items:center;gap:12px;margin:8px 0 14px;flex-wrap:wrap}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{background:var(--surface);border:none;padding:7px 14px;font:inherit;font-size:13px;cursor:pointer;color:var(--text-2)}
+.seg button.on{background:var(--accent,#4C2082);color:#fff}
+.btn.sm{padding:4px 12px;font-size:12px}
+/* modal */
+.modalwrap{position:fixed;inset:0;background:rgba(20,12,30,.45);display:flex;align-items:center;justify-content:center;z-index:1000;padding:20px}
+.modalbox{background:var(--bg,#fff);border-radius:14px;max-width:720px;width:100%;max-height:88vh;overflow:auto;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.modal-head{font-size:16px;margin-bottom:12px;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.probbox{background:var(--warn-bg,#fff8e6);border:1px solid var(--warn,#e0a800);border-radius:10px;padding:12px 14px;margin:10px 0;font-size:13px;line-height:1.7}
+.pickrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0;font-size:13px}
+.editgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:14px 0}
+.editgrid label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--text-2)}
+.editgrid input{padding:8px 10px;border:1px solid var(--line);border-radius:8px;font:inherit;font-size:13px}
+.modal-foot{display:flex;gap:10px;align-items:center;margin-top:18px;border-top:1px solid var(--line);padding-top:16px}
+@media(max-width:560px){.editgrid{grid-template-columns:1fr}}
+.filterbar{display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin:6px 0 14px;padding:12px;background:var(--surface);border:1px solid var(--line);border-radius:10px}
+.filterbar label{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:.3px}
+.filterbar select,.filterbar input{padding:6px 8px;border:1px solid var(--line);border-radius:7px;font:inherit;font-size:13px;min-width:120px}
 </style>
 </head>
 <body>
@@ -252,17 +273,26 @@ label.chk input{accent-color:var(--accent)}
 
     <!-- ===== REVIEW ===== -->
     <section class="view" id="v-review">
-      <h1>Review</h1>
-      <p class="sub">A worklist, not a quarantine. Everything listed here is already stored in the database and
-         already appears in every report — this is simply what to look at first.</p>
+      <h1>Review &amp; correct</h1>
+      <p class="sub">See what needs checking in plain words, fix it right here, and push the correction —
+         no jumping between tabs. Toggle between bills that need fixing and all bills.</p>
+      <div class="reviewbar" id="reviewBar"></div>
       <div class="tblwrap"><table id="review"><thead></thead><tbody></tbody></table></div>
     </section>
 
     <!-- ===== REPORT ===== -->
     <section class="view" id="v-report">
-      <h1>Report</h1>
-      <p class="sub">Columns are a mapping, never the schema. Rename a header freely — the canonical field behind it
-         is unchanged, so validation stays correct even when a client wants unconventional labels.</p>
+      <h1>Report &amp; MIS</h1>
+      <p class="sub">Build a report from this session, or pull the whole database for a full MIS. Filter by client,
+         branch, date, verdict or payment status — the report and every export respect the filters.</p>
+      <div class="reviewbar">
+        <div class="seg">
+          <button class="on" id="misSession" onclick="setMisSource('session')">This session</button>
+          <button id="misDb" onclick="setMisSource('database')">Full database (MIS)</button>
+        </div>
+        <span class="dim" id="misStatus" style="font-size:12px"></span>
+      </div>
+      <div class="filterbar" id="misFilters"></div>
       <h2>Columns in the report — drag order with the arrows</h2>
       <div class="row" id="colChosen" style="gap:6px"></div>
       <h2>Add a column</h2>
@@ -2173,6 +2203,8 @@ async function ingest(fileList){
       }
       const r = L.processView(view);
       r.hash = hash; r.path = it.path; r.sessionId = session.id;
+      // keep the original bytes so the bill can be opened from Review (this session only)
+      try { r._sourceBlob = new Blob([it.buf], { type: it.pdf ? 'application/pdf' : 'application/octet-stream' }); } catch(_){}
       DB.docs.push(r); DB.hashes.add(hash); session.count++;
     } catch (e) { failed++; log(`${it.name} — ${e.message}`, 'er'); }
     done++;
@@ -2282,25 +2314,210 @@ function renderLedger(){
     `<tr data-id="${r.id}">` + LEDGER_COLS.map(c => `<td class="${c[1]}">${c[2](r)}</td>`).join('') + '</tr>').join('');
 }
 
-function renderReview(){
-  const items = [];
-  DB.docs.forEach(r => r.checks.filter(c => c.status === 'FAIL').forEach(c => items.push({
-    r, c, priority: (r.invoice.total_paise || 0)/100 * (c.severity === 'error' ? 3 : 1) })));
-  items.sort((a,b) => b.priority - a.priority);
-  $('#nReview').textContent = items.length || '';
-  const t = $('#review');
-  t.tHead.innerHTML = '<tr><th>Priority</th><th>Severity</th><th>Invoice No</th><th>Branch</th><th>Total</th><th>Check</th><th>What the check found</th></tr>';
-  t.tBodies[0].innerHTML = items.length ? items.slice(0,400).map(x =>
-    `<tr data-id="${x.r.id}">
-      <td class="num mono dim">${x.priority.toLocaleString('en-IN',{maximumFractionDigits:0})}</td>
-      <td><span class="tag ${x.c.severity==='error'?'fail':'warn'}">${x.c.severity}</span></td>
-      <td class="mono">${esc(x.r.invoice.invoice_no)}</td>
-      <td>${esc(x.r.invoice.branch_raw)}</td>
-      <td class="num">${money(x.r.invoice.total_paise)}</td>
-      <td class="mono">${esc(x.c.check_id)}</td>
-      <td class="dim">${esc(x.c.detail)}</td></tr>`).join('')
-    : `<tr><td colspan="7"><div class="empty"><h3>Queue is clear</h3><p>Every document proved itself. Nothing needs a human.</p></div></td></tr>`;
+/* ---- plain-language layer: turn check_id + detail into words a person reads,
+   and name which invoice fields the fix involves. ---- */
+const CHECK_PLAIN = {
+  C1_tax_arithmetic:      { title: "The tax doesn't add up",
+    say: r => `The tax on this bill doesn't match the taxable amount at the stated rate. Check the tax and total.`,
+    fields: ['taxable_paise','tax_total_paise','total_paise'] },
+  C2_total_composition:   { title: "The total doesn't match its parts",
+    say: r => `Taxable + tax + round-off doesn't equal the invoice total. One of them is off.`,
+    fields: ['taxable_paise','tax_total_paise','round_off_paise','total_paise'] },
+  C3_roundoff:            { title: "The round-off looks wrong",
+    say: r => `The round-off is larger than a rupee, which is unusual. Check the total.`,
+    fields: ['round_off_paise','total_paise'] },
+  C6_line_item_rollup:    { title: "The line items don't sum to the total",
+    say: r => `The applicant lines don't add up to the invoice's taxable amount.`,
+    fields: ['taxable_paise'] },
+  C7_cross_artifact_reconciliation: { title: "The bill total and the itemised list disagree",
+    say: r => { const f = r.invoice.face_total_paise, a = r.invoice.annexure_total_paise;
+      return `The bill's total says ${f!=null?money(f):'—'}, but the itemised list adds up to ${a!=null?money(a):'—'}. One of them is wrong — set the correct total.`; },
+    fields: ['face_total_paise','annexure_total_paise','total_paise','taxable_paise'] },
+  C8_gstin_checksum:      { title: "A GSTIN looks invalid",
+    say: r => `A GST number on the bill fails its checksum — likely a typo. Check the GSTINs.`,
+    fields: ['supplier_gstin','recipient_gstin'] },
+  C9_mandatory_fields:    { title: "Something required is missing",
+    say: r => { const d = (r._reviewDetail||''); const miss = d.replace(/^missing:\s*/,'');
+      return `This bill is missing: ${miss || 'a required field'}. Fill it in.`; },
+    fields: ['invoice_no','invoice_date','client_raw','branch_raw','total_paise'] },
+  C10_money_formula:      { title: "A money value couldn't be read",
+    say: r => `A money field couldn't be resolved to a number. Check the amounts.`,
+    fields: ['taxable_paise','tax_total_paise','total_paise'] },
+  C11_amount_plausibility:{ title: "An amount looks off",
+    say: r => `An amount is unusually large or small for this kind of bill. Worth a look.`,
+    fields: ['taxable_paise','total_paise'] },
+  C12_date_plausibility:  { title: "A date looks wrong",
+    say: r => `A date on the bill is outside the expected range. Check the invoice date.`,
+    fields: ['invoice_date','due_date'] },
+  C13_identifier_format:  { title: "The invoice number looks malformed",
+    say: r => `The invoice number "${r.invoice.invoice_no||''}" looks doubled or malformed. Confirm it.`,
+    fields: ['invoice_no'] },
+  C14_row_completeness:   { title: "Some itemised rows may be missing",
+    say: r => `The rows read don't reach the total the annexure itself prints. Some lines may not have been captured.`,
+    fields: ['rows_read','rows_printed'] },
+  C15_applicant_detail:   { title: "The applicant list is missing",
+    say: r => `This bill has an annexure but no applicant rows could be read. The people are missing.`,
+    fields: [] }
+};
+function plainFor(r, c){
+  const base = CHECK_PLAIN[c.check_id];
+  r._reviewDetail = c.detail;
+  if (!base) return { title: c.check_id.replace(/_/g,' '), say: c.detail || 'Needs a look.', fields: [] };
+  return { title: base.title, say: base.say(r), fields: base.fields };
 }
+
+/* which fields to show as editable for a given flagged bill: the union of the
+   fields its failing checks touch, always including the core identity fields */
+function editFieldsFor(r){
+  const set = new Set(['invoice_no','invoice_date','client_raw','branch_raw']);
+  r.checks.filter(c=>c.status==='FAIL').forEach(c=>{
+    const p = CHECK_PLAIN[c.check_id]; if(p) p.fields.forEach(f=>set.add(f));
+  });
+  return [...set];
+}
+
+const FIELD_LABEL = {
+  invoice_no:'Invoice number', invoice_date:'Invoice date', client_raw:'Client (bank/org)',
+  branch_raw:'Branch', branch_email:'Branch email', supplier_gstin:'Supplier GSTIN',
+  recipient_gstin:'Client GSTIN', taxable_paise:'Taxable amount', tax_total_paise:'Tax',
+  round_off_paise:'Round-off', total_paise:'Invoice total', face_total_paise:'Total on the bill',
+  annexure_total_paise:'Total of itemised list', rows_read:'Rows read', rows_printed:'Rows on bill',
+  due_date:'Due date'
+};
+const MONEY_FIELDS = new Set(['taxable_paise','tax_total_paise','round_off_paise','total_paise',
+  'face_total_paise','annexure_total_paise']);
+
+function renderReview(){
+  const t = $('#review');
+  const flaggedOnly = (window.__reviewMode||'flagged') === 'flagged';
+
+  // source rows: session docs, plus any pulled-from-DB rows held in reviewPulled
+  const source = (window.reviewPulled && window.reviewPulled.length)
+    ? window.reviewPulled : DB.docs;
+
+  const rows = source.filter(r => flaggedOnly
+    ? r.checks && r.checks.some(c => c.status === 'FAIL')
+    : true);
+
+  // sort: problems first, by value at risk
+  rows.sort((a,b) => {
+    const af = a.checks?a.checks.some(c=>c.status==='FAIL'):false;
+    const bf = b.checks?b.checks.some(c=>c.status==='FAIL'):false;
+    if (af !== bf) return bf - af;
+    return (b.invoice.total_paise||0) - (a.invoice.total_paise||0);
+  });
+
+  const flaggedCount = source.filter(r=>r.checks&&r.checks.some(c=>c.status==='FAIL')).length;
+  $('#nReview').textContent = flaggedCount || '';
+
+  // toolbar: toggle + push
+  const bar = $('#reviewBar');
+  if (bar) bar.innerHTML = `
+    <div class="seg">
+      <button class="${flaggedOnly?'on':''}" onclick="setReviewMode('flagged')">Needs fixing (${flaggedCount})</button>
+      <button class="${!flaggedOnly?'on':''}" onclick="setReviewMode('all')">All bills (${source.length})</button>
+    </div>
+    <span class="dim" style="font-size:12px">${window.reviewPulled&&window.reviewPulled.length?'showing pulled database records':'showing this session'}</span>
+    <button class="btn" id="reviewPullBtn">Pull from database</button>`;
+
+  t.tHead.innerHTML = '<tr><th></th><th>Invoice</th><th>Client · Branch</th><th>What needs checking</th><th></th></tr>';
+  t.tBodies[0].innerHTML = rows.length ? rows.slice(0,400).map(r => {
+    const fails = (r.checks||[]).filter(c=>c.status==='FAIL');
+    const clean = fails.length===0;
+    const problems = fails.map(c=>plainFor(r,c));
+    return `<tr data-h="${esc(r.hash||r.content_hash||r.id)}" class="revrow">
+      <td>${clean?'<span class="tag proof">OK</span>':`<span class="tag ${fails.some(f=>f.severity==='error')?'fail':'warn'}">${fails.length} issue${fails.length>1?'s':''}</span>`}</td>
+      <td class="mono">${esc(r.invoice.invoice_no||'—')}</td>
+      <td>${esc(r.invoice.client_raw||'—')}<br><span class="dim">${esc(r.invoice.branch_raw||'')}</span></td>
+      <td>${clean?'<span class="dim">Nothing — this bill is clean.</span>'
+              :problems.map(p=>`<div><b>${esc(p.title)}.</b> <span class="dim">${esc(p.say)}</span></div>`).join('')}</td>
+      <td><button class="btn sm" onclick="openReview('${esc(r.hash||r.content_hash||r.id)}')">${clean?'View':'Fix'}</button></td>
+    </tr>`;
+  }).join('')
+   : `<tr><td colspan="5"><div class="empty"><h3>${flaggedOnly?'Nothing needs fixing':'No bills yet'}</h3><p>${flaggedOnly?'Every bill is clean.':'Ingest or pull some bills.'}</p></div></td></tr>`;
+}
+
+window.setReviewMode = m => { window.__reviewMode = m; renderReview(); };
+
+/* open a single bill for correction — plain language, every relevant field editable */
+window.openReview = (key) => {
+  const source = (window.reviewPulled && window.reviewPulled.length) ? window.reviewPulled : DB.docs;
+  const r = source.find(x => (x.hash||x.content_hash||x.id) === key);
+  if (!r) return;
+  const fails = (r.checks||[]).filter(c=>c.status==='FAIL');
+  const problems = fails.map(c=>plainFor(r,c));
+  const fields = editFieldsFor(r);
+  const fromSession = DB.docs.includes(r);
+
+  const moneySet = MONEY_FIELDS;
+  const val = k => { const v = r.invoice[k];
+    if (moneySet.has(k)) return v==null?'':(v/100).toFixed(2);
+    return v==null?'':v; };
+
+  const body = `
+    <div class="modal-head"><b>${esc(r.invoice.invoice_no||'This bill')}</b>
+      <span class="dim">${esc(r.invoice.client_raw||'')} · ${esc(r.invoice.branch_raw||'')}</span></div>
+    ${problems.length?`<div class="probbox">${problems.map(p=>`<div><b>${esc(p.title)}.</b> ${esc(p.say)}</div>`).join('')}</div>`:'<p class="dim">No open issues — you can still edit any field.</p>'}
+
+    ${fails.some(f=>f.check_id==='C7_cross_artifact_reconciliation')?(()=>{
+      const f=r.invoice.face_total_paise, a=r.invoice.annexure_total_paise;
+      return `<div class="pickrow"><span>Which total is correct?</span>
+        <button class="btn" onclick="pickTotal('${key}',${f})">${f!=null?money(f):'—'} <span class="dim">(on the bill)</span></button>
+        <button class="btn" onclick="pickTotal('${key}',${a})">${a!=null?money(a):'—'} <span class="dim">(itemised list)</span></button></div>`;})():''}
+
+    <div class="editgrid">
+      ${fields.map(k=>`<label>${esc(FIELD_LABEL[k]||k)}
+        <input data-k="${k}" data-money="${moneySet.has(k)?1:0}" value="${esc(String(val(k)))}"></label>`).join('')}
+    </div>
+
+    <div class="modal-foot">
+      <button class="btn" onclick="viewBill('${key}')" ${fromSession?'':'disabled title="Original PDF isn\'t kept for pulled bills"'}>View the bill</button>
+      <div style="flex:1"></div>
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn pri" onclick="saveReview('${key}')">Save &amp; push correction</button>
+    </div>`;
+  showModal(body);
+};
+
+window.pickTotal = (key, paise) => {
+  const dlg = $('#modal'); if(!dlg) return;
+  ['total_paise','taxable_paise','face_total_paise','annexure_total_paise'].forEach(k=>{
+    const inp = dlg.querySelector(`input[data-k="${k}"]`);
+    if (inp && paise!=null) inp.value = (paise/100).toFixed(2);
+  });
+};
+
+window.saveReview = async (key) => {
+  const dlg = $('#modal'); if(!dlg) return;
+  const source = (window.reviewPulled && window.reviewPulled.length) ? window.reviewPulled : DB.docs;
+  const r = source.find(x => (x.hash||x.content_hash||x.id) === key);
+  if (!r) return;
+  const patch = {};
+  dlg.querySelectorAll('input[data-k]').forEach(inp=>{
+    const k = inp.dataset.k, isMoney = inp.dataset.money==='1';
+    let v = inp.value.trim();
+    let stored = isMoney ? (v===''?null:Math.round(parseFloat(v)*100)) : (v===''?null:v);
+    if (isMoney && v!=='' && isNaN(stored)) return;
+    patch[k] = stored;
+    // reflect locally so the UI updates
+    r.invoice[k] = stored;
+  });
+  const hash = r.hash || r.content_hash;
+  try {
+    if (hash) { await Cloud.updateOne(hash, patch); log('Correction pushed to database.', 'ok'); }
+    else { log('Saved locally (not yet in database — push this session first).', 'wn'); }
+  } catch(e){ log('Could not push correction: '+e.message, 'er'); }
+  closeModal(); renderReview();
+};
+
+/* view the original bill — only for this-session bills we still hold */
+window.viewBill = (key) => {
+  const r = DB.docs.find(x => (x.hash||x.id) === key);
+  if (!r || !r._sourceBlob) { log('The original file isn\'t available for this bill.', 'wn'); return; }
+  const url = URL.createObjectURL(r._sourceBlob);
+  window.open(url, '_blank');
+};
+
 
 /* ---- report: columns are a MAPPING, never the schema ---- */
 /* Money accessors that work on BOTH row shapes and NEVER return NaN.
@@ -2389,7 +2606,7 @@ function reportRows(){
      the same invoice once per applicant would make it unreadable. */
   const perApplicant = reportCols.some(k => FIELD_MAP[k].perApplicant);
   const out = [];
-  DB.docs.forEach(r => {
+  (typeof misFiltered==='function' ? misFiltered() : DB.docs).forEach(r => {
     const blank = {applicant_name:'', taxable_paise:r.invoice.taxable_paise||0, cgst_paise:0, sgst_paise:0,
                    igst_paise:r.invoice.tax_total_paise||0, total_paise:r.invoice.total_paise||0,
                    allocation_method:'—'};
@@ -2399,6 +2616,72 @@ function reportRows(){
   return out;
 }
 let flashCol = null;
+/* ---- MIS: data source (session vs database) + dynamic filters ---- */
+window.__misSource = 'session';
+window.misRows = null;          // pulled database rows (as doc-shaped)
+window.misFilter = { client:'', branch:'', from:'', to:'', verdict:'', settlement:'' };
+
+window.setMisSource = async (src) => {
+  window.__misSource = src;
+  $('#misSession').classList.toggle('on', src==='session');
+  $('#misDb').classList.toggle('on', src==='database');
+  if (src==='database' && !window.misRows) {
+    $('#misStatus').textContent = 'Pulling database…';
+    try {
+      const rows = await Cloud.pullAll();
+      window.misRows = rows.map(row => ({ invoice: row, applicants: [], checks: [],
+        verdict: row.verdict, verification: row.verification, hash: row.content_hash,
+        candidates: {}, filename: row.source_file }));
+      $('#misStatus').textContent = `${rows.length} records in database`;
+    } catch(e){ $('#misStatus').textContent = 'Pull failed: '+e.message; window.__misSource='session'; }
+  } else {
+    $('#misStatus').textContent = src==='database' ? `${(window.misRows||[]).length} records in database` : '';
+  }
+  buildMisFilters(); renderReport();
+};
+
+/* the pool of docs the report draws from, after the source choice */
+function misPool(){
+  return (window.__misSource==='database' && window.misRows) ? window.misRows : DB.docs;
+}
+
+/* dynamic filter values, derived from whatever's in the pool — never hardcoded */
+function buildMisFilters(){
+  const bar = $('#misFilters'); if(!bar) return;
+  const pool = misPool();
+  const clients = [...new Set(pool.map(r=>r.invoice.client_raw).filter(Boolean))].sort();
+  const branches = [...new Set(pool.map(r=>r.invoice.branch_raw).filter(Boolean))].sort();
+  const verdicts = [...new Set(pool.map(r=>r.verdict).filter(Boolean))].sort();
+  const settlements = [...new Set(pool.map(r=>r.invoice.settlement_status).filter(Boolean))].sort();
+  const opt = (arr, sel) => ['<option value="">All</option>'].concat(
+    arr.map(v=>`<option ${v===sel?'selected':''}>${esc(v)}</option>`)).join('');
+  bar.innerHTML = `
+    <label>Client <select onchange="setMisFilter('client',this.value)">${opt(clients, misFilter.client)}</select></label>
+    <label>Branch <select onchange="setMisFilter('branch',this.value)">${opt(branches, misFilter.branch)}</select></label>
+    <label>From <input type="date" value="${misFilter.from}" onchange="setMisFilter('from',this.value)"></label>
+    <label>To <input type="date" value="${misFilter.to}" onchange="setMisFilter('to',this.value)"></label>
+    <label>Verdict <select onchange="setMisFilter('verdict',this.value)">${opt(verdicts, misFilter.verdict)}</select></label>
+    <label>Payment <select onchange="setMisFilter('settlement',this.value)">${opt(settlements, misFilter.settlement)}</select></label>
+    ${Object.values(misFilter).some(Boolean)?`<button class="btn sm" onclick="clearMisFilters()">Clear filters</button>`:''}`;
+}
+window.setMisFilter = (k,v) => { window.misFilter[k]=v; renderReport(); buildMisFilters(); };
+window.clearMisFilters = () => { window.misFilter={client:'',branch:'',from:'',to:'',verdict:'',settlement:''}; renderReport(); buildMisFilters(); };
+
+/* apply filters to the pool */
+function misFiltered(){
+  const f = window.misFilter;
+  return misPool().filter(r => {
+    const i = r.invoice;
+    if (f.client && i.client_raw !== f.client) return false;
+    if (f.branch && i.branch_raw !== f.branch) return false;
+    if (f.verdict && r.verdict !== f.verdict) return false;
+    if (f.settlement && i.settlement_status !== f.settlement) return false;
+    if (f.from && (!i.invoice_date || i.invoice_date < f.from)) return false;
+    if (f.to && (!i.invoice_date || i.invoice_date > f.to)) return false;
+    return true;
+  });
+}
+
 function renderReport(){
   $('#colChosen').innerHTML = reportCols.map((k,i) =>
     `<span class="chip${flashCol===k?' flash':''}">
@@ -2538,7 +2821,7 @@ function renderAll(){
      ${s0.unproven + s0.undet ? `${s0.unproven + s0.undet} need${s0.unproven + s0.undet === 1 ? 's' : ''} a look, but ${s0.unproven + s0.undet === 1 ? 'it is' : 'they are'} stored and reported like everything else.` : ''}</span>`;
   const set = new Set(DB.docs.map(d=>d.invoice.settlement_status));
   $('#fSettle').innerHTML = '<option value="">All settlement</option>' + [...set].map(s=>`<option>${s}</option>`).join('');
-  renderIngestStats(); renderLedger(); renderReview(); renderReport(); renderAudit(); renderTally();
+  renderIngestStats(); renderLedger(); renderReview(); if(typeof buildMisFilters==='function')buildMisFilters(); renderReport(); renderAudit(); renderTally();
   if(typeof setCloud==='function') setCloud('Ready');
 }
 
@@ -2707,7 +2990,7 @@ function buildWorkbook(){
                    'TAXABLE','CGST','SGST','IGST','TAX TOTAL','ROUND OFF','INVOICE TOTAL',
                    'VERDICT','VERIFICATION','SETTLEMENT','SOURCE FILE'];
   const P = v => v == null ? '' : v / 100;
-  const sumRows = DB.docs.map(d => { const i = d.invoice; return [
+  const sumRows = (typeof misFiltered==='function'?misFiltered():DB.docs).map(d => { const i = d.invoice; return [
     i.invoice_no || '', i.invoice_date || '', i.client_raw || '', i.branch_raw || '',
     new Set(d.applicants.map(a => a.applicant_name)).size, i.rows_read ?? '',
     P(i.face_total_paise), P(i.annexure_total_paise), P(i.match_diff_paise),
@@ -2734,7 +3017,7 @@ function buildWorkbook(){
   // 2. RAW — every applicant row, as selected in the report builder
   const rawHead = reportCols.map(colLabel);
   const raw = [];
-  DB.docs.forEach(d => {
+  (typeof misFiltered==='function'?misFiltered():DB.docs).forEach(d => {
     const blank = {applicant_name:'', taxable_paise:d.invoice.taxable_paise||0, cgst_paise:0, sgst_paise:0,
                    igst_paise:d.invoice.tax_total_paise||0, total_paise:d.invoice.total_paise||0, allocation_method:'—'};
     (d.applicants.length ? d.applicants : [blank]).forEach(a => {
@@ -2746,7 +3029,7 @@ function buildWorkbook(){
 
   // 3. EXCEPTIONS
   const exc = [];
-  DB.docs.forEach(d => d.checks.filter(c => c.status === 'FAIL').forEach(c => exc.push([
+  (typeof misFiltered==='function'?misFiltered():DB.docs).forEach(d => (d.checks||[]).filter(c => c.status === 'FAIL').forEach(c => exc.push([
     c.severity, d.invoice.invoice_no || '', d.invoice.branch_raw || '',
     P(d.invoice.total_paise), c.check_id, FINDING_TEXT[c.check_id] || '', c.detail, d.filename || ''])));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(
@@ -3164,6 +3447,29 @@ function renderCloud(fails, pulled){
   }
 }
 
+/* modal helpers */
+window.showModal = (html) => { const w=$('#modalWrap'); $('#modal').innerHTML=html; w.style.display='flex'; };
+window.closeModal = () => { const w=$('#modalWrap'); if(w) w.style.display='none'; };
+document.addEventListener('keydown', e => { if(e.key==='Escape') closeModal(); });
+
+/* Review: pull database records in so historical bills can be corrected too */
+document.addEventListener('click', async (e) => {
+  if (e.target && e.target.id === 'reviewPullBtn') {
+    e.target.disabled = true; e.target.textContent = 'Pulling…';
+    try {
+      const rows = await Cloud.pullAll();
+      // shape DB rows to look like docs the review code understands
+      window.reviewPulled = rows.map(row => ({
+        content_hash: row.content_hash, hash: row.content_hash,
+        invoice: row, checks: [],   // checks aren't re-run on pulled rows; edits still allowed
+        verdict: row.verdict, verification: row.verification
+      }));
+      log(`Pulled ${rows.length} records from the database into Review.`, 'ok');
+    } catch(err){ log('Pull failed: '+err.message, 'er'); }
+    renderReview();
+  }
+});
+
 /* engine detection — optional acceleration, never required */
 (async () => {
   const p = $('#enginePill');
@@ -3204,5 +3510,8 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
   renderAll();
 })();
 </script>
+  <div id="modalWrap" class="modalwrap" style="display:none" onclick="if(event.target===this)closeModal()">
+    <div id="modal" class="modalbox"></div>
+  </div>
 </body>
 </html>
