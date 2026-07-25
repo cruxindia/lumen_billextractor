@@ -5,16 +5,14 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'none';
-  script-src 'unsafe-inline' blob: https://accounts.google.com https://apis.google.com https://www.gstatic.com;
+  script-src 'unsafe-inline' blob:;
   style-src 'unsafe-inline';
   img-src 'self' data:;
   font-src 'self';
-  connect-src 'self' http://127.0.0.1:8420 http://localhost:8420
-              https://www.googleapis.com https://accounts.google.com
-              https://apis.google.com https://www.gstatic.com https://content.googleapis.com;
+  connect-src 'self' http://127.0.0.1:8420 http://localhost:8420;
   worker-src 'self' blob:;
   manifest-src 'self';
-  frame-src https://accounts.google.com https://content.googleapis.com;
+  frame-ancestors 'none';
   form-action 'none';
   base-uri 'none';">
 <meta name="theme-color" content="#4C2082">
@@ -197,8 +195,6 @@ label.chk input{accent-color:var(--accent)}
     <button data-v="report">▦ <span class="t">Report</span></button>
     <button data-v="audit">◎ <span class="t">Audit</span></button>
     <button data-v="tally">Σ <span class="t">Tally</span></button>
-    <div class="rail-head">ARCHIVE</div>
-    <button data-v="drive">☁ <span class="t">Drive</span><span class="num" id="nDrive"></span></button>
     <div class="rail-head">WORKSPACE</div>
     <button id="saveWs">↓ <span class="t">Save</span></button>
     <button id="openWs">↑ <span class="t">Open</span></button>
@@ -275,45 +271,10 @@ label.chk input{accent-color:var(--accent)}
         <span class="spacer"></span>
         <button class="btn" id="expCsv">Export CSV</button>
         <button class="btn" id="expXlsx">Export Excel</button>
+        <button class="btn" id="expOutstanding">BOM Outstanding Report</button>
         <button class="btn" id="expDef">Export definition</button>
       </div>
       <div class="tblwrap" style="max-height:calc(100vh - 330px)"><table id="report"><thead></thead><tbody></tbody></table></div>
-    </section>
-
-    <!-- ===== DRIVE ===== -->
-    <section class="view" id="v-drive">
-      <h1>Google Drive archive</h1>
-      <p class="sub">Off by default. Until you connect an account, no document leaves this machine and the page
-         is blocked by its own security policy from contacting anything but your own computer.</p>
-      <div class="assure" style="background:var(--warn-bg);border-color:var(--warn)">
-        <span>⚠</span><span><b>Connecting Drive sends your bills to Google.</b> These documents are marked
-        <b>Restricted</b> by the bank. Confirm that storing them in your organisation's Drive is permitted before
-        you switch this on.</span></div>
-      <div class="assure" style="background:var(--surface-2);border-color:var(--line)">
-        <span>ℹ</span><span>A <b>Client ID is not a secret</b> — it is visible in the page source of every
-        Google-connected web app, and it only works from an origin you have authorised. A <b>Client Secret is
-        different</b>: Lumen never uses one, none is stored here, and one should never be placed in a browser
-        application or a public repository.</span></div>
-      <h2>Setup — once</h2>
-      <ol style="color:var(--text-2);font-size:12.5px;line-height:2;max-width:70ch">
-        <li>Open <b>console.cloud.google.com</b> → create a project → <b>APIs &amp; Services → Library</b> → enable <b>Google Drive API</b></li>
-        <li><b>Credentials → Create credentials → OAuth client ID → Web application</b></li>
-        <li>Under <b>Authorised JavaScript origins</b> add exactly: <code class="mono" id="originHint"></code></li>
-        <li>Copy the Client ID and paste it below</li>
-      </ol>
-      <div class="row" style="margin:12px 0">
-        <input type="text" id="gClientId" value="351943280022-dbvi39q3l6joohk6kr0udorbq3sf2mrt.apps.googleusercontent.com" style="min-width:460px">
-        <button class="btn pri" id="gConnect">Connect Drive</button>
-        <button class="btn" id="gDisconnect">Disconnect</button>
-        <span class="pill" id="gStatus"><i class="dot"></i> Not connected</span>
-      </div>
-      <h2>Where files are filed</h2>
-      <p class="sub">Folders are derived from the bill itself, so the archive sorts as it grows:</p>
-      <div class="mono dim" style="font-size:12px;line-height:1.9;padding:10px 12px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius)">
-        Lumen Billing Archive / <b>Bank of Maharashtra</b> / <b>FY 2024-25</b> / <b>2024-12 December</b> / PUNE-2412-9075.pdf
-      </div>
-      <h2>Upload ledger</h2>
-      <div id="driveBody"></div>
     </section>
 
     <!-- ===== TALLY ===== -->
@@ -936,6 +897,17 @@ function extractDetail(view) {
         else if (k === 'amount' || k === 'tax' || k === 'gross') rec[k + '_paise'] = paise(c.value);
         else rec[k] = String(c.value).trim();
       }
+      /* Column repair. When the header fuses "Amount GST" into one cell, the
+         "Bill Amt" heading lands one column left of where its figures actually
+         sit, so gross can capture the GST value instead of the true bill total.
+         Detect it (gross should never be <= tax) and recover the real gross:
+         the rightmost money cell on the row that exceeds the basic amount, else
+         basic + tax. Zero loss means the correct figure survives, not a
+         plausible-looking wrong one. */
+      /* gross = amount + tax, by definition. Never hunt neighbouring columns
+         for it — a stray serial or points count can look like a total. */
+      if (rec.amount_paise != null)
+        rec.gross_paise = rec.amount_paise + (rec.tax_paise || 0);
       acc.push(rec);
     }
     return acc;
@@ -1748,129 +1720,6 @@ function stripHTML(checks){
   }).join('') + '</span>';
 }
 
-/* ================= google drive ================= */
-/* Loads an external script once, with a timeout, and resolves when ready.
-   Used only for Google's sign-in client, and only after the user opts in. */
-function loadScript(src, timeoutMs){
-  return new Promise((resolve, reject) => {
-    const existing = [...document.scripts].find(s => s.src === src);
-    if (existing && existing.dataset.loaded === '1') return resolve();
-    const el = existing || document.createElement('script');
-    const done = () => { el.dataset.loaded = '1'; resolve(); };
-    const fail = () => reject(new Error('load failed'));
-    const timer = setTimeout(() => reject(new Error('timeout')), timeoutMs || 12000);
-    el.addEventListener('load', () => { clearTimeout(timer); done(); }, { once: true });
-    el.addEventListener('error', () => { clearTimeout(timer); fail(); }, { once: true });
-    if (!existing) { el.src = src; el.async = true; document.head.appendChild(el); }
-  });
-}
-
-/* Opt-in archive. Nothing here runs, and no Google script is loaded, until the
-   user supplies a client ID and presses Connect. Scope is drive.file — the app
-   can only ever see files it created itself, never the rest of the Drive. */
-const Drive = {
-  clientId: null, token: null, folders: new Map(), ready: false,
-
-  async connect(clientId){
-    this.clientId = clientId;
-    if (!window.google || !google.accounts) await loadScript('https://accounts.google.com/gsi/client', 12000);
-    return new Promise((res, rej) => {
-      const client = google.accounts.oauth2.initTokenClient({
-        client_id: clientId,
-        scope: 'https://www.googleapis.com/auth/drive.file',
-        callback: t => {
-          if (!t || !t.access_token) return rej(new Error('no token returned'));
-          /* Google returns the scopes actually granted. If the user unticked
-             the Drive permission, we hold a token that cannot upload — better to
-             refuse now than to fail silently on every file later. */
-          if (t.scope && !/drive\.file|\bdrive\b/.test(t.scope))
-            return rej(new Error('the Drive permission was not granted — reconnect and leave the Drive checkbox ticked'));
-          this.token = t.access_token; this.ready = true; res(true);
-        },
-        error_callback: e => rej(new Error(e && e.type ? e.type : 'authorisation cancelled'))
-      });
-      try { client.requestAccessToken(); }
-      catch (e) { rej(new Error('popup blocked')); }
-    });
-  },
-
-  disconnect(){ this.token = null; this.ready = false; this.folders.clear(); },
-
-  async api(url, opts){
-    const r = await fetch(url, { ...opts, headers: { Authorization: 'Bearer ' + this.token, ...(opts && opts.headers || {}) } });
-    if (r.status === 401) { this.ready = false; throw new Error('Drive session expired — reconnect'); }
-    if (!r.ok) throw new Error(`Drive returned ${r.status}`);
-    return r.json();
-  },
-
-  async folder(name, parentId){
-    const key = (parentId || 'root') + '/' + name;
-    if (this.folders.has(key)) return this.folders.get(key);
-    const q = encodeURIComponent(
-      `name='${name.replace(/'/g, "\\'")}' and mimeType='application/vnd.google-apps.folder'`
-      + ` and '${parentId || 'root'}' in parents and trashed=false`);
-    const found = await this.api(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id)`);
-    let id = found.files && found.files[0] && found.files[0].id;
-    if (!id) {
-      const made = await this.api('https://www.googleapis.com/drive/v3/files?fields=id', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.folder',
-                               parents: [parentId || 'root'] }) });
-      id = made.id;
-    }
-    this.folders.set(key, id);
-    return id;
-  },
-
-  /* Folder path derived from the bill, so the archive sorts itself as it grows.
-     Indian financial year: April to March. */
-  pathFor(rec){
-    const i = rec.invoice;
-    const client = (i.client_raw || 'Unfiled client').replace(/[\\/:*?"<>|]/g, '-').trim().slice(0, 80);
-    const d = i.invoice_date ? new Date(i.invoice_date + 'T00:00:00Z') : null;
-    let fy = 'Undated', month = 'Undated';
-    if (d && !isNaN(d)) {
-      const y = d.getUTCFullYear(), m = d.getUTCMonth();
-      const start = m >= 3 ? y : y - 1;
-      fy = `FY ${start}-${String(start + 1).slice(2)}`;
-      month = `${y}-${String(m + 1).padStart(2, '0')} ` +
-        ['January','February','March','April','May','June','July','August','September','October','November','December'][m];
-    }
-    return ['Lumen Billing Archive', client, fy, month];
-  },
-
-  async upload(rec, bytes, mime, filename){
-    let parent = null;
-    for (const seg of this.pathFor(rec)) parent = await this.folder(seg, parent);
-    const meta = { name: filename, parents: [parent] };
-    const boundary = '----lumen' + Math.random().toString(36).slice(2);
-    const head = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`
-               + JSON.stringify(meta) + `\r\n--${boundary}\r\nContent-Type: ${mime}\r\n\r\n`;
-    const tail = `\r\n--${boundary}--`;
-    const body = new Blob([head, new Uint8Array(bytes), tail], { type: 'multipart/related; boundary=' + boundary });
-    const r = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink,size', {
-      method: 'POST', headers: { Authorization: 'Bearer ' + this.token,
-                                 'Content-Type': 'multipart/related; boundary=' + boundary }, body });
-    if (!r.ok) {
-      /* Surface WHAT Google objected to. A bare status turns every failure into
-         a guess; the message body says whether it was scope, quota, or auth. */
-      let why = '';
-      try { const e = await r.json(); why = e.error && (e.error.message || e.error.status) || ''; }
-      catch (_) { try { why = (await r.text()).slice(0, 140); } catch (__) {} }
-      if (r.status === 403 && /insufficient|scope|permission/i.test(why))
-        why = 'the granted permission does not allow file upload — disconnect, reconnect, and be sure to tick the Drive permission on the consent screen';
-      throw new Error(`upload failed (${r.status})${why ? ': ' + why : ''}`);
-    }
-    const out = await r.json();
-    /* Verify the byte count Drive reports against what we sent. An upload that
-       silently truncates would leave a link to a broken file, which is worse
-       than no link at all. */
-    if (out.size != null && Number(out.size) !== bytes.byteLength)
-      throw new Error(`size mismatch: sent ${bytes.byteLength}, Drive stored ${out.size}`);
-    return out;
-  }
-};
-
 /* ================= pdf ================= */
 /* PDF.js runs its parser in a worker. The worker source is embedded and handed
    over as a Blob URL, so the application remains a single file and the CSP
@@ -2070,18 +1919,6 @@ async function ingest(fileList){
       }
       const r = L.processView(view);
       r.hash = hash; r.path = it.path; r.sessionId = session.id;
-      if (Drive.ready) {
-        try {
-          const mime = it.pdf ? 'application/pdf'
-                     : it.csv ? 'text/csv'
-                     : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-          const up = await Drive.upload(r, it.buf, mime, it.name);
-          r.link = up.webViewLink; r.driveId = up.id; session.uploaded = (session.uploaded||0) + 1;
-        } catch (e) {
-          r.uploadError = e.message; session.uploadFailed = (session.uploadFailed||0) + 1;
-          log(`${it.name} — not archived: ${e.message}`, 'er');
-        }
-      }
       DB.docs.push(r); DB.hashes.add(hash); session.count++;
     } catch (e) { failed++; log(`${it.name} — ${e.message}`, 'er'); }
     done++;
@@ -2245,13 +2082,12 @@ const FIELD_MAP = {
   invoice_status:{l:'INVOICE STATUS', g:r=>r.invoice.commercial_state},
   verdict:{l:'VERDICT', g:r=>r.verdict},
   source_file:{l:'SOURCE FILE', g:r=>r.filename},
-  drive_link:{l:'OPEN BILL', g:r=>r.link||''},
 };
 const PRESETS = {
   'Pending bills (reference layout)': ['report_date','state','zone','bank_name','branch_name','branch_email','applicant_name','invoice_number','payment_date','amount','tax_total','total_amount','payment_status'],
   'Applicant billing detail': ['invoice_number','invoice_date','bank_name','branch_name','applicant_name','service_type','location','amount','tax_total','total_amount','allocation_method'],
   'Audit trail': ['invoice_number','invoice_date','branch_name','applicant_name','amount','total_amount','verdict','source_file'],
-  'Bill check — face vs annexure': ['invoice_number','invoice_date','bank_name','branch_name','face_total','annexure_total','match_diff','match_status','rows_read','rows_printed','verdict'],
+  'Bill check — face vs annexure': ['invoice_number','invoice_date','bank_name','branch_name','face_total','annexure_total','match_diff','match_status','rows_read','rows_printed','verdict','source_file'],
 };
 let reportCols = PRESETS['Pending bills (reference layout)'].slice();
 // The reference report labels a single ~18% column 'SGST'. That label is
@@ -2416,7 +2252,6 @@ function renderAll(){
   const set = new Set(DB.docs.map(d=>d.invoice.settlement_status));
   $('#fSettle').innerHTML = '<option value="">All settlement</option>' + [...set].map(s=>`<option>${s}</option>`).join('');
   renderIngestStats(); renderLedger(); renderReview(); renderReport(); renderAudit(); renderTally();
-  if (typeof driveStatus === 'function') driveStatus();
 }
 
 /* ================= drawer ================= */
@@ -2582,7 +2417,7 @@ function buildWorkbook(){
   const sumHead = ['INVOICE NUMBER','INVOICE DATE','CLIENT','BRANCH','APPLICANTS','ROWS READ',
                    'FACE TOTAL','ANNEXURE TOTAL','DIFFERENCE','BILL CHECK',
                    'TAXABLE','CGST','SGST','IGST','TAX TOTAL','ROUND OFF','INVOICE TOTAL',
-                   'VERDICT','VERIFICATION','SETTLEMENT','SOURCE FILE','OPEN BILL'];
+                   'VERDICT','VERIFICATION','SETTLEMENT','SOURCE FILE'];
   const P = v => v == null ? '' : v / 100;
   const sumRows = DB.docs.map(d => { const i = d.invoice; return [
     i.invoice_no || '', i.invoice_date || '', i.client_raw || '', i.branch_raw || '',
@@ -2592,13 +2427,9 @@ function buildWorkbook(){
     P(i.taxable_paise), P(i.cgst_paise), P(i.sgst_paise), P(i.igst_paise),
     P(i.tax_total_paise), P(i.round_off_paise), P(i.total_paise),
     d.verdict, d.verification || '', i.settlement_status,
-    d.filename || '', d.link ? 'Open' : ''];
+    d.filename || ''];
   });
   const wsSum = XLSX.utils.aoa_to_sheet([sumHead, ...sumRows]);
-  DB.docs.forEach((d, n) => { if (!d.link) return;
-    const ref = XLSX.utils.encode_cell({ r: n + 1, c: sumHead.length - 1 });
-    if (wsSum[ref]) wsSum[ref].l = { Target: d.link, Tooltip: 'Open the original bill' };
-  });
   /* Formula AND cached value. A formula alone shows blank in any reader that
      does not recalculate — which is exactly the silent-zero failure this whole
      platform exists to prevent, reintroduced at the last step. */
@@ -2613,21 +2444,16 @@ function buildWorkbook(){
   XLSX.utils.book_append_sheet(wb, wsSum, 'Invoice Summary');
 
   // 2. RAW — every applicant row, as selected in the report builder
-  const rawHead = reportCols.map(colLabel).concat('OPEN BILL');
-  const raw = [], linkAt = [];
+  const rawHead = reportCols.map(colLabel);
+  const raw = [];
   DB.docs.forEach(d => {
     const blank = {applicant_name:'', taxable_paise:d.invoice.taxable_paise||0, cgst_paise:0, sgst_paise:0,
                    igst_paise:d.invoice.tax_total_paise||0, total_paise:d.invoice.total_paise||0, allocation_method:'—'};
     (d.applicants.length ? d.applicants : [blank]).forEach(a => {
-      raw.push(reportCols.map(k => FIELD_MAP[k].g(d, a) ?? '').concat(d.link ? 'Open' : ''));
-      linkAt.push(d.link || null);
+      raw.push(reportCols.map(k => FIELD_MAP[k].g(d, a) ?? ''));
     });
   });
   const wsRaw = XLSX.utils.aoa_to_sheet([rawHead, ...raw]);
-  linkAt.forEach((url, n) => { if (!url) return;
-    const ref = XLSX.utils.encode_cell({ r: n + 1, c: rawHead.length - 1 });
-    if (wsRaw[ref]) wsRaw[ref].l = { Target: url, Tooltip: 'Open the original bill' };
-  });
   XLSX.utils.book_append_sheet(wb, wsRaw, 'Applicant Detail (RAW)');
 
   // 3. EXCEPTIONS
@@ -2666,6 +2492,75 @@ function buildWorkbook(){
   return wb;
 }
 
+/* BOM Outstanding Report — matches the bank's own layout exactly:
+   one line per verification, grouped by applicant, a numbered Sr No on the
+   group's first line only, and a per-applicant "Sub total" row. Column order
+   and header text are copied from the supplied template so it drops straight
+   into their process. */
+function buildOutstandingReport(){
+  const HEAD = ['Sr No','Case Receive Date','Case Sent Date','Location','Zone','Bank Name','Branch Name',
+    'Branch Code','Branch Email Id','Applicant Name','Type of Verification','Invoice Number','Invoice Date',
+    'Visit Location','Payment Date','Basic Amount','Gst','Gross Total Amount'];
+  const rows = [HEAD];
+  const P = v => v == null ? '' : v / 100;
+  let sr = 0;
+
+  DB.docs.forEach(doc => {
+    const inv = doc.invoice;
+    /* Use the RAW annexure rows — one line per verification — not the collapsed
+       per-applicant allocation. Each verification (RESI, PAN, ITR…) is a
+       separate billable line on the bank's report, and squashing them by name
+       would drop the individual types and amounts. Zero loss means every
+       printed line survives to the export. */
+    const raw = ((doc.candidates && doc.candidates._applicant_rows || [])[0] || {}).normalized || [];
+    const src = raw.length ? raw : doc.applicants;   // fall back to allocation if no raw rows
+
+    // group consecutive rows by applicant name, preserving document order
+    const groups = [];
+    src.forEach(row => {
+      const name = (row.applicant_name || '(unnamed)').trim();
+      const last = groups[groups.length - 1];
+      if (last && last.name === name) last.lines.push(row);
+      else groups.push({ name, lines: [row] });
+    });
+
+    groups.forEach(({ name, lines }) => {
+      sr += 1;
+      let bSum = 0, gSum = 0, grSum = 0;
+      lines.forEach((row, idx) => {
+        // raw rows carry amount_paise + tax; allocation rows carry taxable_paise
+        const basic = row.amount_paise != null ? row.amount_paise : (row.taxable_paise || 0);
+        const gst = row.tax_paise != null ? row.tax_paise
+                  : ((row.cgst_paise || 0) + (row.sgst_paise || 0) + (row.igst_paise || 0))
+                    || Math.round(basic * (inv.tax_rate || 0.18));
+const gross = basic + gst;   /* gross is basic+tax by definition; never a stray column */
+        bSum += basic; gSum += gst; grSum += gross;
+        rows.push([
+          idx === 0 ? String(sr).padStart(4, '0') : '',
+          row.receipt_date || '', '',
+          inv.branch_location || row.location || '', '',
+          inv.client_raw || '', inv.branch_raw || '', '',
+          inv.branch_email || '',
+          name, row.service_type || '',
+          inv.invoice_no || '', inv.invoice_date || '',
+          row.location || '', inv.last_payment_date || '',
+          P(basic), P(gst), P(gross)
+        ]);
+      });
+      rows.push(['Sub total','','','','','','','','','','','','','','', P(bSum), P(gSum), P(grSum)]);
+    });
+  });
+
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Outstanding Report');
+  return wb;
+}
+
+$('#expOutstanding').onclick = () => { if(!window.XLSX) return log('Excel writer unavailable offline','er');
+  XLSX.writeFile(buildOutstandingReport(), 'BOM-Outstanding-Report.xlsx');
+  log('Exported the BOM Outstanding Report (bank template layout)', 'ok'); };
+
 $('#expXlsx').onclick = () => { if(!window.XLSX) return log('Excel writer unavailable offline','er');
   XLSX.writeFile(buildWorkbook(), 'lumen-billing.xlsx');
   log('Exported 4 sheets — Invoice Summary, Applicant Detail (RAW), Exceptions, Tally', 'ok'); };
@@ -2681,60 +2576,6 @@ $('#openWs').onclick = () => { const i = document.createElement('input'); i.type
   } catch(e){ log('Could not read that workspace file', 'er'); } }; i.click(); };
 $('#clearWs').onclick = () => { if (!confirm('Clear all ingested documents from this workspace?')) return;
   DB.docs = []; DB.hashes = new Set(); DB.sessions = []; renderAll(); persist(); log('Workspace cleared', 'wn'); };
-
-/* ---- Drive wiring ---- */
-$('#originHint').textContent = location.origin;
-function driveStatus(){
-  const p = $('#gStatus');
-  p.innerHTML = Drive.ready ? '<i class="dot on"></i> Connected' : '<i class="dot"></i> Not connected';
-  const n = DB.docs.filter(d => d.link).length;
-  $('#nDrive').textContent = n || '';
-  const body = $('#driveBody');
-  if (!DB.docs.length) { body.innerHTML = '<p class="dim">Nothing ingested yet.</p>'; return; }
-  const failed = DB.docs.filter(d => d.uploadError);
-  body.innerHTML = `
-    <div class="tblwrap" style="max-height:none"><table><thead><tr><th>Measure</th><th>Count</th><th>Meaning</th></tr></thead><tbody>
-      <tr style="cursor:default"><td>Documents in workspace</td><td class="num">${DB.docs.length}</td><td class="dim"></td></tr>
-      <tr style="cursor:default"><td>Archived to Drive</td><td class="num" style="color:var(--proof)">${n}</td><td class="dim">byte count verified after upload</td></tr>
-      <tr style="cursor:default"><td>Not archived</td><td class="num" style="color:${DB.docs.length-n?'var(--warn)':'var(--proof)'}">${DB.docs.length-n}</td>
-        <td class="dim">${Drive.ready ? (failed.length?'upload failed — see below':'ingested before Drive was connected') : 'Drive is not connected'}</td></tr>
-    </tbody></table></div>
-    ${failed.length ? `<h2>Failed uploads</h2><div class="tblwrap"><table><thead><tr><th>File</th><th>Reason</th></tr></thead><tbody>
-      ${failed.map(d=>`<tr style="cursor:default"><td class="mono">${esc(d.filename)}</td><td class="dim">${esc(d.uploadError)}</td></tr>`).join('')}
-    </tbody></table></div>` : ''}`;
-}
-$('#gConnect').onclick = async () => {
-  const btn = $('#gConnect'), id = $('#gClientId').value.trim();
-  if (!id) { setG('Paste the Client ID first', 'wn'); return; }
-  Store.set('clientId', id);   /* the ID only — an access token is never persisted */
-  btn.disabled = true; btn.textContent = 'Connecting…';
-  setG('Opening Google sign-in… if no window appears, allow pop-ups for this site', 'dim');
-  try {
-    await Drive.connect(id);
-    setG('Connected — documents ingested from now on will be archived', 'ok');
-    log('Drive connected.', 'ok');
-  } catch (e) {
-    const m = String(e.message || e);
-    const hint = /popup|window|blocked/i.test(m)
-        ? 'The sign-in window was blocked. Click the pop-up icon in the address bar, allow pop-ups for this site, and press Connect again.'
-      : /origin|redirect|idpiframe/i.test(m)
-        ? 'Origin mismatch. In Google Cloud → Clients → Lumen, the Authorised JavaScript origin must be exactly https://cruxindia.github.io (no path, no slash).'
-      : /load failed|timeout/i.test(m)
-        ? 'Google’s sign-in script could not load — check the connection and try again.'
-        : m;
-    setG(hint, 'er');
-    log('Drive connect failed: ' + m, 'er');
-  } finally {
-    btn.disabled = false; btn.textContent = 'Connect Drive';
-    driveStatus();
-  }
-};
-function setG(msg, kind){
-  const p = $('#gStatus');
-  const col = kind==='ok'?'var(--proof)':kind==='er'?'var(--fail)':kind==='wn'?'var(--warn)':'var(--text-3)';
-  p.innerHTML = `<i class="dot ${kind==='ok'?'on':''}"></i> <span style="color:${col}">${esc(msg)}</span>`;
-}
-$('#gDisconnect').onclick = () => { Drive.disconnect(); log('Drive disconnected. Nothing further will be uploaded.', 'dim'); driveStatus(); };
 
 /* engine detection — optional acceleration, never required */
 (async () => {
