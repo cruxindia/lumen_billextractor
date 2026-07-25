@@ -1753,19 +1753,25 @@ const Cloud = {
 
   /* map a processed doc to the flat invoice row the schema expects */
   invoiceRow(doc){
-    const i = doc.invoice;
+    const i = doc.invoice, m = doc.metadata || {};
     return {
       content_hash: doc.hash,
-      invoice_no: i.invoice_no, invoice_date: i.invoice_date,
-      client_raw: i.client_raw, branch_raw: i.branch_raw, branch_email: i.branch_email,
-      supplier_gstin: i.supplier_gstin, recipient_gstin: i.recipient_gstin, sac_hsn: i.sac_hsn,
+      invoice_no: i.invoice_no, invoice_no_normalized: i.invoice_no_normalized,
+      invoice_date: i.invoice_date, period: i.period, due_date: i.due_date,
+      client_raw: i.client_raw, branch_raw: i.branch_raw, branch_email: i.branch_email, sac_hsn: i.sac_hsn,
+      supplier_gstin: i.supplier_gstin, recipient_gstin: i.recipient_gstin, supplier_pan: i.supplier_pan,
       taxable_paise: i.taxable_paise, cgst_paise: i.cgst_paise, sgst_paise: i.sgst_paise,
-      igst_paise: i.igst_paise, tax_total_paise: i.tax_total_paise, round_off_paise: i.round_off_paise,
+      igst_paise: i.igst_paise, gst_paise: i.gst_paise, tax_total_paise: i.tax_total_paise, round_off_paise: i.round_off_paise,
       total_paise: i.total_paise, tax_rate: i.tax_rate,
       face_total_paise: i.face_total_paise, annexure_total_paise: i.annexure_total_paise,
       match_status: i.match_status, match_diff_paise: i.match_diff_paise,
       rows_read: i.rows_read, rows_printed: i.rows_printed,
-      verdict: doc.verdict, verification: doc.verification, source_file: doc.filename
+      verdict: doc.verdict, verification: doc.verification, source_file: doc.filename,
+      settlement_status: i.settlement_status, commercial_state: i.commercial_state,
+      processing_state: i.processing_state, written_off: i.written_off,
+      allocated_paise: i.allocated_paise, last_payment_date: i.last_payment_date,
+      doc_type: doc.documentType, type_confidence: doc.typeConfidence,
+      page_count: m.pageCount, is_scanned: m.isScanned, text_items: m.textItems
     };
   },
 
@@ -1773,11 +1779,12 @@ const Cloud = {
   lineRows(doc){
     const raw = ((doc.candidates && doc.candidates._applicant_rows || [])[0] || {}).normalized || [];
     if (raw.length) return raw.map((r,idx) => ({
-      line_no: parseInt(r.serial,10) || (idx+1),
+      line_no: parseInt(r.serial,10) || (idx+1), serial: r.serial || null,
       applicant_name: r.applicant_name || null, receipt_date: r.receipt_date || null,
       service_type: r.service_type || null, location: r.location || null,
       amount_paise: r.amount_paise ?? null, tax_paise: r.tax_paise ?? null,
-      gross_paise: (r.amount_paise!=null?r.amount_paise:0) + (r.tax_paise!=null?r.tax_paise:0) || null
+      gross_paise: (r.amount_paise!=null?r.amount_paise:0) + (r.tax_paise!=null?r.tax_paise:0) || null,
+      src_sheet: r.locator ? r.locator.sheet : null, src_row: r.locator ? r.locator.row : null
     }));
     // fall back to allocation rows if no raw annexure
     return doc.applicants.map((a,idx) => ({
@@ -1794,8 +1801,17 @@ const Cloud = {
       severity: c.severity || null, detail: (c.detail||'').slice(0,500) }));
   },
 
+  confRows(doc){
+    const c = doc.confidences || {}, a = doc.agreement || {};
+    const keys = new Set([...Object.keys(c), ...Object.keys(a)]);
+    return [...keys].map(field => ({ field,
+      confidence: typeof c[field]==='number' ? c[field] : null,
+      agreement:  typeof a[field]==='number' ? a[field] : null }));
+  },
+
   async pushOne(doc){
-    const body = { p: this.invoiceRow(doc), lines: this.lineRows(doc), chk: this.checkRows(doc) };
+    const body = { p: this.invoiceRow(doc), lines: this.lineRows(doc),
+                   chk: this.checkRows(doc), conf: this.confRows(doc) };
     const r = await fetch(this.url + '/rpc/sync_invoice', {
       method: 'POST', headers: this.headers(), body: JSON.stringify(body) });
     if (!r.ok) { const t = await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
