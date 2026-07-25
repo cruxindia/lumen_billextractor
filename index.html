@@ -2049,6 +2049,32 @@ function renderReview(){
 }
 
 /* ---- report: columns are a MAPPING, never the schema ---- */
+/* Money accessors that work on BOTH row shapes and NEVER return NaN.
+   Allocation rows carry taxable_paise + cgst/sgst/igst_paise; raw annexure
+   rows carry amount_paise + tax_paise. A getter that assumed one shape and got
+   the other produced undefined/100 = NaN, which Excel then wrote into a numeric
+   cell and refused to open. Empty is returned as '' so a blank cell stays blank
+   rather than becoming a spurious zero. */
+const mDiv  = v => (typeof v === 'number' && isFinite(v)) ? v/100 : '';
+const mBasic = a => { const v = (typeof a.taxable_paise==='number') ? a.taxable_paise
+                          : (typeof a.amount_paise==='number') ? a.amount_paise : null;
+                      return v==null ? '' : v/100; };
+const mTax = a => { let t = 0, seen = false;
+    for (const k of ['cgst_paise','sgst_paise','igst_paise']) if (typeof a[k]==='number') { t += a[k]; seen = true; }
+    if (!seen && typeof a.tax_paise==='number') { t = a.tax_paise; seen = true; }
+    return seen ? t/100 : ''; };
+const mGross = (r,a) => {
+    if (typeof a.gross_paise==='number') return a.gross_paise/100;
+    if (typeof a.total_paise==='number') return a.total_paise/100;
+    const b = (typeof a.taxable_paise==='number') ? a.taxable_paise
+            : (typeof a.amount_paise==='number') ? a.amount_paise : null;
+    if (b==null) return '';
+    let tax = 0, seen=false;
+    for (const k of ['cgst_paise','sgst_paise','igst_paise']) if (typeof a[k]==='number'){tax+=a[k];seen=true;}
+    if (!seen && typeof a.tax_paise==='number'){tax=a.tax_paise;seen=true;}
+    if (!seen) tax = Math.round(b*((r.invoice&&r.invoice.tax_rate)||0.18));
+    return (b+tax)/100; };
+
 const FIELD_MAP = {
   report_date:{perApplicant:1, l:'REPORT DATE', g:(r,a)=>a.receipt_date||r.invoice.invoice_date},
   invoice_date:{l:'INVOICE DATE', g:r=>r.invoice.invoice_date},
@@ -2065,12 +2091,12 @@ const FIELD_MAP = {
   service_type:{perApplicant:1, l:'TYPE', g:(r,a)=>a.service_type},
   location:{perApplicant:1, l:'LOCATION', g:(r,a)=>a.location},
   payment_date:{l:'PAYMENT DATE', g:r=>r.invoice.last_payment_date},
-  amount:{perApplicant:1, l:'AMOUNT', g:(r,a)=>a.taxable_paise/100, n:1},
-  cgst:{perApplicant:1, l:'CGST', g:(r,a)=>a.cgst_paise/100, n:1},
-  sgst:{perApplicant:1, l:'SGST', g:(r,a)=>a.sgst_paise/100, n:1},
-  igst:{perApplicant:1, l:'IGST', g:(r,a)=>a.igst_paise/100, n:1},
-  tax_total:{perApplicant:1, l:'TAX', g:(r,a)=>(a.cgst_paise+a.sgst_paise+a.igst_paise)/100, n:1},
-  total_amount:{perApplicant:1, l:'TOTAL AMOUNT', g:(r,a)=>a.total_paise/100, n:1},
+  amount:{perApplicant:1, l:'AMOUNT', g:(r,a)=>mBasic(a), n:1},
+  cgst:{perApplicant:1, l:'CGST', g:(r,a)=>mDiv(a.cgst_paise), n:1},
+  sgst:{perApplicant:1, l:'SGST', g:(r,a)=>mDiv(a.sgst_paise), n:1},
+  igst:{perApplicant:1, l:'IGST', g:(r,a)=>mDiv(a.igst_paise), n:1},
+  tax_total:{perApplicant:1, l:'TAX', g:(r,a)=>mTax(a), n:1},
+  total_amount:{perApplicant:1, l:'TOTAL AMOUNT', g:(r,a)=>mGross(r,a), n:1},
   face_total:{l:'FACE TOTAL', g:r=>r.invoice.face_total_paise==null?'':r.invoice.face_total_paise/100, n:1},
   annexure_total:{l:'ANNEXURE TOTAL', g:r=>r.invoice.annexure_total_paise==null?'':r.invoice.annexure_total_paise/100, n:1},
   match_status:{l:'BILL CHECK', g:r=>({MATCH:'OK',ROUNDED:'OK (rounded)',RECHECK:'⚑ RECHECK THE BILL','NO ANNEXURE':'no annexure'})[r.invoice.match_status]||''},
@@ -2087,7 +2113,7 @@ const FIELD_MAP = {
   branch_code:{l:'Branch Code', g:r=>r.invoice.branch_code||''},
   visit_location:{perApplicant:1, l:'Visit Location', g:(r,a)=>a.location||''},
   receipt_date:{perApplicant:1, l:'Case Receive Date', g:(r,a)=>a.receipt_date||''},
-  gross_amount:{perApplicant:1, n:1, l:'Gross Total Amount', g:(r,a)=>((a.taxable_paise||a.amount_paise||0)+((a.cgst_paise||0)+(a.sgst_paise||0)+(a.igst_paise||0)||Math.round((a.taxable_paise||a.amount_paise||0)*(r.invoice.tax_rate||0.18))))/100},
+  gross_amount:{perApplicant:1, n:1, l:'Gross Total Amount', g:(r,a)=>mGross(r,a)},
 };
 const PRESETS = {
   'Pending bills (reference layout)': ['report_date','state','zone','bank_name','branch_name','branch_email','applicant_name','invoice_number','payment_date','amount','tax_total','total_amount','payment_status'],
@@ -2551,7 +2577,8 @@ const LumenStyle = (() => {
   /* write: rows = array of {cells:[...], style:'header'|'body'|'subtotal'|'grand', zebra:bool},
      cols = column widths. Returns a Blob. */
   async function write(sheetName, header, dataRows, colWidths, filename){
-    const aoa = [header.map(h=>h.label), ...dataRows.map(r=>r.cells)];
+    const clean = v => (typeof v === 'number' && !isFinite(v)) ? '' : v;   // NaN/Infinity -> blank
+    const aoa = [header.map(h=>h.label), ...dataRows.map(r=>r.cells.map(clean))];
     const ws = XLSX.utils.aoa_to_sheet(aoa);
     ws['!cols'] = colWidths.map(w => ({ wch: w }));
     ws['!freeze'] = { xSplit:0, ySplit:1 };
@@ -2685,7 +2712,7 @@ $('#expXlsx').onclick = async () => { if(!window.XLSX) return log('Excel writer 
   const grand = {};   // money column totals
 
   const pushCells = (arr, style, zebra) => {
-    reportCols.forEach((k, i) => { if (FIELD_MAP[k].n && typeof arr[i] === 'number') grand[i] = (grand[i]||0) + arr[i]; });
+    reportCols.forEach((k, i) => { if (FIELD_MAP[k].n && typeof arr[i] === 'number' && isFinite(arr[i])) grand[i] = (grand[i]||0) + arr[i]; });
     dataRows.push({ cells: arr, style, zebra });
   };
 
