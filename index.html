@@ -294,6 +294,7 @@ label.chk input{accent-color:var(--accent)}
         <button class="btn pri" id="cloudPush">Push this session to database</button>
         <button class="btn" id="cloudPull">Pull full history down</button>
         <button class="btn" id="cloudBranches">View branches learned</button>
+        <button class="btn" id="cloudClients">View clients</button>
         <span class="pill" id="cloudStatus"><i class="dot"></i> Ready</span>
       </div>
 
@@ -817,8 +818,41 @@ function extractFace(view) {
     const r0 = rc(to[0][0])[0];
     const noise = /gstn|gstin|e-?mail|floor|tower|invoice|sac\b|hsn|pan\b|msme\s*no|page\s*:|^to\s*,?$|tel\.|udyam|description|period|road\s*num/i;
     const block = textCells(face).filter(([ref, t]) => { const [r, c] = rc(ref); return c === 1 && r > r0 && r <= r0 + 10 && t.trim() && !/\d{2}[A-Z]{5}\d{4}[A-Z]/.test(t.toUpperCase()) && !noise.test(t); });
-    if (block[0]) push('client_raw', block[0][1].trim(), block[0][1].trim(), 'string', .8, 'addressee_block', face.name, block[0][0]);
-    if (block[1]) push('branch_raw', block[1][1].trim(), block[1][1].trim(), 'string', .75, 'addressee_block', face.name, block[1][0]);
+    /* Split client from branch intelligently. Three layouts occur:
+       (a) two lines: "BANK OF MAHARASHTRA" / "PARVATI PUNE-158"  -> as-is
+       (b) one fused line: "BANK OF MAHARASHTRA PATAS BRANCH - 172"
+       (c) branch only, bank name absent: "RANJANGAON -681"
+       We detect the bank name by pattern (X BANK / BANK OF X), not a fixed list,
+       so any client bank works — nothing hardcoded. */
+    /* "<WORD> BANK OF <WORD>" or "BANK OF <WORD>" — the recipient bank pattern.
+       Deliberately NOT a generic "...BANK" (which would match "ICICI Bank" in
+       the remittance footer). Anchored to the "BANK OF" form these bank clients
+       use, so the supplier's own bank name is never picked up. */
+    const BANK_RX = /\b((?:[A-Z][A-Za-z]+\s+)?BANK\s+OF\s+[A-Za-z]+)\b/i;
+    let clientVal = block[0] ? block[0][1].trim() : null;
+    let branchVal = block[1] ? block[1][1].trim() : null;
+
+    if (clientVal) {
+      const bm = BANK_RX.exec(clientVal);
+      if (bm && bm[0].length < clientVal.length - 2) {
+        // (b) fused line: bank name + branch on one line -> split
+        const bank = bm[0].trim();
+        const rest = clientVal.replace(bm[0], '').replace(/^[\s,-]+|[\s,-]+$/g, '').trim();
+        if (rest && !branchVal) { clientVal = bank; branchVal = rest; }
+      } else if (!bm && !branchVal) {
+        // (c) addressee line is a branch with no bank name. Find the bank ONLY in
+        // the addressee region (at/just below "To,"), never the remittance footer.
+        let foundBank = null;
+        for (const [ref, t] of textCells(face)) {
+          const [rr] = rc(ref); if (rr < r0 || rr > r0 + 6) continue;
+          const m = BANK_RX.exec(t); if (m) { foundBank = m[0].trim(); break; }
+        }
+        if (foundBank) { branchVal = clientVal; clientVal = foundBank; }
+      }
+    }
+
+    if (clientVal) push('client_raw', clientVal, clientVal, 'string', .8, 'addressee_block', face.name, block[0][0]);
+    if (branchVal) push('branch_raw', branchVal, branchVal, 'string', .75, 'addressee_block', face.name, block[1] ? block[1][0] : block[0][0]);
   }
 
   const [hrow, cols] = findTable(face, LINE_HEADERS, 2);
@@ -1851,6 +1885,29 @@ const Cloud = {
     return (Array.isArray(rows) ? rows[0] : rows) || null;
   },
 
+  /* Resolve a raw addressee against the clients master table. Returns
+     {client_name, matched_prefix} if the org is known, else null. Used to split
+     client from branch by KNOWN ORG NAME rather than a hardcoded pattern. */
+  async resolveClient(raw){
+    if(!raw) return null;
+    const r = await fetch(this.url + '/rpc/resolve_client', {
+      method:'POST', headers: this.headers(), body: JSON.stringify({ raw }) });
+    if(!r.ok) return null;
+    const rows = await r.json();
+    return (Array.isArray(rows)?rows[0]:rows) || null;
+  },
+  async learnClient(raw){
+    if(!raw) return;
+    try { await fetch(this.url + '/rpc/learn_client', {
+      method:'POST', headers:this.headers(), body: JSON.stringify({ raw }) }); } catch(_){}
+  },
+  async allClients(){
+    const r = await fetch(this.url + '/clients?select=*&order=category,client_name', {
+      headers:this.headers({ 'Range':'0-9999' }) });
+    if(!r.ok){ const t=await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
+    return await r.json();
+  },
+
   async allBranches(){
     const r = await fetch(this.url + '/branches?select=*&order=client_raw,branch_raw', {
       headers: this.headers({ 'Range':'0-9999' }) });
@@ -1864,7 +1921,42 @@ const Cloud = {
      the value is never silently passed off as having come from the document. */
   async enrichFromMaster(doc){
     const i = doc.invoice;
-    if (i.branch_email && i.recipient_gstin) return;   // nothing missing
+    doc.enriched = doc.enriched || {};
+
+    /* STEP 1 — resolve client vs branch against the clients master table.
+       If the addressee contains a KNOWN client name (bank, NBFC, insurer,
+       automaker…), split it: the known org is the client, the remainder is the
+       branch. This replaces the "Bank of" pattern with a real, growing roster.
+       Try the client line first, then the branch line (in case they're swapped
+       or fused). */
+    for (const cand of [i.client_raw, [i.client_raw,i.branch_raw].filter(Boolean).join(' ')]) {
+      if (!cand) continue;
+      const resolved = await this.resolveClient(cand);
+      if (resolved && resolved.client_name) {
+        const known = resolved.client_name;
+        // the branch is whatever's left after removing the known client name
+        const combined = [i.client_raw, i.branch_raw].filter(Boolean).join(' ').trim();
+        const normKnown = known.replace(/[^a-z0-9]/gi,'').toUpperCase();
+        const normComb  = combined.replace(/[^a-z0-9]/gi,'').toUpperCase();
+        if (normComb.startsWith(normKnown)) {
+          // strip the client name off the front to get the branch
+          let branch = combined;
+          // remove the matched org words from the start, case-insensitive
+          const knownWords = known.split(/\s+/).length;
+          branch = combined.split(/\s+/).slice(knownWords).join(' ').replace(/^[\s,\-]+/,'').trim();
+          if (i.client_raw !== known) { i.client_raw = known; doc.enriched.client_raw = 'clients_table'; }
+          if (branch && i.branch_raw !== branch) { i.branch_raw = branch; doc.enriched.branch_raw = 'clients_table'; }
+        } else if (i.client_raw !== known) {
+          i.client_raw = known; doc.enriched.client_raw = 'clients_table';
+        }
+        break;
+      }
+    }
+    // STEP 1b — teach the table any client it didn't already know (silent auto-add)
+    await this.learnClient(i.client_raw);
+
+    // STEP 2 — fill missing branch details from the branches master table
+    if (i.branch_email && i.recipient_gstin) return;
     const m = await this.lookupBranch(i.client_raw, i.branch_raw);
     if (!m) return;
     doc.enriched = doc.enriched || {};
@@ -2956,6 +3048,24 @@ $('#cloudPush') && ($('#cloudPush').onclick = async () => {
   setCloud(`${tally.inserted} new · ${tally.updated} updated · ${tally.unchanged} already there`
     + (tally.failed?` · ${tally.failed} failed`:''), ok?'ok':'er');
   renderCloud(fails);
+});
+$('#cloudClients') && ($('#cloudClients').onclick = async () => {
+  const btn=$('#cloudClients'); btn.disabled=true; setCloud('Loading clients…','dim');
+  try {
+    const rows = await Cloud.allClients();
+    const learned = rows.filter(r=>!r.seeded).length;
+    setCloud(`${rows.length} clients (${learned} learned from bills)`, 'ok');
+    const el=$('#cloudBody');
+    el.innerHTML = `<h2>Clients master table — ${rows.length}</h2>
+      <p class="sub">Seeded with known banks, NBFCs, insurers and auto-finance; any new client an invoice
+         reveals is added automatically (shown as “learned”). This is what decides client vs branch.</p>
+      <div class="tblwrap" style="max-height:60vh;overflow:auto"><table><thead><tr>
+        <th>Client</th><th>Category</th><th>Source</th><th>Bills</th></tr></thead><tbody>
+        ${rows.map(r=>`<tr style="cursor:default"><td>${esc(r.client_name)}</td><td>${esc(r.category||'')}</td>
+          <td>${r.seeded?'<span class=dim>seeded</span>':'<b>learned</b>'}</td><td class="num">${r.bill_count||''}</td></tr>`).join('')}
+      </tbody></table></div>`;
+  } catch(e){ setCloud('Could not load clients: '+e.message, 'er'); }
+  btn.disabled=false;
 });
 $('#cloudBranches') && ($('#cloudBranches').onclick = async () => {
   const btn=$('#cloudBranches'); btn.disabled=true; setCloud('Loading master table…','dim');
