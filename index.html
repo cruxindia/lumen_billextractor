@@ -5,12 +5,13 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'none';
-  script-src 'unsafe-inline' blob: https://accounts.google.com https://apis.google.com;
+  script-src 'unsafe-inline' blob: https://accounts.google.com https://apis.google.com https://www.gstatic.com;
   style-src 'unsafe-inline';
   img-src 'self' data:;
   font-src 'self';
   connect-src 'self' http://127.0.0.1:8420 http://localhost:8420
-              https://www.googleapis.com https://accounts.google.com;
+              https://www.googleapis.com https://accounts.google.com
+              https://apis.google.com https://www.gstatic.com;
   worker-src 'self' blob:;
   manifest-src 'self';
   frame-src https://accounts.google.com;
@@ -1766,7 +1767,8 @@ const Drive = {
                          else rej(new Error('no token returned')); },
         error_callback: e => rej(new Error(e && e.type ? e.type : 'authorisation cancelled'))
       });
-      client.requestAccessToken();
+      try { client.requestAccessToken(); }
+      catch (e) { rej(new Error('popup blocked')); }
     });
   },
 
@@ -2671,15 +2673,36 @@ function driveStatus(){
     </tbody></table></div>` : ''}`;
 }
 $('#gConnect').onclick = async () => {
-  const id = $('#gClientId').value.trim();
+  const btn = $('#gConnect'), id = $('#gClientId').value.trim();
+  if (!id) { setG('Paste the Client ID first', 'wn'); return; }
   Store.set('clientId', id);   /* the ID only — an access token is never persisted */
-  if (!id) return log('Paste your Google OAuth Client ID first', 'wn');
+  btn.disabled = true; btn.textContent = 'Connecting…';
+  setG('Opening Google sign-in… if no window appears, allow pop-ups for this site', 'dim');
   try {
     await Drive.connect(id);
-    log('Drive connected. Documents ingested from now on will be archived.', 'ok');
-  } catch (e) { log('Could not connect to Drive: ' + e.message, 'er'); }
-  driveStatus();
+    setG('Connected — documents ingested from now on will be archived', 'ok');
+    log('Drive connected.', 'ok');
+  } catch (e) {
+    const m = String(e.message || e);
+    const hint = /popup|window|blocked/i.test(m)
+        ? 'The sign-in window was blocked. Click the pop-up icon in the address bar, allow pop-ups for this site, and press Connect again.'
+      : /origin|redirect|idpiframe/i.test(m)
+        ? 'Origin mismatch. In Google Cloud → Clients → Lumen, the Authorised JavaScript origin must be exactly https://cruxindia.github.io (no path, no slash).'
+      : /load failed|timeout/i.test(m)
+        ? 'Google’s sign-in script could not load — check the connection and try again.'
+        : m;
+    setG(hint, 'er');
+    log('Drive connect failed: ' + m, 'er');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Connect Drive';
+    driveStatus();
+  }
 };
+function setG(msg, kind){
+  const p = $('#gStatus');
+  const col = kind==='ok'?'var(--proof)':kind==='er'?'var(--fail)':kind==='wn'?'var(--warn)':'var(--text-3)';
+  p.innerHTML = `<i class="dot ${kind==='ok'?'on':''}"></i> <span style="color:${col}">${esc(msg)}</span>`;
+}
 $('#gDisconnect').onclick = () => { Drive.disconnect(); log('Drive disconnected. Nothing further will be uploaded.', 'dim'); driveStatus(); };
 
 /* engine detection — optional acceleration, never required */
