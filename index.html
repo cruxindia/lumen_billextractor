@@ -293,6 +293,7 @@ label.chk input{accent-color:var(--accent)}
       <div class="row" style="margin:14px 0">
         <button class="btn pri" id="cloudPush">Push this session to database</button>
         <button class="btn" id="cloudPull">Pull full history down</button>
+        <button class="btn" id="cloudBranches">View branches learned</button>
         <span class="pill" id="cloudStatus"><i class="dot"></i> Ready</span>
       </div>
 
@@ -797,12 +798,24 @@ function extractFace(view) {
                      'regex+' + method, face.name, supplier[0]);
   if (recipient) push('recipient_gstin', recipient[1], recipient[1], 'string', method === 'pan_match' ? .85 : .7,
                      'regex+' + method, face.name, recipient[0]);
-  for (const [ref, text] of textCells(face)) { const m = EMAIL_RX.exec(text); if (m) { push('branch_email', m[0], m[0].toLowerCase(), 'string', .6, 'regex', face.name, ref); break; } }
+  /* The branch email must belong to the RECIPIENT, not the supplier. The
+     supplier's own address block (with accounts@... ) sits at the top of the
+     bill, above "To,". Only accept an email at or below the addressee row so we
+     never mistake the sender's email for the branch's. */
+  {
+    const toAnchor = findLabel(face, [/^\s*to\s*,?\s*$/i, /^bill\s*to\b/i]);
+    const minRow = toAnchor.length ? rc(toAnchor[0][0])[0] : 0;
+    for (const [ref, text] of textCells(face)) {
+      const [rr] = rc(ref); if (rr < minRow) continue;
+      const m = EMAIL_RX.exec(text);
+      if (m) { push('branch_email', m[0], m[0].toLowerCase(), 'string', .6, 'regex', face.name, ref); break; }
+    }
+  }
 
   const to = findLabel(face, [/^\s*to\s*,?\s*$/i, /^bill\s*to\b/i]);
   if (to.length) {
     const r0 = rc(to[0][0])[0];
-    const noise = /gstn|gstin|e-?mail|floor|tower|invoice|sac\b|hsn|pan\b|msme|page\s*:|^to\s*,?$|tel\.|udyam|description|period|road\s*num/i;
+    const noise = /gstn|gstin|e-?mail|floor|tower|invoice|sac\b|hsn|pan\b|msme\s*no|page\s*:|^to\s*,?$|tel\.|udyam|description|period|road\s*num/i;
     const block = textCells(face).filter(([ref, t]) => { const [r, c] = rc(ref); return c === 1 && r > r0 && r <= r0 + 10 && t.trim() && !/\d{2}[A-Z]{5}\d{4}[A-Z]/.test(t.toUpperCase()) && !noise.test(t); });
     if (block[0]) push('client_raw', block[0][1].trim(), block[0][1].trim(), 'string', .8, 'addressee_block', face.name, block[0][0]);
     if (block[1]) push('branch_raw', block[1][1].trim(), block[1][1].trim(), 'string', .75, 'addressee_block', face.name, block[1][0]);
@@ -1642,6 +1655,7 @@ function processView(view) {
       invoice_no_normalized: v.invoice_no ? String(v.invoice_no).toUpperCase().replace(/\s+/g,'') : null,
       invoice_date: v.invoice_date || null, due_date: v.due_date || null, period: v.period || null,
       client_raw: v.client_raw || null, branch_raw: v.branch_raw || null,
+      branch_code: (function(b){ if(!b) return null; var m=b.match(/(?:-\s*|\b)(\d{1,4})\s*$/); return m?m[1]:null; })(v.branch_raw) || null,
       branch_email: v.branch_email || null, sac_hsn: v.sac_hsn || null,
       supplier_gstin: v.supplier_gstin || null, recipient_gstin: v.recipient_gstin || null, supplier_pan: v.supplier_pan || null,
       taxable_paise: v.taxable_paise ?? null, cgst_paise: v.cgst_paise ?? null, sgst_paise: v.sgst_paise ?? null,
@@ -1758,7 +1772,7 @@ const Cloud = {
       content_hash: doc.hash,
       invoice_no: i.invoice_no, invoice_no_normalized: i.invoice_no_normalized,
       invoice_date: i.invoice_date, period: i.period, due_date: i.due_date,
-      client_raw: i.client_raw, branch_raw: i.branch_raw, branch_email: i.branch_email, sac_hsn: i.sac_hsn,
+      client_raw: i.client_raw, branch_raw: i.branch_raw, branch_email: i.branch_email, branch_code: i.branch_code, sac_hsn: i.sac_hsn,
       supplier_gstin: i.supplier_gstin, recipient_gstin: i.recipient_gstin, supplier_pan: i.supplier_pan,
       taxable_paise: i.taxable_paise, cgst_paise: i.cgst_paise, sgst_paise: i.sgst_paise,
       igst_paise: i.igst_paise, gst_paise: i.gst_paise, tax_total_paise: i.tax_total_paise, round_off_paise: i.round_off_paise,
@@ -1823,6 +1837,48 @@ const Cloud = {
       headers: this.headers({ 'Range': '0-9999' }) });
     if (!r.ok) { const t = await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
     return await r.json();
+  },
+
+  /* Look up a branch in the master table to fill a gap a bill is missing.
+     Returns the learned record or null. */
+  async lookupBranch(client, branch){
+    if(!client || !branch) return null;
+    const r = await fetch(this.url + '/rpc/lookup_branch', {
+      method:'POST', headers: this.headers(),
+      body: JSON.stringify({ p_client: client, p_branch: branch }) });
+    if(!r.ok) return null;
+    const rows = await r.json();
+    return (Array.isArray(rows) ? rows[0] : rows) || null;
+  },
+
+  async allBranches(){
+    const r = await fetch(this.url + '/branches?select=*&order=client_raw,branch_raw', {
+      headers: this.headers({ 'Range':'0-9999' }) });
+    if(!r.ok){ const t=await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
+    return await r.json();
+  },
+
+  /* Fill genuinely-missing invoice fields from the master table BEFORE push.
+     Only fills a field that is null/empty on the bill — never overwrites what
+     the bill actually stated. Every filled field is recorded in doc.enriched so
+     the value is never silently passed off as having come from the document. */
+  async enrichFromMaster(doc){
+    const i = doc.invoice;
+    if (i.branch_email && i.recipient_gstin) return;   // nothing missing
+    const m = await this.lookupBranch(i.client_raw, i.branch_raw);
+    if (!m) return;
+    doc.enriched = doc.enriched || {};
+    if (!i.branch_email && m.branch_email) { i.branch_email = m.branch_email; doc.enriched.branch_email = 'master'; }
+    if (!i.recipient_gstin && m.recipient_gstin) { i.recipient_gstin = m.recipient_gstin; doc.enriched.recipient_gstin = 'master'; }
+    if (!i.branch_code && m.branch_code) { i.branch_code = m.branch_code; doc.enriched.branch_code = 'master'; }
+  },
+
+  async updateOne(hash, patch){
+    const r = await fetch(this.url + '/invoices?content_hash=eq.' + encodeURIComponent(hash), {
+      method: 'PATCH', headers: this.headers({ 'Prefer': 'return=minimal' }),
+      body: JSON.stringify(patch) });
+    if (!r.ok) { const t = await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
+    return true;
   }
 };
 
@@ -2892,7 +2948,7 @@ $('#cloudPush') && ($('#cloudPush').onclick = async () => {
   for(let i=0;i<DB.docs.length;i++){
     const d = DB.docs[i];
     setCloud(`Pushing ${i+1} of ${DB.docs.length}…`, 'dim');
-    try { const res = await Cloud.pushOne(d); tally[res] = (tally[res]||0)+1; }
+    try { await Cloud.enrichFromMaster(d); const res = await Cloud.pushOne(d); tally[res] = (tally[res]||0)+1; }
     catch(e){ tally.failed++; fails.push([d.filename, e.message]); }
   }
   btn.disabled = false;
@@ -2900,6 +2956,24 @@ $('#cloudPush') && ($('#cloudPush').onclick = async () => {
   setCloud(`${tally.inserted} new · ${tally.updated} updated · ${tally.unchanged} already there`
     + (tally.failed?` · ${tally.failed} failed`:''), ok?'ok':'er');
   renderCloud(fails);
+});
+$('#cloudBranches') && ($('#cloudBranches').onclick = async () => {
+  const btn=$('#cloudBranches'); btn.disabled=true; setCloud('Loading master table…','dim');
+  try {
+    const rows = await Cloud.allBranches();
+    setCloud(`${rows.length} branch(es) learned from bills`, 'ok');
+    const el=$('#cloudBody');
+    el.innerHTML = `<h2>Branches master table — ${rows.length}</h2>
+      <p class="sub">Learned automatically from every bill pushed. A field filled here can be used to complete a
+         future bill that's missing it. Nothing here is hardcoded — it grows from your data.</p>
+      <div class="tblwrap" style="max-height:60vh;overflow:auto"><table><thead><tr>
+        <th>Client</th><th>Branch</th><th>Code</th><th>Email</th><th>GSTIN</th><th>Bills</th></tr></thead><tbody>
+        ${rows.map(r=>`<tr style="cursor:default"><td>${esc(r.client_raw)}</td><td>${esc(r.branch_raw)}</td>
+          <td class="mono">${esc(r.branch_code||'')}</td><td>${esc(r.branch_email||'')}</td>
+          <td class="mono">${esc(r.recipient_gstin||'')}</td><td class="num">${r.bill_count}</td></tr>`).join('')}
+      </tbody></table></div>`;
+  } catch(e){ setCloud('Could not load branches: '+e.message, 'er'); }
+  btn.disabled=false;
 });
 $('#cloudPull') && ($('#cloudPull').onclick = async () => {
   const btn=$('#cloudPull'); btn.disabled=true; setCloud('Pulling…','dim');
@@ -2910,17 +2984,39 @@ $('#cloudPull') && ($('#cloudPull').onclick = async () => {
   } catch(e){ setCloud('Pull failed: '+e.message, 'er'); }
   btn.disabled=false;
 });
+/* the fields shown in the editable pull view, in order */
+const CLOUD_EDIT_COLS = [
+  ['invoice_no','Invoice No',0], ['invoice_date','Date',0], ['client_raw','Client',0],
+  ['branch_raw','Branch',0], ['branch_email','Branch Email',0], ['branch_code','Branch Code',0],
+  ['period','Period',0], ['supplier_gstin','Supplier GSTIN',0], ['recipient_gstin','Recipient GSTIN',0],
+  ['taxable_paise','Taxable',1], ['tax_total_paise','Tax',1], ['total_paise','Total',1],
+  ['settlement_status','Settlement',0], ['verdict','Verdict',0], ['rows_read','Rows',0]
+];
+let cloudRows = [];
+const cloudEdits = new Map();
+
 function renderCloud(fails, pulled){
   const el = $('#cloudBody'); if(!el) return;
+  if (pulled) { cloudRows = pulled; cloudEdits.clear(); }
   let html = '';
-  if (pulled) {
-    html += `<h2>In the database — ${pulled.length}</h2>
-      <div class="tblwrap"><table><thead><tr><th>Invoice</th><th>Date</th><th>Branch</th><th>Total</th><th>Verdict</th><th>Rev</th></tr></thead><tbody>
-      ${pulled.slice(0,200).map(r=>`<tr style="cursor:default"><td class="mono">${esc(r.invoice_no)}</td><td>${esc(r.invoice_date)}</td>
-        <td>${esc(r.branch_raw)}</td><td class="num">${r.total_paise!=null?money(r.total_paise):''}</td>
-        <td>${esc(r.verdict)}</td><td class="num">${r.revision>1?'v'+r.revision:''}</td></tr>`).join('')}
+
+  if (cloudRows.length) {
+    html += `<div class="row" style="justify-content:space-between;align-items:center;margin:8px 0">
+      <h2 style="margin:0">In the database — ${cloudRows.length}</h2>
+      <button class="btn pri" id="cloudSaveEdits" disabled>Push edits back</button></div>
+      <p class="sub">Every field is editable. Correct anything the extraction got wrong — click a cell, type,
+         and the change is staged. When you're done, push the edits back to the database.</p>
+      <div class="tblwrap" style="max-height:60vh;overflow:auto"><table><thead><tr>
+        ${CLOUD_EDIT_COLS.map(([,l])=>`<th>${esc(l)}</th>`).join('')}<th>Rev</th></tr></thead><tbody>
+        ${cloudRows.slice(0,500).map(r=>`<tr data-h="${esc(r.content_hash)}">
+          ${CLOUD_EDIT_COLS.map(([k,,mny])=>{
+            const val = mny ? (r[k]!=null ? (r[k]/100).toFixed(2) : '') : (r[k]??'');
+            return `<td contenteditable="true" data-k="${k}" data-money="${mny?1:0}" style="min-width:80px">${esc(String(val))}</td>`;
+          }).join('')}
+          <td class="num">${r.revision>1?'v'+r.revision:''}</td></tr>`).join('')}
       </tbody></table></div>`;
   }
+
   if (fails && fails.length) {
     html += `<h2>Failed to push — ${fails.length}</h2>
       <div class="tblwrap"><table><thead><tr><th>File</th><th>Reason</th></tr></thead><tbody>
@@ -2928,6 +3024,34 @@ function renderCloud(fails, pulled){
       </tbody></table></div>`;
   }
   el.innerHTML = html || '<p class="dim">Push this session, or pull the full history, using the buttons above.</p>';
+
+  if (cloudRows.length) {
+    el.querySelectorAll('td[contenteditable]').forEach(td => {
+      td.addEventListener('input', () => {
+        const tr = td.closest('tr'), hash = tr.dataset.h, k = td.dataset.k;
+        const isMoney = td.dataset.money === '1';
+        const v = td.textContent.trim();
+        const stored = isMoney ? (v===''?null:Math.round(parseFloat(v)*100)) : (v===''?null:v);
+        if (isMoney && v!=='' && isNaN(stored)) return;
+        if (!cloudEdits.has(hash)) cloudEdits.set(hash, {});
+        cloudEdits.get(hash)[k] = stored;
+        td.style.background = 'var(--warn-bg)';
+        const btn = $('#cloudSaveEdits'); if (btn) btn.disabled = cloudEdits.size===0;
+      });
+    });
+    const save = $('#cloudSaveEdits');
+    if (save) save.onclick = async () => {
+      save.disabled = true;
+      let ok=0, fail=0; const errs=[];
+      for (const [hash, patch] of cloudEdits) {
+        try { await Cloud.updateOne(hash, patch); ok++; }
+        catch(e){ fail++; errs.push([hash.slice(0,12), e.message]); }
+      }
+      setCloud(`Saved ${ok} edit(s)` + (fail?` · ${fail} failed`:''), fail?'er':'ok');
+      cloudEdits.clear();
+      try { const rows = await Cloud.pullAll(); renderCloud(null, rows); } catch(_){}
+    };
+  }
 }
 
 /* engine detection — optional acceleration, never required */
