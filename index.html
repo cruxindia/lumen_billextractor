@@ -205,6 +205,7 @@ label.chk input{accent-color:var(--accent)}
     <span class="pill" id="enginePill"><i class="dot"></i> Standalone</span>
     <span class="pill" id="libPill"><i class="dot"></i> Readers</span>
     <span class="pill" id="ocrPill" title="OCR reads image/scanned bills"><i class="dot"></i> OCR off</span>
+    <span class="pill" id="ocrProgress" style="color:var(--warn)"></span>
     <button class="icon-btn" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">◐</button>
   </header>
 
@@ -246,6 +247,7 @@ label.chk input{accent-color:var(--accent)}
       </div>
       <div class="bar"><i id="prog"></i></div>
       <div class="grid k4" id="ingestStats" style="margin:14px 0"></div>
+      <div id="ocrBanner"></div>
       <h2>Activity</h2>
       <div class="log" id="log"><div class="dim">Ready. Nothing ingested yet.</div></div>
     </section>
@@ -2039,7 +2041,7 @@ async function pdfToView(buf, filename){
     disableFontFace: true, verbosity: 0
   }).promise;
   const pages = [];
-  let ocrUsed = false;
+  let ocrUsed = false, hasImagePage = false;
   for (let n = 1; n <= doc.numPages; n++) {
     const page = await doc.getPage(n);
     const tc = await page.getTextContent();
@@ -2051,18 +2053,19 @@ async function pdfToView(buf, filename){
        like a clean text layer. */
     const realText = items.filter(i => i.str && i.str.trim()).length;
     if (realText < 5) {
-      try {
-        const ocrItems = await OCR.ocrPage(page);
-        if (ocrItems.length) { items = items.concat(ocrItems); ocrUsed = true;
-          log(`  page ${n} was an image — recovered ${ocrItems.length} words by OCR (verify these)`, 'wn'); }
-      } catch(e){ log(`  page ${n} is an image and OCR is unavailable: ${e.message}`, 'er'); }
+      /* This page is an image. During bulk ingest we do NOT OCR inline — OCR-ing
+         hundreds of pages serially would freeze the batch for a very long time.
+         We flag the page instead, and OCR runs as a separate, resumable pass the
+         user starts from the Ingest screen. This keeps ingest fast and never
+         hangs on a stuck page. */
+      hasImagePage = true;
     }
     pages.push({ items });
     page.cleanup();
   }
   await doc.destroy();
   const view = L.buildViewFromPages(pages, filename);
-  if (ocrUsed) { view.metadata.ocrUsed = true; view._ocrUsed = true; }
+  if (hasImagePage) { view.metadata.hasImagePage = true; view._hasImagePage = true; }
   return view;
 }
 
@@ -2090,23 +2093,28 @@ const OCR = {
     });
   },
 
+  _withTimeout(promise, ms, label){
+    return Promise.race([ promise,
+      new Promise((_, rej) => setTimeout(() => rej(new Error((label||'operation')+' timed out after '+ms+'ms')), ms)) ]);
+  },
+
   async worker(){
     if (this._worker) return this._worker;
     if (this._loading) return this._loading;
     setOcrStatus('loading');
     this._loading = (async () => {
-      const ok = await this._loadScript();
+      const ok = await this._withTimeout(this._loadScript(), 60000, 'OCR engine download');
       if (!ok) { setOcrStatus('error'); throw new Error('OCR engine unavailable'); }
       /* IMPORTANT: point corePath at the EXACT file we host, not the directory.
          If given a directory, Tesseract auto-selects a SIMD variant
          (tesseract-core-relaxedsimd-lstm.wasm.js) that we did not upload, and
          loading fails. Naming the file forces it to use the one that's there. */
-      const w = await Tesseract.createWorker('eng', 1, {
+      const w = await this._withTimeout(Tesseract.createWorker('eng', 1, {
         corePath: this.base + '/tesseract-core-lstm.wasm.js',
         workerPath: this.base + '/worker.min.js',
         langPath: this.base,               // eng.traineddata lives here
         cacheMethod: 'none'
-      });
+      }), 90000, 'OCR engine start');
       this._worker = w; setOcrStatus('ready'); return w;
     })().catch(e => { setOcrStatus('error'); this._loading = null; throw e; });
     return this._loading;
@@ -2121,7 +2129,7 @@ const OCR = {
     const canvas = document.createElement('canvas');
     canvas.width = vp.width; canvas.height = vp.height;
     await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
-    const { data } = await worker.recognize(canvas, {}, { blocks: true });
+    const { data } = await this._withTimeout(worker.recognize(canvas, {}, { blocks: true }), 30000, 'OCR page');
     // convert OCR words to text items in PDF coordinate space (flip Y, unscale)
     const items = [];
     const words = [];
@@ -2307,6 +2315,7 @@ async function ingest(fileList){
       }
       const r = L.processView(view);
       r.hash = hash; r.path = it.path; r.sessionId = session.id;
+      if (view._hasImagePage) { r._hasImagePage = true; r._pdfBuf = it.buf; }
       if (view._ocrUsed) {
         r._ocr = true;
         // record an explicit check so it surfaces in Review as needing verification
@@ -2359,12 +2368,91 @@ async function ingest(fileList){
     log(`No findings — every document reconciled.`, 'ok');
   }
   busy = false; renderAll(); persist();
+  renderOcrBanner();
 
   /* The database is the default backing store — every ingested bill is pushed
      automatically, no button. Enrichment (client/branch master tables) runs
      first so what's stored is already corrected. Failures are surfaced, never
      silent. */
   autoSync(mine);
+}
+
+/* OCR pass — runs on demand over the bills flagged as having image pages.
+   Resumable, timeout-guarded per page, and it updates the light and a live
+   counter so it can never look "frozen". One stuck page is skipped, not fatal. */
+let ocrPassRunning = false;
+async function runOcrPass(){
+  if (ocrPassRunning) return;
+  const pending = DB.docs.filter(d => d._hasImagePage && !d._ocrDone && d._pdfBuf);
+  if (!pending.length) { log('No image bills need OCR.', 'dim'); return; }
+  ocrPassRunning = true;
+  log(`Starting OCR on ${pending.length} image bill(s)… you can keep working.`, 'head');
+  setOcrStatus('loading');
+  let ok=0, failed=0;
+  for (let idx=0; idx<pending.length; idx++){
+    const d = pending[idx];
+    updateOcrProgress(idx+1, pending.length);
+    try {
+      const view = await pdfToViewWithOcr(d._pdfBuf, d.filename);
+      const r2 = L.processView(view);
+      // merge recovered fields into the existing doc, mark as OCR draft
+      Object.assign(d.invoice, r2.invoice);
+      d.applicants = r2.applicants; d.candidates = r2.candidates; d.checks = r2.checks;
+      d.verdict = r2.verdict; d.verification = r2.verification;
+      d._ocr = true; d._ocrDone = true;
+      d.checks = d.checks || [];
+      d.checks.push({ check_id:'C16_ocr_source', status:'FAIL', severity:'warning',
+        detail:'Read from an image by OCR — verify the amounts.' });
+      if (d.verdict==='PROVEN') d.verdict='UNPROVEN';
+      ok++;
+      // push the corrected bill to the database
+      try { await Cloud.enrichFromMaster(d); await Cloud.pushOne(d); } catch(_){}
+    } catch(e){
+      failed++; d._ocrDone = true;   // mark done so we don't retry-loop forever
+      log(`  ${d.filename} — OCR failed: ${e.message}`, 'er');
+    }
+  }
+  ocrPassRunning = false;
+  setOcrStatus('ready');
+  updateOcrProgress(0,0);
+  renderOcrBanner();
+  log(`OCR pass finished — ${ok} read, ${failed} could not be read.`, ok?'ok':'wn');
+  renderAll();
+}
+function renderOcrBanner(){
+  const el = document.getElementById('ocrBanner'); if(!el) return;
+  const pending = DB.docs.filter(d => d._hasImagePage && !d._ocrDone && d._pdfBuf).length;
+  if (!pending) { el.innerHTML = ''; return; }
+  el.innerHTML = `<div class="assure" style="border-color:var(--warn);background:var(--warn-bg)">
+    <span>◉</span><span><b>${pending} bill(s) have an image page</b> that needs OCR to read the client,
+    branch and totals. Ingest stayed fast by not OCR-ing inline. Run OCR now — it processes in the
+    background and you can keep working. Read values will be flagged for you to verify.
+    <button class="btn pri" style="margin-left:10px" onclick="runOcrPass()">Run OCR on ${pending} bill(s)</button>
+    </span></div>`;
+}
+window.runOcrPass = runOcrPass;
+function updateOcrProgress(cur, total){
+  const el = document.getElementById('ocrProgress'); if(!el) return;
+  el.textContent = total ? `OCR: ${cur} of ${total}…` : '';
+}
+
+/* pdfToView variant that DOES OCR (used only by the deliberate pass) */
+async function pdfToViewWithOcr(buf, filename){
+  const doc = await pdfjsLib.getDocument({ data: new Uint8Array(buf), isEvalSupported:false,
+    useSystemFonts:false, disableFontFace:true, verbosity:0 }).promise;
+  const pages = [];
+  for (let n=1; n<=doc.numPages; n++){
+    const page = await doc.getPage(n);
+    const tc = await page.getTextContent();
+    let items = tc.items.map(i => ({ x:i.transform[4], y:i.transform[5], w:i.width, h:i.height, str:i.str }));
+    if (items.filter(i=>i.str&&i.str.trim()).length < 5){
+      try { const ocrItems = await OCR.ocrPage(page); if (ocrItems.length) items = items.concat(ocrItems); }
+      catch(e){ /* per-page failure is non-fatal; leave the page as-is */ }
+    }
+    pages.push({ items }); page.cleanup();
+  }
+  await doc.destroy();
+  return L.buildViewFromPages(pages, filename);
 }
 
 async function autoSync(docs){
