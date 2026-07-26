@@ -2216,6 +2216,14 @@ const OCR = {
   }
 };
 
+/* file-type patterns and ingest state (restored) */
+const SHEET_EXT = /\.(xlsx|xlsm|xltx|xltm|xlsb|xls)$/i;
+const CSV_EXT   = /\.(csv|tsv)$/i;
+const PDF_EXT   = /\.pdf$/i;
+const ARCHIVE_EXT = /\.(zip|rar|7z|tar|gz|tgz|bz2)$/i;
+const MAX_ARCHIVE_DEPTH = 8, MAX_ARCHIVE_ENTRIES = 50000;
+let busy = false;
+
 /* Route by SNIFFED type, never by extension. A .zip that is really a RAR, an
    .xlsx with the wrong suffix, or an extensionless export all resolve correctly. */
 const MAGIC = [
