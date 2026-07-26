@@ -2177,41 +2177,44 @@ const OCR = {
 
   /* OCR a single PDF page: render to canvas, recognise, return pseudo text items
      positioned like the real text layer so the same extractor can read them. */
-  async ocrPage(pdfPage){
-    /* scale 2 is the measured sweet spot — reads correctly and is faster than
-       2.5. Render happens on the main thread; recognition on a pooled worker. */
+  async ocrPage(pdfPage, onDiag){
     const scale = 2;
     const vp = pdfPage.getViewport({ scale });
     const canvas = document.createElement('canvas');
     canvas.width = vp.width; canvas.height = vp.height;
+    const tRender0 = Date.now();
     await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
-    // hand the worker a bitmap/blob, not the live canvas, so it's thread-safe
-    const blob = await new Promise(res => canvas.toBlob(res, 'image/png'));
-    const { data } = await this._lease(w => this._withTimeout(w.recognize(blob, {}, { blocks: true }), 30000, 'OCR page'));
-    // convert OCR words to text items in PDF coordinate space (flip Y, unscale)
+    const tRender = Date.now() - tRender0;
+
+    // Use the simplest, fastest worker call. Plain recognize (no blocks tree) is
+    // ~2x faster and gives us data.words with bounding boxes — enough to place
+    // text. One shared worker; a hard timeout guards against any hang.
+    const worker = await this.worker();
+    const tOcr0 = Date.now();
+    const { data } = await this._withTimeout(worker.recognize(canvas), 25000, 'OCR page');
+    const tOcr = Date.now() - tOcr0;
+    if (onDiag) onDiag({ render: tRender, ocr: tOcr });
+
     const items = [];
-    const words = [];
-    (data.blocks||[]).forEach(b => (b.paragraphs||[]).forEach(pp => (pp.lines||[]).forEach(ln => (ln.words||[]).forEach(wd => words.push(wd)))));
     const H = vp.height;
-    for (const wd of (words.length ? words : (data.words||[]))) {
-      const bb = wd.bbox || wd;
-      items.push({
-        x: (bb.x0||0)/scale, y: (H - (bb.y1||0))/scale,
-        w: ((bb.x1||0)-(bb.x0||0))/scale, h: ((bb.y1||0)-(bb.y0||0))/scale,
-        str: wd.text || '', _ocr: true
-      });
+    const words = data.words || [];
+    if (words.length) {
+      for (const wd of words) {
+        const bb = wd.bbox || {};
+        items.push({ x:(bb.x0||0)/scale, y:(H-(bb.y1||0))/scale,
+          w:((bb.x1||0)-(bb.x0||0))/scale, h:((bb.y1||0)-(bb.y0||0))/scale,
+          str: wd.text||'', _ocr:true });
+      }
+    } else if (data.text) {
+      // fallback: no word boxes — lay the lines out top-to-bottom so the
+      // extractor still sees them as text rows.
+      let y = H;
+      data.text.split(/\n/).forEach(line => { y -= 14;
+        if (line.trim()) items.push({ x:10, y:y/scale, w:200, h:12/scale, str:line.trim(), _ocr:true }); });
     }
     return items;
   }
 };
-
-/* ================= ingest ================= */
-const SHEET_EXT = /\.(xlsx|xlsm|xltx|xltm|xlsb|xls)$/i;
-const CSV_EXT   = /\.(csv|tsv)$/i;
-const PDF_EXT   = /\.pdf$/i;
-const ARCHIVE_EXT = /\.(zip|rar|7z|tar|gz|tgz|bz2)$/i;
-const MAX_ARCHIVE_DEPTH = 8, MAX_ARCHIVE_ENTRIES = 50000;
-let busy = false;
 
 /* Route by SNIFFED type, never by extension. A .zip that is really a RAR, an
    .xlsx with the wrong suffix, or an extensionless export all resolve correctly. */
@@ -2312,6 +2315,21 @@ async function collect(entries, depth, acc){
   return acc;
 }
 
+/* Pull an invoice number from a filename without opening the file. Bills are
+   named like "invoice-CHE-2606-0157.pdf" or "...PUN-2408-8590.xlsx". Used to
+   match a PDF to an Excel of the SAME bill so we can prefer the Excel and skip
+   the slow OCR path. Returns a normalized key or null. */
+const FILENAME_INV_RX = /([A-Z]{2,5})-?(\d{4})-?\s*(\d{3,5})/i;
+function invNoFromName(name){
+  const m = FILENAME_INV_RX.exec(name || '');
+  if (!m) return null;
+  return (m[1] + m[2] + m[3]).toUpperCase();   // e.g. CHE26060157
+}
+function invNoKey(no){
+  if (!no) return null;
+  return String(no).replace(/[^a-z0-9]/gi,'').toUpperCase();
+}
+
 async function ingest(fileList){
   if (busy) return;
   if (!window.XLSX) { log('Spreadsheet reader unavailable — this file needs an internet connection on first load.', 'er'); return; }
@@ -2343,13 +2361,25 @@ async function ingest(fileList){
     Object.entries(g).forEach(([r, n]) => log(`  skipped ${n} — ${SKIP_REASONS[r] || r}`, 'wn'));
   }
 
-  let done = 0, dupes = 0, failed = 0, scans = 0;
+  let done = 0, dupes = 0, failed = 0, scans = 0, excelPreferred = 0;
   const session = { id: L.newId('ses'), at: new Date().toISOString(), count: 0,
                     filesSeen: fileList.length, readable: items.length,
                     skipped: acc.skipped.length, skipDetail: {},
                     dupes: 0, failed: 0, scans: 0 };
   acc.skipped.forEach(([, r]) => session.skipDetail[r] = (session.skipDetail[r] || 0) + 1);
-  for (const it of items) {
+
+  /* PROCESS ORDER: Excels (and other non-PDFs) first so their clean data lands,
+     then PDFs — which can now check whether an Excel already covered the same
+     bill and skip OCR if so. This is the speed win: no OCR when a reliable
+     Excel twin exists. */
+  const ordered = [...items].sort((a,b) => (a.pdf?1:0) - (b.pdf?1:0));
+
+  /* invoice numbers covered by a NON-pdf (Excel) source this session, plus any
+     already in the database from a prior Excel ingest */
+  const excelCovered = new Set();
+  DB.docs.forEach(d => { if (d && !d._fromPdf) { const k = invNoKey(d.invoice && d.invoice.invoice_no); if (k) excelCovered.add(k); } });
+
+  for (const it of ordered) {
     try {
       const hash = await sha256(it.buf);
       if (DB.hashes.has(hash)) { dupes++; done++; continue; }
@@ -2373,12 +2403,32 @@ async function ingest(fileList){
       }
       const r = L.processView(view);
       r.hash = hash; r.path = it.path; r.sessionId = session.id;
+      r._fromPdf = !!it.pdf;
+
+      /* If this is an Excel (or other non-PDF), register the bill it covers so a
+         matching PDF later can skip OCR. */
+      if (!it.pdf) {
+        const k = invNoKey(r.invoice && r.invoice.invoice_no) || invNoFromName(it.name);
+        if (k) excelCovered.add(k);
+      }
+
       if (view._hasImagePage) {
-        r._hasImagePage = true;
-        // keep an independent copy so the OCR pass can re-read the PDF later
-        // (the working buffer gets detached by PDF.js during parsing)
-        try { const src = new Uint8Array(it.buf); const copy = new Uint8Array(src.length); copy.set(src); r._pdfBuf = copy.buffer; }
-        catch(_){ r._pdfBuf = null; }
+        /* SPEED WIN: this PDF has an image page that would need OCR. But if an
+           Excel already covered this same bill, the clean data is already in —
+           so we DON'T OCR. We keep the PDF as a record, marked as covered, and
+           skip the slow path entirely. Match by invoice number from the read
+           data, falling back to the filename. */
+        const key = invNoKey(r.invoice && r.invoice.invoice_no) || invNoFromName(it.name);
+        if (key && excelCovered.has(key)) {
+          r._ocrCoveredByExcel = true;      // record, but no OCR needed
+          excelPreferred++;
+        } else {
+          r._hasImagePage = true;
+          // keep an independent copy so the OCR pass can re-read the PDF later
+          // (the working buffer gets detached by PDF.js during parsing)
+          try { const src = new Uint8Array(it.buf); const copy = new Uint8Array(src.length); copy.set(src); r._pdfBuf = copy.buffer; }
+          catch(_){ r._pdfBuf = null; }
+        }
       }
       if (view._ocrUsed) {
         r._ocr = true;
@@ -2410,6 +2460,7 @@ async function ingest(fileList){
     log(`Done — ${session.count} document(s) in ${secs.toFixed(1)}s (${(done/secs).toFixed(1)}/sec)`, 'head');
     if (proved) log(`  ${proved} proved automatically, needing no review`, 'ok');
     if (dupes)  log(`  ${dupes} already ingested, skipped by content hash`, 'dim');
+    if (excelPreferred) log(`  ${excelPreferred} image PDF(s) skipped OCR — an Excel of the same bill was used instead (faster, more reliable)`, 'ok');
     if (scans)  log(`  ${scans} scanned PDF(s) could not be read even with OCR`, 'wn');
     if (failed) log(`  ${failed} could not be read — see above`, 'er');
   }
@@ -2450,16 +2501,30 @@ async function runOcrPass(){
   const pending = DB.docs.filter(d => d._hasImagePage && !d._ocrDone && d._pdfBuf);
   if (!pending.length) { log('No image bills need OCR.', 'dim'); return; }
   ocrPassRunning = true;
-  log(`Starting OCR on ${pending.length} image bill(s)… you can keep working.`, 'head');
+  log(`Starting OCR on ${pending.length} image bill(s)…`, 'head');
   setOcrStatus('loading');
 
-  let ok=0, failed=0, done=0;
-  const total = pending.length;
+  // Warm the worker ONCE, up front, with a clear message and its own timing.
+  const tWarm = Date.now();
+  try {
+    await OCR.worker();
+    log(`  OCR engine ready in ${((Date.now()-tWarm)/1000).toFixed(1)}s.`, 'dim');
+  } catch(e){
+    ocrPassRunning = false; setOcrStatus('error');
+    log(`  OCR engine failed to load: ${e.message}. Check the OCR bucket is public and reachable.`, 'er');
+    return;
+  }
 
-  // process ONE bill end to end
-  async function processBill(d){
+  let ok=0, failed=0;
+  const total = pending.length;
+  const tStart = Date.now();
+  for (let i=0; i<pending.length; i++){
+    const d = pending[i];
+    updateOcrProgress(i+1, total);
+    const tFile = Date.now();
     try {
-      const view = await pdfToViewWithOcr(d._pdfBuf, d.filename);
+      let diag = null;
+      const view = await pdfToViewWithOcr(d._pdfBuf, d.filename, (dg)=>{ diag = dg; });
       const r2 = L.processView(view);
       Object.assign(d.invoice, r2.invoice);
       d.applicants = r2.applicants; d.candidates = r2.candidates; d.checks = r2.checks || [];
@@ -2470,33 +2535,20 @@ async function runOcrPass(){
       if (d.verdict==='PROVEN') d.verdict='UNPROVEN';
       ok++;
       try { await Cloud.enrichFromMaster(d); await Cloud.pushOne(d); } catch(_){}
+      // show timing for the FIRST few so slowness is visible immediately
+      if (i < 3) log(`  ${d.filename}: ${((Date.now()-tFile)/1000).toFixed(1)}s`
+        + (diag ? ` (render ${diag.render}ms + OCR ${diag.ocr}ms)` : ''), 'dim');
     } catch(e){
       failed++; d._ocrDone = true;
-      log(`  ${d.filename} — OCR failed: ${e.message}`, 'er');
-    } finally {
-      done++; updateOcrProgress(done, total);
+      log(`  ${d.filename} — OCR failed after ${((Date.now()-tFile)/1000).toFixed(1)}s: ${e.message}`, 'er');
     }
   }
-
-  /* Dispatch bills concurrently up to the pool size. Each "lane" pulls the next
-     pending bill as soon as it finishes one, so all workers stay busy without
-     ever exceeding the pool. This is what turns 36 min into ~9 min. */
-  const lanes = (typeof OCR!=='undefined' && OCR.poolSize) ? OCR.poolSize() : 1;
-  let cursor = 0;
-  async function lane(){
-    while (cursor < pending.length) {
-      const mine = pending[cursor++];
-      await processBill(mine);
-    }
-  }
-  setOcrStatus('loading');
-  await Promise.all(Array.from({length: lanes}, lane));
-
+  const secs = (Date.now()-tStart)/1000;
   ocrPassRunning = false;
   setOcrStatus('ready');
   updateOcrProgress(0,0);
   renderOcrBanner();
-  log(`OCR pass finished — ${ok} read, ${failed} could not be read.`, ok?'ok':'wn');
+  log(`OCR pass finished — ${ok} read, ${failed} failed, in ${secs.toFixed(0)}s (${(secs/Math.max(1,total)).toFixed(1)}s per bill).`, ok?'ok':'wn');
   renderAll();
 }
 function renderOcrBanner(){
@@ -2517,7 +2569,7 @@ function updateOcrProgress(cur, total){
 }
 
 /* pdfToView variant that DOES OCR (used only by the deliberate pass) */
-async function pdfToViewWithOcr(buf, filename){
+async function pdfToViewWithOcr(buf, filename, onDiag){
   const bytes = new Uint8Array(buf.byteLength);
   bytes.set(new Uint8Array(buf));
   const doc = await pdfjsLib.getDocument({ data: bytes, isEvalSupported:false,
@@ -2528,8 +2580,10 @@ async function pdfToViewWithOcr(buf, filename){
     const tc = await page.getTextContent();
     let items = tc.items.map(i => ({ x:i.transform[4], y:i.transform[5], w:i.width, h:i.height, str:i.str }));
     if (items.filter(i=>i.str&&i.str.trim()).length < 5){
-      try { const ocrItems = await OCR.ocrPage(page); if (ocrItems.length) items = items.concat(ocrItems); }
-      catch(e){ /* per-page failure is non-fatal; leave the page as-is */ }
+      // OCR this image page. Let a failure THROW so the pass records it loudly,
+      // rather than silently producing an empty page (which looked like success).
+      const ocrItems = await OCR.ocrPage(page, onDiag);
+      if (ocrItems.length) items = items.concat(ocrItems);
     }
     pages.push({ items }); page.cleanup();
   }
