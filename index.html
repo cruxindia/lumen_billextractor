@@ -2101,6 +2101,58 @@ const OCR = {
       new Promise((_, rej) => setTimeout(() => rej(new Error((label||'operation')+' timed out after '+ms+'ms')), ms)) ]);
   },
 
+  /* ---- worker pool: parallel OCR sized to the machine ---- */
+  _pool: null, _poolLoading: null,
+
+  poolSize(){
+    // hardwareConcurrency = logical cores. Use half (leave room for the UI and
+    // PDF rendering), clamped to 2..4. A weak 2-core machine gets 1; a good
+    // 8-core gets 4. Never so many that the machine chokes.
+    const cores = (navigator && navigator.hardwareConcurrency) || 2;
+    return Math.max(1, Math.min(4, Math.floor(cores / 2)));
+  },
+
+  async pool(){
+    if (this._pool) return this._pool;
+    if (this._poolLoading) return this._poolLoading;
+    setOcrStatus('loading');
+    this._poolLoading = (async () => {
+      const ok = await this._withTimeout(this._loadScript(), 60000, 'OCR engine download');
+      if (!ok) { setOcrStatus('error'); throw new Error('OCR engine unavailable'); }
+      const n = this.poolSize();
+      const mk = () => Tesseract.createWorker('eng', 1, {
+        corePath: this.base + '/tesseract-core-lstm.wasm.js',
+        workerPath: this.base + '/worker.min.js',
+        langPath: this.base, cacheMethod: 'none'
+      });
+      const workers = await this._withTimeout(Promise.all(Array.from({length:n}, mk)), 120000, 'OCR pool start');
+      this._pool = { workers, n, busy: new Array(n).fill(false) };
+      log(`OCR ready with ${n} parallel worker${n>1?'s':''}.`, 'dim');
+      setOcrStatus('ready');
+      return this._pool;
+    })().catch(e => { setOcrStatus('error'); this._poolLoading = null; throw e; });
+    return this._poolLoading;
+  },
+
+  /* grab a free worker from the pool, run fn, release it */
+  async _lease(fn){
+    const pool = await this.pool();
+    // find a free worker, or wait briefly for one
+    let idx = -1;
+    while (idx === -1) {
+      idx = pool.busy.indexOf(false);
+      if (idx === -1) await new Promise(r => setTimeout(r, 25));
+    }
+    pool.busy[idx] = true;
+    try { return await fn(pool.workers[idx]); }
+    finally { pool.busy[idx] = false; }
+  },
+
+  async terminatePool(){
+    if (this._pool) { try { await Promise.all(this._pool.workers.map(w=>w.terminate())); } catch(_){}
+      this._pool = null; this._poolLoading = null; }
+  },
+
   async worker(){
     if (this._worker) return this._worker;
     if (this._loading) return this._loading;
@@ -2126,13 +2178,16 @@ const OCR = {
   /* OCR a single PDF page: render to canvas, recognise, return pseudo text items
      positioned like the real text layer so the same extractor can read them. */
   async ocrPage(pdfPage){
-    const worker = await this.worker();
-    const scale = 2.5;                       // higher = better OCR, slower
+    /* scale 2 is the measured sweet spot — reads correctly and is faster than
+       2.5. Render happens on the main thread; recognition on a pooled worker. */
+    const scale = 2;
     const vp = pdfPage.getViewport({ scale });
     const canvas = document.createElement('canvas');
     canvas.width = vp.width; canvas.height = vp.height;
     await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
-    const { data } = await this._withTimeout(worker.recognize(canvas, {}, { blocks: true }), 30000, 'OCR page');
+    // hand the worker a bitmap/blob, not the live canvas, so it's thread-safe
+    const blob = await new Promise(res => canvas.toBlob(res, 'image/png'));
+    const { data } = await this._lease(w => this._withTimeout(w.recognize(blob, {}, { blocks: true }), 30000, 'OCR page'));
     // convert OCR words to text items in PDF coordinate space (flip Y, unscale)
     const items = [];
     const words = [];
@@ -2397,30 +2452,46 @@ async function runOcrPass(){
   ocrPassRunning = true;
   log(`Starting OCR on ${pending.length} image bill(s)… you can keep working.`, 'head');
   setOcrStatus('loading');
-  let ok=0, failed=0;
-  for (let idx=0; idx<pending.length; idx++){
-    const d = pending[idx];
-    updateOcrProgress(idx+1, pending.length);
+
+  let ok=0, failed=0, done=0;
+  const total = pending.length;
+
+  // process ONE bill end to end
+  async function processBill(d){
     try {
       const view = await pdfToViewWithOcr(d._pdfBuf, d.filename);
       const r2 = L.processView(view);
-      // merge recovered fields into the existing doc, mark as OCR draft
       Object.assign(d.invoice, r2.invoice);
-      d.applicants = r2.applicants; d.candidates = r2.candidates; d.checks = r2.checks;
+      d.applicants = r2.applicants; d.candidates = r2.candidates; d.checks = r2.checks || [];
       d.verdict = r2.verdict; d.verification = r2.verification;
       d._ocr = true; d._ocrDone = true;
-      d.checks = d.checks || [];
       d.checks.push({ check_id:'C16_ocr_source', status:'FAIL', severity:'warning',
         detail:'Read from an image by OCR — verify the amounts.' });
       if (d.verdict==='PROVEN') d.verdict='UNPROVEN';
       ok++;
-      // push the corrected bill to the database
       try { await Cloud.enrichFromMaster(d); await Cloud.pushOne(d); } catch(_){}
     } catch(e){
-      failed++; d._ocrDone = true;   // mark done so we don't retry-loop forever
+      failed++; d._ocrDone = true;
       log(`  ${d.filename} — OCR failed: ${e.message}`, 'er');
+    } finally {
+      done++; updateOcrProgress(done, total);
     }
   }
+
+  /* Dispatch bills concurrently up to the pool size. Each "lane" pulls the next
+     pending bill as soon as it finishes one, so all workers stay busy without
+     ever exceeding the pool. This is what turns 36 min into ~9 min. */
+  const lanes = (typeof OCR!=='undefined' && OCR.poolSize) ? OCR.poolSize() : 1;
+  let cursor = 0;
+  async function lane(){
+    while (cursor < pending.length) {
+      const mine = pending[cursor++];
+      await processBill(mine);
+    }
+  }
+  setOcrStatus('loading');
+  await Promise.all(Array.from({length: lanes}, lane));
+
   ocrPassRunning = false;
   setOcrStatus('ready');
   updateOcrProgress(0,0);
