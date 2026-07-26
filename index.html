@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'none';
-  script-src 'unsafe-inline' blob:;
+  script-src 'unsafe-inline' blob: https://czdjbbhxboweawqbjywr.supabase.co 'wasm-unsafe-eval';
   style-src 'unsafe-inline';
-  img-src 'self' data:;
+  img-src 'self' data: blob:;
   font-src 'self';
   connect-src 'self' http://127.0.0.1:8420 http://localhost:8420 https://czdjbbhxboweawqbjywr.supabase.co;
   worker-src 'self' blob:;
@@ -287,8 +287,8 @@ label.chk input{accent-color:var(--accent)}
          branch, date, verdict or payment status — the report and every export respect the filters.</p>
       <div class="reviewbar">
         <div class="seg">
-          <button class="on" id="misSession" onclick="setMisSource('session')">This session</button>
-          <button id="misDb" onclick="setMisSource('database')">Full database (MIS)</button>
+          <button id="misSession" onclick="setMisSource('session')">This session only</button>
+          <button class="on" id="misDb" onclick="setMisSource('database')">Full database (MIS)</button>
         </div>
         <span class="dim" id="misStatus" style="font-size:12px"></span>
       </div>
@@ -320,11 +320,15 @@ label.chk input{accent-color:var(--accent)}
         <span>⛁</span><span>Connected to <b>cruxindia's Project</b>. The key used here is the <b>publishable</b>
         key, which is safe in a browser — the database's own row-security rules decide what it can touch.</span></div>
 
-      <div class="row" style="margin:14px 0">
-        <button class="btn pri" id="cloudPush">Push this session to database</button>
-        <button class="btn" id="cloudPull">Pull full history down</button>
+      <div class="assure" style="margin-top:10px">
+        <span>✓</span><span>Saving is <b>automatic</b>. Every bill you ingest is corrected and saved to the
+        database on its own, and every tab reads from the database by default. The buttons below are just
+        manual overrides and views — you don't need them in normal use.</span></div>
+      <div class="row" style="margin:14px 0;flex-wrap:wrap">
         <button class="btn" id="cloudBranches">View branches learned</button>
         <button class="btn" id="cloudClients">View clients</button>
+        <button class="btn" id="cloudPush">Re-save this session</button>
+        <button class="btn" id="cloudPull">Reload from database</button>
         <span class="pill" id="cloudStatus"><i class="dot"></i> Ready</span>
       </div>
 
@@ -673,7 +677,17 @@ function valueForLabel(grid, ref, text, labelRx, maxScan) {
   // label patterns routinely contain top-level alternation, so they MUST be
   // wrapped — otherwise `a|b` + `(.+)$` parses as `a` OR `b(.+)$`.
   const m = new RegExp('(?:' + labelRx + ')[\\s.:#\\-]*(.+)$', 'i').exec(text);
-  if (m && m[1] && m[1].replace(/^[.:#\-\s]+|[.:#\-\s]+$/g, '')) return [m[1].replace(/^[.:#\-\s]+|[.:#\-\s]+$/g, ''), 'inline_label', ref];
+  if (m && m[1] && m[1].replace(/^[.:#\-\s]+|[.:#\-\s]+$/g, '')) {
+    let val = m[1].replace(/^[.:#\-\s]+|[.:#\-\s]+$/g, '');
+    /* A single physical line often carries TWO fields, e.g.
+       "Invoice No. : CHE-2606-0157  DATED: 23-JUN-2026". Without cutting, the
+       invoice number swallows " DATED: 23-JUN-2026", which then poisons every
+       downstream match. Stop the value at the next in-line field label
+       (DATE/DATED/GSTIN/PAN/SAC/PERIOD…) so each field keeps only its own text. */
+    val = val.split(/\s+(?=(?:dated?|date|gstin?|pan|sac|hsn|period|invoice|amount|page)\b[:\s.]*)/i)[0]
+             .replace(/[.:#\-\s]+$/,'').trim();
+    if (val) return [val, 'inline_label', ref];
+  }
   const [r, c] = rc(ref);
   for (let d = 1; d <= (maxScan || 8); d++) {
     const n = cref(r, c + d), cell = grid.cells[n];
@@ -2024,16 +2038,101 @@ async function pdfToView(buf, filename){
     disableFontFace: true, verbosity: 0
   }).promise;
   const pages = [];
+  let ocrUsed = false;
   for (let n = 1; n <= doc.numPages; n++) {
     const page = await doc.getPage(n);
     const tc = await page.getTextContent();
-    pages.push({ items: tc.items.map(i => ({
-      x: i.transform[4], y: i.transform[5], w: i.width, h: i.height, str: i.str })) });
+    let items = tc.items.map(i => ({
+      x: i.transform[4], y: i.transform[5], w: i.width, h: i.height, str: i.str }));
+    /* A page with almost no text but real drawing is an image page. Try OCR —
+       from the user's Supabase-hosted engine — to recover its text. Whatever OCR
+       returns is tagged _ocr so it's treated as a draft to verify, never trusted
+       like a clean text layer. */
+    const realText = items.filter(i => i.str && i.str.trim()).length;
+    if (realText < 5) {
+      try {
+        const ocrItems = await OCR.ocrPage(page);
+        if (ocrItems.length) { items = items.concat(ocrItems); ocrUsed = true;
+          log(`  page ${n} was an image — recovered ${ocrItems.length} words by OCR (verify these)`, 'wn'); }
+      } catch(e){ log(`  page ${n} is an image and OCR is unavailable: ${e.message}`, 'er'); }
+    }
+    pages.push({ items });
     page.cleanup();
   }
   await doc.destroy();
-  return L.buildViewFromPages(pages, filename);
+  const view = L.buildViewFromPages(pages, filename);
+  if (ocrUsed) { view.metadata.ocrUsed = true; view._ocrUsed = true; }
+  return view;
 }
+
+/* ================= OCR (image pages) ================= */
+/* OCR machinery is hosted on the user's own Supabase Storage, loaded lazily the
+   first time an image page is met, then browser-cached. The app stays small for
+   everyone; only image bills pay the one-time download, and it comes from the
+   user's own infrastructure — not a third-party CDN. */
+const OCR = {
+  base: 'https://czdjbbhxboweawqbjywr.supabase.co/storage/v1/object/public/ocr',
+  _worker: null, _loading: null,
+
+  available(){ return typeof Tesseract !== 'undefined' || !!this._scriptTried; },
+
+  async _loadScript(){
+    if (typeof Tesseract !== 'undefined') return true;
+    if (this._scriptTried) return typeof Tesseract !== 'undefined';
+    this._scriptTried = true;
+    return new Promise((res) => {
+      const sc = document.createElement('script');
+      sc.src = this.base + '/tesseract.min.js';
+      sc.onload = () => res(true);
+      sc.onerror = () => { log('OCR engine could not be loaded from storage. Check the OCR bucket is public.', 'er'); res(false); };
+      document.head.appendChild(sc);
+    });
+  },
+
+  async worker(){
+    if (this._worker) return this._worker;
+    if (this._loading) return this._loading;
+    this._loading = (async () => {
+      const ok = await this._loadScript();
+      if (!ok) throw new Error('OCR engine unavailable');
+      // point Tesseract at the user's Supabase-hosted core, worker and lang data
+      const w = await Tesseract.createWorker('eng', 1, {
+        corePath: this.base,               // tesseract-core-lstm.wasm(.js)
+        workerPath: this.base + '/worker.min.js',
+        langPath: this.base,               // eng.traineddata
+        cacheMethod: 'none'
+      });
+      this._worker = w; return w;
+    })();
+    return this._loading;
+  },
+
+  /* OCR a single PDF page: render to canvas, recognise, return pseudo text items
+     positioned like the real text layer so the same extractor can read them. */
+  async ocrPage(pdfPage){
+    const worker = await this.worker();
+    const scale = 2.5;                       // higher = better OCR, slower
+    const vp = pdfPage.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = vp.width; canvas.height = vp.height;
+    await pdfPage.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+    const { data } = await worker.recognize(canvas, {}, { blocks: true });
+    // convert OCR words to text items in PDF coordinate space (flip Y, unscale)
+    const items = [];
+    const words = [];
+    (data.blocks||[]).forEach(b => (b.paragraphs||[]).forEach(pp => (pp.lines||[]).forEach(ln => (ln.words||[]).forEach(wd => words.push(wd)))));
+    const H = vp.height;
+    for (const wd of (words.length ? words : (data.words||[]))) {
+      const bb = wd.bbox || wd;
+      items.push({
+        x: (bb.x0||0)/scale, y: (H - (bb.y1||0))/scale,
+        w: ((bb.x1||0)-(bb.x0||0))/scale, h: ((bb.y1||0)-(bb.y0||0))/scale,
+        str: wd.text || '', _ocr: true
+      });
+    }
+    return items;
+  }
+};
 
 /* ================= ingest ================= */
 const SHEET_EXT = /\.(xlsx|xlsm|xltx|xltm|xlsb|xls)$/i;
@@ -2186,9 +2285,9 @@ async function ingest(fileList){
       let view;
       if (it.pdf) {
         view = await pdfToView(it.buf, it.name);
-        if (view.metadata.isScanned) {
+        if (view.metadata.isScanned && !view._ocrUsed) {
           scans++; done++;
-          log(`${it.name} — scanned image, no text to read (OCR is not in this build)`, 'wn');
+          log(`${it.name} — scanned image and OCR could not read it`, 'wn');
           continue;
         }
       } else if (it.csv) {
@@ -2203,6 +2302,14 @@ async function ingest(fileList){
       }
       const r = L.processView(view);
       r.hash = hash; r.path = it.path; r.sessionId = session.id;
+      if (view._ocrUsed) {
+        r._ocr = true;
+        // record an explicit check so it surfaces in Review as needing verification
+        r.checks = r.checks || [];
+        r.checks.push({ check_id: 'C16_ocr_source', status: 'FAIL', severity: 'warning',
+          detail: 'Some of this bill was read from an image by OCR — the amounts especially need checking.' });
+        if (r.verdict === 'PROVEN') r.verdict = 'UNPROVEN';
+      }
       // keep the original bytes so the bill can be opened from Review (this session only)
       try { r._sourceBlob = new Blob([it.buf], { type: it.pdf ? 'application/pdf' : 'application/octet-stream' }); } catch(_){}
       DB.docs.push(r); DB.hashes.add(hash); session.count++;
@@ -2225,7 +2332,7 @@ async function ingest(fileList){
     log(`Done — ${session.count} document(s) in ${secs.toFixed(1)}s (${(done/secs).toFixed(1)}/sec)`, 'head');
     if (proved) log(`  ${proved} proved automatically, needing no review`, 'ok');
     if (dupes)  log(`  ${dupes} already ingested, skipped by content hash`, 'dim');
-    if (scans)  log(`  ${scans} scanned PDF(s) had no text layer — OCR is not in this build`, 'wn');
+    if (scans)  log(`  ${scans} scanned PDF(s) could not be read even with OCR`, 'wn');
     if (failed) log(`  ${failed} could not be read — see above`, 'er');
   }
 
@@ -2247,6 +2354,28 @@ async function ingest(fileList){
     log(`No findings — every document reconciled.`, 'ok');
   }
   busy = false; renderAll(); persist();
+
+  /* The database is the default backing store — every ingested bill is pushed
+     automatically, no button. Enrichment (client/branch master tables) runs
+     first so what's stored is already corrected. Failures are surfaced, never
+     silent. */
+  autoSync(mine);
+}
+
+async function autoSync(docs){
+  if (!docs || !docs.length || typeof Cloud === 'undefined') return;
+  setCloud(`Saving ${docs.length} to database…`, 'dim');
+  let ok=0, fail=0; const fails=[];
+  for (const d of docs){
+    try { await Cloud.enrichFromMaster(d); const res = await Cloud.pushOne(d); ok++; }
+    catch(e){ fail++; fails.push([d.filename, e.message]); }
+  }
+  if (fail) { setCloud(`Saved ${ok}, ${fail} failed to save`, 'er'); log(`${fail} document(s) could not be saved to the database:`, 'er');
+    fails.forEach(([f,m])=>log(`   ${f} — ${m}`, 'dim')); }
+  else setCloud(`All ${ok} saved to the database`, 'ok');
+  // refresh the MIS pull so Report/Review reflect the new data immediately
+  try { if (window.misRows !== null) { window.misRows = null; if(window.__misSource==='database') await setMisSource('database'); } } catch(_){}
+  renderReview();
 }
 
 /* ================= rendering ================= */
@@ -2357,7 +2486,10 @@ const CHECK_PLAIN = {
     fields: ['rows_read','rows_printed'] },
   C15_applicant_detail:   { title: "The applicant list is missing",
     say: r => `This bill has an annexure but no applicant rows could be read. The people are missing.`,
-    fields: [] }
+    fields: [] },
+  C16_ocr_source:         { title: "Read from an image — please verify",
+    say: r => `Part of this bill was a picture, not text, so it was read by OCR. OCR often drops decimal points (₹84.75 can become ₹8475), so check the amounts and totals carefully against the bill.`,
+    fields: ['client_raw','branch_raw','taxable_paise','tax_total_paise','total_paise'] }
 };
 function plainFor(r, c){
   const base = CHECK_PLAIN[c.check_id];
@@ -2617,7 +2749,7 @@ function reportRows(){
 }
 let flashCol = null;
 /* ---- MIS: data source (session vs database) + dynamic filters ---- */
-window.__misSource = 'session';
+window.__misSource = 'database';
 window.misRows = null;          // pulled database rows (as doc-shaped)
 window.misFilter = { client:'', branch:'', from:'', to:'', verdict:'', settlement:'' };
 
@@ -2642,7 +2774,8 @@ window.setMisSource = async (src) => {
 
 /* the pool of docs the report draws from, after the source choice */
 function misPool(){
-  return (window.__misSource==='database' && window.misRows) ? window.misRows : DB.docs;
+  if (window.__misSource==='database') return window.misRows || DB.docs;
+  return DB.docs;
 }
 
 /* dynamic filter values, derived from whatever's in the pool — never hardcoded */
@@ -3368,6 +3501,26 @@ $('#cloudBranches') && ($('#cloudBranches').onclick = async () => {
   } catch(e){ setCloud('Could not load branches: '+e.message, 'er'); }
   btn.disabled=false;
 });
+/* On startup, pull the full database so every tab reflects all stored bills by
+   default. This is what makes the database the source of truth, not the session. */
+(async () => {
+  if (typeof Cloud === 'undefined') return;
+  try {
+    setCloud('Loading database…','dim');
+    const rows = await Cloud.pullAll();
+    window.dbRows = rows;
+    // make pulled rows available to Review and the MIS report by default
+    window.reviewPulled = rows.map(row => ({ content_hash: row.content_hash, hash: row.content_hash,
+      invoice: row, checks: [], verdict: row.verdict, verification: row.verification }));
+    window.misRows = rows.map(row => ({ invoice: row, applicants: [], checks: [],
+      verdict: row.verdict, verification: row.verification, hash: row.content_hash,
+      candidates: {}, filename: row.source_file }));
+    setCloud(`${rows.length} in database`, 'ok');
+    if (typeof buildMisFilters==='function') buildMisFilters();
+    renderReview(); renderReport();
+  } catch(e){ setCloud('Database offline — working locally','wn'); }
+})();
+
 $('#cloudPull') && ($('#cloudPull').onclick = async () => {
   const btn=$('#cloudPull'); btn.disabled=true; setCloud('Pulling…','dim');
   try {
