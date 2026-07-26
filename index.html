@@ -290,8 +290,8 @@ label.chk input{accent-color:var(--accent)}
          branch, date, verdict or payment status — the report and every export respect the filters.</p>
       <div class="reviewbar">
         <div class="seg">
-          <button id="misSession" onclick="setMisSource('session')">This session only</button>
-          <button class="on" id="misDb" onclick="setMisSource('database')">Full database (MIS)</button>
+          <button class="on" id="misSession" onclick="setMisSource('session')">This session</button>
+          <button id="misDb" onclick="setMisSource('database')">Full database (MIS)</button>
         </div>
         <span class="dim" id="misStatus" style="font-size:12px"></span>
       </div>
@@ -2036,8 +2036,11 @@ const Cloud = {
 })();
 
 async function pdfToView(buf, filename){
+  // hand PDF.js its OWN copy; PDF.js detaches whatever buffer it's given
+  const bytes = new Uint8Array(buf.byteLength);
+  bytes.set(new Uint8Array(buf));
   const doc = await pdfjsLib.getDocument({
-    data: new Uint8Array(buf), isEvalSupported: false, useSystemFonts: false,
+    data: bytes, isEvalSupported: false, useSystemFonts: false,
     disableFontFace: true, verbosity: 0
   }).promise;
   const pages = [];
@@ -2315,7 +2318,13 @@ async function ingest(fileList){
       }
       const r = L.processView(view);
       r.hash = hash; r.path = it.path; r.sessionId = session.id;
-      if (view._hasImagePage) { r._hasImagePage = true; r._pdfBuf = it.buf; }
+      if (view._hasImagePage) {
+        r._hasImagePage = true;
+        // keep an independent copy so the OCR pass can re-read the PDF later
+        // (the working buffer gets detached by PDF.js during parsing)
+        try { const src = new Uint8Array(it.buf); const copy = new Uint8Array(src.length); copy.set(src); r._pdfBuf = copy.buffer; }
+        catch(_){ r._pdfBuf = null; }
+      }
       if (view._ocrUsed) {
         r._ocr = true;
         // record an explicit check so it surfaces in Review as needing verification
@@ -2438,7 +2447,9 @@ function updateOcrProgress(cur, total){
 
 /* pdfToView variant that DOES OCR (used only by the deliberate pass) */
 async function pdfToViewWithOcr(buf, filename){
-  const doc = await pdfjsLib.getDocument({ data: new Uint8Array(buf), isEvalSupported:false,
+  const bytes = new Uint8Array(buf.byteLength);
+  bytes.set(new Uint8Array(buf));
+  const doc = await pdfjsLib.getDocument({ data: bytes, isEvalSupported:false,
     useSystemFonts:false, disableFontFace:true, verbosity:0 }).promise;
   const pages = [];
   for (let n=1; n<=doc.numPages; n++){
@@ -2842,7 +2853,7 @@ function reportRows(){
 }
 let flashCol = null;
 /* ---- MIS: data source (session vs database) + dynamic filters ---- */
-window.__misSource = 'database';
+window.__misSource = 'session';
 window.misRows = null;          // pulled database rows (as doc-shaped)
 window.misFilter = { client:'', branch:'', from:'', to:'', verdict:'', settlement:'' };
 
@@ -2867,8 +2878,8 @@ window.setMisSource = async (src) => {
 
 /* the pool of docs the report draws from, after the source choice */
 function misPool(){
-  if (window.__misSource==='database') return window.misRows || DB.docs;
-  return DB.docs;
+  if (window.__misSource==='database' && window.misRows && window.misRows.length) return window.misRows;
+  return DB.docs;   // session data (also the fallback when the DB is empty/unreached)
 }
 
 /* dynamic filter values, derived from whatever's in the pool — never hardcoded */
