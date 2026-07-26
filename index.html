@@ -367,7 +367,7 @@ label.chk input{accent-color:var(--accent)}
   <div class="dbody" id="dBody"></div>
 </aside>
 
-<script>/* PDF.js 3.11.174 — Apache-2.0 */
+<script>/* PDF.js 3.11.174 */
 /**
  * @licstart The following is the entire license notice for the
  * JavaScript code in this page
@@ -3611,13 +3611,24 @@ document.addEventListener('click', async (e) => {
     e.target.disabled = true; e.target.textContent = 'Pulling…';
     try {
       const rows = await Cloud.pullAll();
-      // shape DB rows to look like docs the review code understands
+      // also pull the stored checks so the "needs fixing" filter works on
+      // database records, not just this session
+      let checksByHash = {};
+      try {
+        const cr = await fetch(Cloud.url + '/checks?select=content_hash,check_id,status,severity,detail&status=eq.FAIL',
+          { headers: Cloud.headers({ 'Range':'0-99999' }) });
+        if (cr.ok) { const cks = await cr.json();
+          cks.forEach(c => { (checksByHash[c.content_hash] = checksByHash[c.content_hash] || []).push(c); }); }
+      } catch(_){}
       window.reviewPulled = rows.map(row => ({
         content_hash: row.content_hash, hash: row.content_hash,
-        invoice: row, checks: [],   // checks aren't re-run on pulled rows; edits still allowed
+        invoice: row, checks: checksByHash[row.content_hash] || [],
         verdict: row.verdict, verification: row.verification
       }));
-      log(`Pulled ${rows.length} records from the database into Review.`, 'ok');
+      const flagged = window.reviewPulled.filter(r=>r.checks.length).length;
+      log(`Pulled ${rows.length} records from the database into Review (${flagged} need fixing).`, 'ok');
+      // if none have checks, show All so the user still sees the data
+      if (!flagged) window.__reviewMode = 'all';
     } catch(err){ log('Pull failed: '+err.message, 'er'); }
     renderReview();
   }
