@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='c452fb6b56ad';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -237,7 +237,7 @@ label.chk input{accent-color:var(--accent)}
         workspace is stored in this browser only. On a shared computer, use <b>Clear</b> in the sidebar when you finish.</span></div>
       <div class="drop" id="drop">
         <h3>Drop files or a folder here</h3>
-        <p>PDF, Excel (.xlsx .xlsm .xls .xlsb), CSV, TSV and ZIP — including archives nested inside archives. Files already ingested are recognised by content hash and skipped. RAR is opened on a best-effort basis and needs internet on first use; extracting it and dropping the folder always works.</p>
+        <p>PDF, Excel (.xlsx .xlsm .xls .xlsb), CSV, TSV, images (JPG/PNG/TIFF, read by OCR) and ZIP — including archives nested inside archives. Files already ingested are recognised by content hash and skipped. RAR is opened on a best-effort basis and needs internet on first use; extracting it and dropping the folder always works.</p>
         <div class="row" style="justify-content:center">
           <button class="btn pri" id="pickFiles">Choose files</button>
           <button class="btn" id="pickFolder">Choose folder</button>
@@ -248,7 +248,10 @@ label.chk input{accent-color:var(--accent)}
       <div class="bar"><i id="prog"></i></div>
       <div class="grid k4" id="ingestStats" style="margin:14px 0"></div>
       <div id="ocrBanner"></div>
-      <h2>Activity</h2>
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <h2 style="margin:0">Activity</h2>
+        <button class="btn sm" id="dlDiag" title="Download a detailed timestamped log of every file, decision and reason — for debugging">↓ Download diagnostic log</button>
+      </div>
       <div class="log" id="log"><div class="dim">Ready. Nothing ingested yet.</div></div>
     </section>
 
@@ -1817,6 +1820,67 @@ const Store = {
 /* ================= helpers ================= */
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const money = p => p == null ? '—' : (p/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+/* ---- diagnostic log: a structured, timestamped record of EVERY decision,
+   so any failure (0 values, skipped files, OCR errors) carries its reason and
+   can be downloaded and shared for debugging. Separate from the on-screen log
+   (which stays readable); this captures the fine detail. ---- */
+const DIAG = {
+  entries: [],
+  sessionStart: new Date().toISOString(),
+  add(level, category, message, detail){
+    this.entries.push({
+      t: new Date().toISOString(),
+      level,                 // info | warn | error | success
+      category,              // ingest | extract | ocr | excel | push | skip | value | system
+      message,
+      detail: detail || null
+    });
+    // keep memory bounded on huge runs
+    if (this.entries.length > 100000) this.entries.splice(0, 20000);
+  },
+  info(cat, m, d){ this.add('info', cat, m, d); },
+  warn(cat, m, d){ this.add('warn', cat, m, d); },
+  error(cat, m, d){ this.add('error', cat, m, d); },
+  ok(cat, m, d){ this.add('success', cat, m, d); },
+
+  summary(){
+    const byCat = {}, byLevel = {};
+    this.entries.forEach(e => { byCat[e.category]=(byCat[e.category]||0)+1; byLevel[e.level]=(byLevel[e.level]||0)+1; });
+    return { total: this.entries.length, byCategory: byCat, byLevel };
+  },
+
+  toText(){
+    const s = this.summary();
+    const head = [
+      'LUMEN DIAGNOSTIC LOG',
+      'session started: ' + this.sessionStart,
+      'exported:        ' + new Date().toISOString(),
+      'total events:    ' + s.total,
+      'by level:        ' + JSON.stringify(s.byLevel),
+      'by category:     ' + JSON.stringify(s.byCategory),
+      'app build:       ' + (window.__LUMEN_BUILD || 'unknown'),
+      ''.padEnd(70,'='), ''
+    ].join('\n');
+    const body = this.entries.map(e => {
+      let line = `${e.t}  [${e.level.toUpperCase().padEnd(7)}] ${e.category.padEnd(8)} ${e.message}`;
+      if (e.detail) line += '\n' + '    ↳ ' + (typeof e.detail==='string' ? e.detail : JSON.stringify(e.detail));
+      return line;
+    }).join('\n');
+    return head + body + '\n';
+  },
+
+  download(){
+    const blob = new Blob([this.toText()], { type:'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'lumen-diagnostic-' + new Date().toISOString().replace(/[:.]/g,'-').slice(0,19) + '.txt';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 1000);
+  },
+
+  clear(){ this.entries = []; this.sessionStart = new Date().toISOString(); }
+};
+
 function log(msg, cls){ const l = $('#log');
   if (l.firstChild && l.firstChild.classList && l.firstChild.classList.contains('dim') && l.children.length===1 && l.textContent.startsWith('Ready')) l.innerHTML='';
   const d = document.createElement('div'); if(cls) d.className = cls; d.textContent = msg; l.appendChild(d); l.scrollTop = l.scrollHeight; }
@@ -2199,6 +2263,29 @@ const OCR = {
 
   /* OCR a single PDF page: render to canvas, recognise, return pseudo text items
      positioned like the real text layer so the same extractor can read them. */
+  /* OCR a raw image file (jpg/png/tiff…). An image bill has no text layer at
+     all, so we OCR the whole thing. Returns pseudo text items like ocrPage. */
+  async ocrImage(buf, onDiag){
+    const worker = await this.worker();
+    const blob = new Blob([buf]);
+    const tOcr0 = Date.now();
+    const { data } = await this._withTimeout(worker.recognize(blob), 30000, 'OCR image');
+    if (onDiag) onDiag({ render: 0, ocr: Date.now()-tOcr0 });
+    const items = [];
+    const words = data.words || [];
+    if (words.length) {
+      // OCR gives absolute pixel boxes; we don't know the page scale, so use
+      // the raw pixel coords directly — the extractor works on relative layout.
+      const H = Math.max(...words.map(w=>(w.bbox&&w.bbox.y1)||0), 1000);
+      for (const wd of words) { const bb = wd.bbox||{};
+        items.push({ x:bb.x0||0, y:H-(bb.y1||0), w:(bb.x1||0)-(bb.x0||0), h:(bb.y1||0)-(bb.y0||0), str:wd.text||'', _ocr:true }); }
+    } else if (data.text) {
+      let y = 1000; data.text.split(/\n/).forEach(line => { y -= 14;
+        if (line.trim()) items.push({ x:10, y, w:200, h:12, str:line.trim(), _ocr:true }); });
+    }
+    return items;
+  },
+
   async ocrPage(pdfPage, onDiag){
     const scale = 2;
     const vp = pdfPage.getViewport({ scale });
@@ -2253,6 +2340,12 @@ const MAGIC = [
   { sig:[0x52,0x61,0x72,0x21], kind:'rar'  }, { sig:[0x37,0x7A,0xBC,0xAF], kind:'7z'  },
   { sig:[0xD0,0xCF,0x11,0xE0], kind:'ole2' }, { sig:[0x25,0x50,0x44,0x46], kind:'pdf' },
   { sig:[0x1F,0x8B],           kind:'gzip' },
+  { sig:[0xFF,0xD8,0xFF],      kind:'image' },                 // JPEG
+  { sig:[0x89,0x50,0x4E,0x47], kind:'image' },                 // PNG
+  { sig:[0x47,0x49,0x46,0x38], kind:'image' },                 // GIF
+  { sig:[0x49,0x49,0x2A,0x00], kind:'image' },                 // TIFF (LE)
+  { sig:[0x4D,0x4D,0x00,0x2A], kind:'image' },                 // TIFF (BE)
+  { sig:[0x42,0x4D],           kind:'image' },                 // BMP
 ];
 function sniff(bytes){
   for (const m of MAGIC) if (m.sig.every((b,i) => bytes[i] === b)) return m.kind;
@@ -2305,16 +2398,16 @@ async function collect(entries, depth, acc){
     const name = e.name, base = name.split('/').pop();
     if (!base || base.startsWith('.') || name.startsWith('__MACOSX/')) continue;
     const buf = await e.read();
-    if (!buf || buf.byteLength === 0) { acc.skipped.push([name, 'empty']); continue; }
+    if (!buf || buf.byteLength === 0) { acc.skipped.push([name, 'empty']); if(typeof DIAG!=='undefined')DIAG.warn('skip',`skipped: ${name}`,{reason:'file is empty (0 bytes)'}); continue; }
     const head = new Uint8Array(buf.slice(0, 8));
     const kind = sniff(head);
 
-    if (kind === 'rar') { showRarHelp(base); acc.skipped.push([name, 'rar']); continue; }
+    if (kind === 'rar') { showRarHelp(base); acc.skipped.push([name, 'rar']); if(typeof DIAG!=='undefined')DIAG.warn('skip',`skipped: ${name}`,{reason:'RAR archive — extract and drop the folder instead'}); continue; }
     if (kind === 'pdf') {
-      if (!window.pdfjsLib) { acc.skipped.push([name, 'pdf']); continue; }
+      if (!window.pdfjsLib) { acc.skipped.push([name, 'pdf']); if(typeof DIAG!=='undefined')DIAG.error('skip',`skipped: ${name}`,{reason:'PDF reader not loaded'}); continue; }
       acc.docs.push({ name: base, path: e.path, buf, pdf: true }); continue;
     }
-    if (kind === '7z' || kind === 'gzip') { acc.skipped.push([name, kind]); continue; }
+    if (kind === '7z' || kind === 'gzip') { acc.skipped.push([name, kind]); if(typeof DIAG!=='undefined')DIAG.warn('skip',`skipped: ${name}`,{reason:kind+' archive not supported — use zip'}); continue; }
     if (kind === 'ole2') { acc.docs.push({ name: base, path: e.path, buf, legacy: true }); continue; }
 
     if (kind === 'zip') {
@@ -2326,7 +2419,7 @@ async function collect(entries, depth, acc){
         const inner = Object.values(z.files).filter(f => !f.dir);
         if (inner.length > MAX_ARCHIVE_ENTRIES) {
           log(`${base} quarantined — ${inner.length} entries exceeds the safety limit`, 'er');
-          acc.skipped.push([name, 'type']); continue;
+          acc.skipped.push([name, 'type']); if(typeof DIAG!=='undefined')DIAG.warn('skip',`skipped: ${name}`,{reason:'not a spreadsheet, CSV, PDF or ZIP'}); continue;
         }
         acc.archives++;
         log(`${base} → ${inner.length} entries${depth ? ' (depth ' + (depth+1) + ')' : ''}`, 'dim');
@@ -2340,7 +2433,11 @@ async function collect(entries, depth, acc){
       continue;
     }
     if (CSV_EXT.test(base)) { acc.docs.push({ name: base, path: e.path, buf, csv: true }); continue; }
-    acc.skipped.push([name, 'type']);
+    if (kind === 'image' || /\.(jpe?g|png|gif|tiff?|bmp|webp)$/i.test(base)) {
+      // An image of a bill IS a bill — route it to OCR rather than dropping it.
+      acc.docs.push({ name: base, path: e.path, buf, image: true }); continue;
+    }
+    acc.skipped.push([name, 'type']); if(typeof DIAG!=='undefined')DIAG.warn('skip',`skipped: ${name}`,{reason:'unreadable format — not a spreadsheet, CSV, PDF or image. File recorded so nothing is lost silently; convert to PDF/Excel/image to capture it.'});
   }
   return acc;
 }
@@ -2364,6 +2461,7 @@ async function ingest(fileList){
   if (busy) return;
   if (!window.XLSX) { log('Spreadsheet reader unavailable — this file needs an internet connection on first load.', 'er'); return; }
   busy = true; $('#prog').style.width = '0';
+  DIAG.info('ingest', `=== ingest started: ${fileList.length} item(s) selected ===`);
   const t0 = performance.now();
   log(`Scanning ${fileList.length} item(s)…`, 'dim');
 
@@ -2419,20 +2517,42 @@ async function ingest(fileList){
      If it can't load, we degrade gracefully: image bills get flagged (their
      buffers dropped) rather than the whole run failing. */
   let ocrReady = false;
-  if (BIG_BATCH && ordered.some(it => it.pdf)) {
-    try { await OCR.worker(); ocrReady = true; log('  OCR engine ready for image bills.', 'dim'); }
-    catch(e){ log('  OCR engine unavailable — image bills will be flagged, not read. ('+e.message+')', 'wn'); }
+  if (BIG_BATCH && ordered.some(it => it.pdf || it.image)) {
+    try { const tw=Date.now(); await OCR.worker(); ocrReady = true;
+      DIAG.ok('ocr',`OCR engine loaded in ${((Date.now()-tw)/1000).toFixed(1)}s`);
+      log('  OCR engine ready for image bills.', 'dim'); }
+    catch(e){ DIAG.error('ocr','OCR engine failed to load',{reason:e.message});
+      log('  OCR engine unavailable — image bills will be flagged, not read. ('+e.message+')', 'wn'); }
   }
 
   for (const it of ordered) {
     try {
       const hash = await sha256(it.buf);
-      if (DB.hashes.has(hash)) { dupes++; done++; continue; }
+      DIAG.info('ingest', `processing: ${it.name}`, { type: it.image?'image':(it.pdf?'pdf':(it.csv?'csv':'excel')), bytes: it.buf.byteLength });
+      if (DB.hashes.has(hash)) { dupes++; done++;
+        DIAG.info('skip', `duplicate skipped: ${it.name}`, { reason:'content hash already ingested', hash: hash.slice(0,16) });
+        continue; }
       let view;
-      if (it.pdf) {
+      if (it.image) {
+        // an image file IS a bill with no text — OCR the whole image
+        if (!ocrReady && !BIG_BATCH) { try { await OCR.worker(); ocrReady = true; } catch(_){} }
+        try {
+          let diag=null;
+          const ocrItems = await OCR.ocrImage(it.buf, (d)=>{diag=d;});
+          view = L.buildViewFromPages([{ items: ocrItems }], it.name);
+          view._ocrUsed = true; view.metadata = view.metadata || {}; view.metadata.hasImagePage = true;
+          DIAG.ok('ocr', `OCR read image ${it.name}`, diag);
+        } catch(e){
+          done++;
+          DIAG.error('ocr', `image OCR failed: ${it.name}`, { reason: e.message });
+          log(`${it.name} — image, OCR failed: ${e.message}`, 'er');
+          continue;
+        }
+      } else if (it.pdf) {
         view = await pdfToView(it.buf, it.name);
         if (view.metadata.isScanned && !view._ocrUsed) {
           scans++; done++;
+          DIAG.error('ocr', `image PDF unreadable: ${it.name}`, { reason:'no text layer and OCR did not recover it' });
           log(`${it.name} — scanned image and OCR could not read it`, 'wn');
           continue;
         }
@@ -2449,6 +2569,28 @@ async function ingest(fileList){
       const r = L.processView(view);
       r.hash = hash; r.path = it.path; r.sessionId = session.id;
       r._fromPdf = !!it.pdf;
+
+      /* record what was extracted, and WHY anything is missing/zero */
+      const iv = r.invoice;
+      const missing = [];
+      if (!iv.invoice_no) missing.push('invoice_no');
+      if (!iv.client_raw) missing.push('client_raw');
+      if (!iv.branch_raw) missing.push('branch_raw');
+      if (iv.total_paise == null || iv.total_paise === 0) missing.push('total');
+      if (iv.taxable_paise == null || iv.taxable_paise === 0) missing.push('taxable');
+      const rowCount = ((r.candidates && r.candidates._applicant_rows||[])[0]||{}).normalized?.length || 0;
+      if (missing.length) {
+        // explain the likely cause
+        let reason = 'fields not found by extractor';
+        if (it.pdf && view.metadata && view.metadata.hasImagePage) reason = 'page is an image — needs OCR';
+        else if (rowCount === 0) reason = 'no applicant/detail rows read from annexure';
+        else if (missing.includes('total')) reason = 'total/amount column not matched in this layout';
+        DIAG.warn('value', `missing/zero fields in ${it.name}: ${missing.join(', ')}`, {
+          reason, invoice_no: iv.invoice_no||null, rows_read: rowCount,
+          taxable: iv.taxable_paise, total: iv.total_paise, format: it.pdf?'pdf':'excel' });
+      } else {
+        DIAG.ok('extract', `read OK: ${it.name}`, { invoice_no: iv.invoice_no, total: iv.total_paise, rows: rowCount });
+      }
 
       /* If this is an Excel (or other non-PDF), register the bill it covers so a
          matching PDF later can skip OCR. */
@@ -2467,6 +2609,7 @@ async function ingest(fileList){
         if (key && excelCovered.has(key)) {
           r._ocrCoveredByExcel = true;      // record, but no OCR needed
           excelPreferred++;
+          DIAG.info('excel', `OCR skipped for ${it.name}`, { reason:'Excel of same invoice already covers it', invoice: key });
         } else if (BIG_BATCH && ocrReady) {
           /* STREAMING OCR for big backfills: OCR this image PDF right now, using
              the buffer we already have, then let it be freed. We never stockpile
@@ -2484,12 +2627,13 @@ async function ingest(fileList){
               detail:'Read from an image by OCR — verify the amounts.' });
             if (r.verdict==='PROVEN') r.verdict='UNPROVEN';
             ocrStreamed++;
+            DIAG.ok('ocr', `OCR read ${it.name}`, { invoice: r.invoice.invoice_no, total: r.invoice.total_paise });
           } catch(e){
-            // OCR failed for this one — flag it, but don't hold its buffer
             r._hasImagePage = true; r._ocrFailed = true;
             r.checks = r.checks || [];
             r.checks.push({ check_id:'C16_ocr_source', status:'FAIL', severity:'warning',
               detail:'Image bill — OCR did not complete; re-ingest this file alone to read it.' });
+            DIAG.error('ocr', `OCR failed for ${it.name}`, { reason: e.message });
           }
         } else if (BIG_BATCH) {
           // big batch but OCR not ready: flag without holding the buffer
@@ -2501,8 +2645,8 @@ async function ingest(fileList){
           catch(_){ r._pdfBuf = null; }
         }
       }
-      if (view._ocrUsed) {
-        r._ocr = true;
+      if (view._ocrUsed || it.image) {
+        r._ocr = true; if (it.image) r._fromImage = true;
         // record an explicit check so it surfaces in Review as needing verification
         r.checks = r.checks || [];
         r.checks.push({ check_id: 'C16_ocr_source', status: 'FAIL', severity: 'warning',
@@ -2526,8 +2670,9 @@ async function ingest(fileList){
     if (BIG_BATCH && DB.docs.length) {
       const justAdded = DB.docs[DB.docs.length - 1];
       if (justAdded && !justAdded._pushed) {
-        try { await Cloud.enrichFromMaster(justAdded); await Cloud.pushOne(justAdded); justAdded._pushed = true; pushedCount++; }
-        catch(e){ /* network hiccup: leave unpushed, a later manual push catches it */ }
+        try { await Cloud.enrichFromMaster(justAdded); await Cloud.pushOne(justAdded); justAdded._pushed = true; pushedCount++;
+          DIAG.info('push', `saved: ${justAdded.filename}`, { invoice: justAdded.invoice.invoice_no }); }
+        catch(e){ DIAG.error('push', `save failed: ${justAdded.filename}`, { reason: e.message }); }
         // free heavy per-file memory now that it's stored
         delete justAdded._pdfBuf; delete justAdded._sourceBlob;
         if (justAdded.candidates) justAdded.candidates = {};   // drop bulky candidate trees
@@ -2576,6 +2721,10 @@ async function ingest(fileList){
   }
   busy = false; renderAll(); persist();
   renderOcrBanner();
+  DIAG.ok('ingest', `=== ingest finished ===`, {
+    stored: session.count, duplicates: dupes, failed, scans,
+    excel_preferred: excelPreferred, ocr_streamed: ocrStreamed, pushed: pushedCount,
+    skipped: acc.skipped.length });
 
   /* The database is the default backing store — every ingested bill is pushed
      automatically, no button. Enrichment (client/branch master tables) runs
@@ -3409,6 +3558,7 @@ DROP_HTML = drop.innerHTML;
 ['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('hot'); }));
 drop.addEventListener('drop', e => { if (e.dataTransfer.files.length) ingest([...e.dataTransfer.files]); });
 wireDrop();
+$('#dlDiag') && ($('#dlDiag').onclick = () => { DIAG.info('system','diagnostic log downloaded by user'); DIAG.download(); });
 $('#fileIn').onchange = e => ingest([...e.target.files]);
 $('#folderIn').onchange = e => ingest([...e.target.files]);
 
@@ -3944,9 +4094,9 @@ window.setOcrStatus = function(state){
   setOcrStatus('checking');
   try {
     const r = await fetch(OCR.base + '/tesseract-core-lstm.wasm.js', { method:'HEAD' });
-    if (r.ok) { setOcrStatus('ready'); }
-    else { setOcrStatus('error'); }
-  } catch(e){ setOcrStatus('off'); }
+    if (r.ok) { setOcrStatus('ready'); if(typeof DIAG!=='undefined')DIAG.ok('ocr','OCR engine reachable on Supabase'); }
+    else { setOcrStatus('error'); if(typeof DIAG!=='undefined')DIAG.error('ocr','OCR files not reachable',{status:r.status}); }
+  } catch(e){ setOcrStatus('off'); if(typeof DIAG!=='undefined')DIAG.warn('ocr','OCR reachability check failed',{reason:e.message}); }
 })();
 
 /* modal helpers */
