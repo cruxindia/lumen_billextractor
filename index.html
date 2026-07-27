@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='841c21758124';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='52c18296b3a0';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2150,6 +2150,20 @@ const Cloud = {
       body: JSON.stringify(patch) });
     if (!r.ok) { const t = await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
     return true;
+  },
+
+  /* Mark a bill as manually verified/complete. Sets verdict=VERIFIED and clears
+     its failing checks so it stops counting as "needs attention" and drops out
+     of the review worklist. The bill's data stays; only its pending status
+     changes. */
+  async markVerified(hash){
+    await this.updateOne(hash, { verdict: 'VERIFIED', verification: 'manual' });
+    // clear its failing checks in the DB so it leaves the needs-attention list
+    try {
+      await fetch(this.url + '/checks?content_hash=eq.' + encodeURIComponent(hash) + '&status=eq.FAIL',
+        { method: 'DELETE', headers: this.headers({ 'Prefer':'return=minimal' }) });
+    } catch(_){}
+    return true;
   }
 };
 
@@ -3129,6 +3143,7 @@ window.openReview = (key) => {
       <div style="flex:1"></div>
       <button class="btn" onclick="closeModal()">Cancel</button>
       <button class="btn pri" onclick="saveReview('${key}')">Save &amp; push correction</button>
+      <button class="btn" onclick="markVerified('${key}')" title="This bill is fully checked and correct — mark it complete so it leaves the review list and stops counting as pending">✓ Mark verified &amp; complete</button>
     </div>`;
   showModal(body);
 };
@@ -3139,6 +3154,23 @@ window.pickTotal = (key, paise) => {
     const inp = dlg.querySelector(`input[data-k="${k}"]`);
     if (inp && paise!=null) inp.value = (paise/100).toFixed(2);
   });
+};
+
+window.markVerified = async (key) => {
+  const source = (window.reviewPulled && window.reviewPulled.length) ? window.reviewPulled : DB.docs;
+  const r = source.find(x => (x.hash||x.content_hash||x.id) === key);
+  if (!r) return;
+  const hash = r.hash || r.content_hash;
+  try {
+    if (hash) await Cloud.markVerified(hash);
+    // reflect locally: mark verified, clear failing checks, free memory
+    r.verdict = 'VERIFIED'; r.verification = 'manual';
+    if (r.checks) r.checks = r.checks.filter(c => c.status !== 'FAIL');
+    r._hasImagePage = false; delete r._pdfBuf; delete r._sourceBlob;
+    log('Bill marked verified — removed from the review list.', 'ok');
+    DIAG && DIAG.info('system', `bill marked verified: ${r.filename||hash}`);
+  } catch(e){ log('Could not mark verified: '+e.message, 'er'); }
+  closeModal(); renderReview(); renderOcrBanner(); renderAll();
 };
 
 window.saveReview = async (key) => {
@@ -3568,7 +3600,18 @@ function toCsv(headers, rows){
   const q = v => { const s = String(v ?? ''); return /[",\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s; };
   return headers.map(q).join(',') + '\n' + rows.map(r => r.map(q).join(',')).join('\n');
 }
-function persist(){ Store.set('workspace', { docs: DB.docs, sessions: DB.sessions, savedAt: new Date().toISOString() }); }
+function persist(){
+  // Strip fields that can't be serialized or would bloat browser storage:
+  // ArrayBuffers (_pdfBuf), Blobs (_sourceBlob), and bulky candidate trees.
+  // These live in memory only for the current session; storage keeps the light
+  // extracted data. (Persisting ~700MB of PDF buffers would fail/hang the tab.)
+  const light = DB.docs.map(d => {
+    const { _pdfBuf, _sourceBlob, ...rest } = d;
+    return rest;
+  });
+  try { Store.set('workspace', { docs: light, sessions: DB.sessions, savedAt: new Date().toISOString() }); }
+  catch(e){ DIAG && DIAG.warn('system','could not persist workspace to browser',{reason:e.message}); }
+}
 
 /* ================= wiring ================= */
 $('#rail').addEventListener('click', e => { const b = e.target.closest('button[data-v]'); if(!b) return;
