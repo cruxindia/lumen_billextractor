@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='2bb21b63381d';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='841c21758124';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -309,6 +309,7 @@ label.chk input{accent-color:var(--accent)}
         <span class="spacer"></span>
         <button class="btn" id="expCsv">Export CSV</button>
         <button class="btn" id="expXlsx">Export Excel</button>
+        <button class="btn" id="expNeedsAttention" title="Export every bill that is unproven, has missing values, or needs OCR — with the reason for each, so they can be reviewed and fixed">⚠ Export bills needing attention</button>
         <label class="chk" title="Group rows by applicant and add a Sub total line after each"><input type="checkbox" id="optSubtotal"> Group with sub-totals</label>
         <button class="btn" id="expDef">Export definition</button>
       </div>
@@ -2661,15 +2662,15 @@ async function ingest(fileList){
              ingest. Inline OCR of hundreds/thousands of image PDFs freezes the
              batch (each takes seconds). Ingest stays fast; OCR runs afterward as
              a resumable background pass the user starts from the banner.
-             For big batches we don't hold the buffer (memory); the user re-runs
-             OCR which re-reads from the pushed record path. For small batches we
-             keep the buffer so OCR is instant. */
+          /* Flag image bills for the SEPARATE OCR pass — never OCR inline during
+             ingest (that froze the batch). We DO keep each image bill's PDF
+             buffer so the Run OCR button works afterward. Only image bills hold
+             buffers (a subset), and non-image files still drop theirs below — so
+             memory stays far lower than the old "hold everything" freeze. */
           r._hasImagePage = true;
-          if (!BIG_BATCH) {
-            try { const src = new Uint8Array(it.buf); const copy = new Uint8Array(src.length); copy.set(src); r._pdfBuf = copy.buffer; }
-            catch(_){ r._pdfBuf = null; }
-          }
-          DIAG.info('ocr', `flagged for OCR: ${it.name}`, { reason:'image page — will be read in the OCR pass' });
+          try { const src = new Uint8Array(it.buf); const copy = new Uint8Array(src.length); copy.set(src); r._pdfBuf = copy.buffer; }
+          catch(_){ r._pdfBuf = null; }
+          DIAG.info('ocr', `flagged for OCR: ${it.name}`, { reason:'image page — buffer kept for the OCR pass' });
         }
       }
       if (view._deferImage) {
@@ -2707,9 +2708,11 @@ async function ingest(fileList){
         try { await Cloud.enrichFromMaster(justAdded); await Cloud.pushOne(justAdded); justAdded._pushed = true; pushedCount++;
           DIAG.info('push', `saved: ${justAdded.filename}`, { invoice: justAdded.invoice.invoice_no }); }
         catch(e){ DIAG.error('push', `save failed: ${justAdded.filename}`, { reason: e.message }); }
-        // free heavy per-file memory now that it's stored
-        delete justAdded._pdfBuf; delete justAdded._sourceBlob;
-        if (justAdded.candidates) justAdded.candidates = {};   // drop bulky candidate trees
+        // free heavy per-file memory now that it's stored — BUT keep the PDF
+        // buffer for image bills, which the OCR pass needs to read them.
+        if (!justAdded._hasImagePage) { delete justAdded._pdfBuf; }
+        delete justAdded._sourceBlob;
+        if (justAdded.candidates && !justAdded._hasImagePage) justAdded.candidates = {};   // drop bulky candidate trees (keep for image bills)
       }
     }
   }
@@ -2815,10 +2818,15 @@ async function runOcrPass(){
         detail:'Read from an image by OCR — verify the amounts.' });
       if (d.verdict==='PROVEN') d.verdict='UNPROVEN';
       ok++;
-      try { await Cloud.enrichFromMaster(d); await Cloud.pushOne(d); } catch(_){}
+      try { await Cloud.enrichFromMaster(d); await Cloud.pushOne(d); d._pushed = true; } catch(_){}
+      // free this bill's buffer now that it's OCR'd and saved — memory releases
+      // progressively so even 100k image bills never accumulate in RAM
+      delete d._pdfBuf; d._hasImagePage = false;
       // show timing for the FIRST few so slowness is visible immediately
       if (i < 3) log(`  ${d.filename}: ${((Date.now()-tFile)/1000).toFixed(1)}s`
         + (diag ? ` (render ${diag.render}ms + OCR ${diag.ocr}ms)` : ''), 'dim');
+      // yield to the browser every few bills so the UI stays responsive
+      if (i % 5 === 0) await new Promise(r => setTimeout(r));
     } catch(e){
       failed++; d._ocrDone = true;
       log(`  ${d.filename} — OCR failed after ${((Date.now()-tFile)/1000).toFixed(1)}s: ${e.message}`, 'er');
@@ -2874,10 +2882,14 @@ async function pdfToViewWithOcr(buf, filename, onDiag){
 
 async function autoSync(docs){
   if (!docs || !docs.length || typeof Cloud === 'undefined') return;
-  setCloud(`Saving ${docs.length} to database…`, 'dim');
+  // Skip docs already pushed during ingest (big batches push as they go), so we
+  // never push the same bill twice.
+  const toPush = docs.filter(d => !d._pushed);
+  if (!toPush.length) { setCloud(`All saved to the database`, 'ok'); renderReview(); return; }
+  setCloud(`Saving ${toPush.length} to database…`, 'dim');
   let ok=0, fail=0; const fails=[];
-  for (const d of docs){
-    try { await Cloud.enrichFromMaster(d); const res = await Cloud.pushOne(d); ok++; }
+  for (const d of toPush){
+    try { await Cloud.enrichFromMaster(d); const res = await Cloud.pushOne(d); d._pushed = true; ok++; }
     catch(e){ fail++; fails.push([d.filename, e.message]); }
   }
   if (fail) { setCloud(`Saved ${ok}, ${fail} failed to save`, 'er'); log(`${fail} document(s) could not be saved to the database:`, 'er');
@@ -3939,6 +3951,66 @@ $('#expXlsx').onclick = async () => { if(!window.XLSX) return log('Excel writer 
   await LumenStyle.write('Report', header, dataRows, widths, 'lumen-report.xlsx');
   log(`Exported a formatted report — ${dataRows.length} rows${wantSub?' with sub-totals':''}`, 'ok');
 };
+$('#expNeedsAttention').onclick = async () => {
+  // Gather every bill that needs attention, with a clear reason for each, so
+  // they can be reviewed here and sent for fixing. Pulls from the whole database
+  // (not just this session) so it's a complete worklist.
+  let pool = DB.docs;
+  try {
+    const rows = await Cloud.pullAll();
+    if (rows && rows.length) pool = rows.map(r => ({ invoice: r, verdict: r.verdict, filename: r.source_file, _fromDb:true,
+      checks: [] }));
+  } catch(_){ /* offline: use session */ }
+
+  const problems = [];
+  for (const d of pool) {
+    const iv = d.invoice || d;
+    const missing = [];
+    if (!iv.invoice_no) missing.push('invoice_no');
+    if (!iv.client_raw) missing.push('client');
+    if (!iv.branch_raw) missing.push('branch');
+    if (iv.total_paise == null || iv.total_paise === 0) missing.push('total');
+    if (iv.taxable_paise == null || iv.taxable_paise === 0) missing.push('taxable');
+    const isProblem = (d.verdict && d.verdict !== 'PROVEN') || missing.length || d._hasImagePage || d._ocrFailed;
+    if (!isProblem) continue;
+
+    let reason = '';
+    if (d._hasImagePage || d._ocrFailed) reason = 'image page — needs OCR (run the OCR pass)';
+    else if (missing.includes('total') || missing.includes('taxable')) reason = 'amount not read from this layout';
+    else if (missing.length) reason = 'missing: ' + missing.join(', ');
+    else if (d.verdict === 'UNPROVEN') reason = 'read by OCR — amounts need verifying';
+    else reason = (d.verdict || 'needs review').toLowerCase();
+
+    problems.push({
+      invoice_no: iv.invoice_no || '(not read)',
+      file: d.filename || iv.source_file || '',
+      client: iv.client_raw || '',
+      branch: iv.branch_raw || '',
+      total: iv.total_paise != null ? (iv.total_paise/100).toFixed(2) : '',
+      verdict: d.verdict || '',
+      reason
+    });
+  }
+
+  if (!problems.length) { log('No bills need attention — everything reconciled.', 'ok'); return; }
+
+  if (window.XLSX) {
+    const ws = XLSX.utils.json_to_sheet(problems, { header:['invoice_no','file','client','branch','total','verdict','reason'] });
+    ws['!cols'] = [{wch:18},{wch:40},{wch:24},{wch:24},{wch:12},{wch:12},{wch:38}];
+    const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Needs attention');
+    const buf = XLSX.write(wb, { bookType:'xlsx', type:'array' });
+    download('lumen-needs-attention-' + new Date().toISOString().slice(0,10) + '.xlsx', new Blob([buf]));
+  } else {
+    // offline fallback: CSV
+    const head = 'invoice_no,file,client,branch,total,verdict,reason\n';
+    const csv = head + problems.map(p => [p.invoice_no,p.file,p.client,p.branch,p.total,p.verdict,p.reason]
+      .map(v => '"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\n');
+    download('lumen-needs-attention.csv', new Blob([csv], {type:'text/csv'}));
+  }
+  log(`Exported ${problems.length} bill(s) needing attention.`, 'ok');
+  DIAG.info('system', `exported ${problems.length} bills needing attention`);
+};
+
 $('#expDef').onclick = () => download('report-definition.json', new Blob([JSON.stringify(
   { id:'rpt_custom', columns: reportCols.map((k,i)=>({key:k, label:colLabel(k), order:i})) }, null, 1)], {type:'application/json'}));
 
@@ -4211,6 +4283,32 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
   if (w && w.docs && w.docs.length) { DB.docs = w.docs; DB.sessions = w.sessions || [];
     DB.hashes = new Set(DB.docs.map(x=>x.hash)); log(`Restored ${DB.docs.length} document(s) from this browser`, 'dim'); }
   renderAll();
+
+  /* Auto-pull the database so Review and Report reflect ALL stored bills without
+     a manual "pull" — this is why you had to pull before. Runs quietly in the
+     background; if offline it just uses the local workspace. */
+  (async () => {
+    if (typeof Cloud === 'undefined') return;
+    try {
+      const rows = await Cloud.pullAll();
+      if (rows && rows.length) {
+        // fetch failing checks too, so the needs-attention view works on DB rows
+        let checksByHash = {};
+        try {
+          const cr = await fetch(Cloud.url + '/checks?select=content_hash,check_id,status,severity,detail&status=eq.FAIL',
+            { headers: Cloud.headers({ 'Range':'0-99999' }) });
+          if (cr.ok) { (await cr.json()).forEach(c => { (checksByHash[c.content_hash]=checksByHash[c.content_hash]||[]).push(c); }); }
+        } catch(_){}
+        window.reviewPulled = rows.map(row => ({ content_hash: row.content_hash, hash: row.content_hash,
+          invoice: row, checks: checksByHash[row.content_hash]||[], verdict: row.verdict, verification: row.verification, filename: row.source_file }));
+        window.misRows = rows; window.__misSource = 'database';
+        const needs = window.reviewPulled.filter(r => r.verdict && r.verdict!=='PROVEN').length;
+        setCloud(`Database loaded — ${rows.length} bills, ${needs} need attention`, needs?'wn':'ok');
+        renderReview(); if (typeof renderReport==='function') renderReport();
+        DIAG.ok('system', `auto-pulled ${rows.length} bills from database on load`, { needs_attention: needs });
+      }
+    } catch(e){ DIAG.warn('system', 'auto-pull on load failed (working offline)', { reason: e.message }); }
+  })();
 })();
 </script>
   <div id="modalWrap" class="modalwrap" style="display:none" onclick="if(event.target===this)closeModal()">
