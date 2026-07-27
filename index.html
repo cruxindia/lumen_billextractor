@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='c452fb6b56ad';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='36fd339c4de2';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2513,17 +2513,10 @@ async function ingest(fileList){
   const excelCovered = new Set();
   DB.docs.forEach(d => { if (d && !d._fromPdf) { const k = invNoKey(d.invoice && d.invoice.invoice_no); if (k) excelCovered.add(k); } });
 
-  /* For a big batch we OCR image bills inline, so warm the engine ONCE up front.
-     If it can't load, we degrade gracefully: image bills get flagged (their
-     buffers dropped) rather than the whole run failing. */
+  /* OCR does NOT run during ingest — it runs as a separate pass afterward. So
+     we do not warm the engine here (warming it up front was causing a long
+     "OCR working…" hang before the batch could even start). */
   let ocrReady = false;
-  if (BIG_BATCH && ordered.some(it => it.pdf || it.image)) {
-    try { const tw=Date.now(); await OCR.worker(); ocrReady = true;
-      DIAG.ok('ocr',`OCR engine loaded in ${((Date.now()-tw)/1000).toFixed(1)}s`);
-      log('  OCR engine ready for image bills.', 'dim'); }
-    catch(e){ DIAG.error('ocr','OCR engine failed to load',{reason:e.message});
-      log('  OCR engine unavailable — image bills will be flagged, not read. ('+e.message+')', 'wn'); }
-  }
 
   for (const it of ordered) {
     try {
@@ -2534,19 +2527,27 @@ async function ingest(fileList){
         continue; }
       let view;
       if (it.image) {
-        // an image file IS a bill with no text — OCR the whole image
-        if (!ocrReady && !BIG_BATCH) { try { await OCR.worker(); ocrReady = true; } catch(_){} }
-        try {
-          let diag=null;
-          const ocrItems = await OCR.ocrImage(it.buf, (d)=>{diag=d;});
-          view = L.buildViewFromPages([{ items: ocrItems }], it.name);
-          view._ocrUsed = true; view.metadata = view.metadata || {}; view.metadata.hasImagePage = true;
-          DIAG.ok('ocr', `OCR read image ${it.name}`, diag);
-        } catch(e){
-          done++;
-          DIAG.error('ocr', `image OCR failed: ${it.name}`, { reason: e.message });
-          log(`${it.name} — image, OCR failed: ${e.message}`, 'er');
-          continue;
+        // an image file IS a bill with no text. Small batch: OCR now. Big batch:
+        // flag it for the separate OCR pass so ingest never freezes.
+        if (BIG_BATCH) {
+          view = L.buildViewFromPages([{ items: [] }], it.name);
+          view.metadata = view.metadata || {}; view.metadata.hasImagePage = true;
+          view._deferImage = true;
+          DIAG.info('ocr', `image flagged for OCR pass: ${it.name}`, { reason:'big batch — deferred to keep ingest fast' });
+        } else {
+          if (!ocrReady) { try { await OCR.worker(); ocrReady = true; } catch(_){} }
+          try {
+            let diag=null;
+            const ocrItems = await OCR.ocrImage(it.buf, (d)=>{diag=d;});
+            view = L.buildViewFromPages([{ items: ocrItems }], it.name);
+            view._ocrUsed = true; view.metadata = view.metadata || {}; view.metadata.hasImagePage = true;
+            DIAG.ok('ocr', `OCR read image ${it.name}`, diag);
+          } catch(e){
+            done++;
+            DIAG.error('ocr', `image OCR failed: ${it.name}`, { reason: e.message });
+            log(`${it.name} — image, OCR failed: ${e.message}`, 'er');
+            continue;
+          }
         }
       } else if (it.pdf) {
         view = await pdfToView(it.buf, it.name);
@@ -2610,42 +2611,30 @@ async function ingest(fileList){
           r._ocrCoveredByExcel = true;      // record, but no OCR needed
           excelPreferred++;
           DIAG.info('excel', `OCR skipped for ${it.name}`, { reason:'Excel of same invoice already covers it', invoice: key });
-        } else if (BIG_BATCH && ocrReady) {
-          /* STREAMING OCR for big backfills: OCR this image PDF right now, using
-             the buffer we already have, then let it be freed. We never stockpile
-             thousands of buffers. If OCR isn't ready/available, we mark the bill
-             so it can be re-ingested later, but we do NOT hold its bytes. */
-          try {
-            const src = new Uint8Array(it.buf); const copy = new Uint8Array(src.length); copy.set(src);
-            const ocrView = await pdfToViewWithOcr(copy.buffer, it.name);
-            const r2 = L.processView(ocrView);
-            Object.assign(r.invoice, r2.invoice);
-            r.applicants = r2.applicants; r.candidates = r2.candidates; r.checks = r2.checks || [];
-            r.verdict = r2.verdict; r.verification = r2.verification;
-            r._ocr = true; r._ocrDone = true;
-            r.checks.push({ check_id:'C16_ocr_source', status:'FAIL', severity:'warning',
-              detail:'Read from an image by OCR — verify the amounts.' });
-            if (r.verdict==='PROVEN') r.verdict='UNPROVEN';
-            ocrStreamed++;
-            DIAG.ok('ocr', `OCR read ${it.name}`, { invoice: r.invoice.invoice_no, total: r.invoice.total_paise });
-          } catch(e){
-            r._hasImagePage = true; r._ocrFailed = true;
-            r.checks = r.checks || [];
-            r.checks.push({ check_id:'C16_ocr_source', status:'FAIL', severity:'warning',
-              detail:'Image bill — OCR did not complete; re-ingest this file alone to read it.' });
-            DIAG.error('ocr', `OCR failed for ${it.name}`, { reason: e.message });
-          }
-        } else if (BIG_BATCH) {
-          // big batch but OCR not ready: flag without holding the buffer
-          r._hasImagePage = true; r._ocrFailed = true;
         } else {
+          /* Flag image bills for the SEPARATE OCR pass — never OCR inline during
+             ingest. Inline OCR of hundreds/thousands of image PDFs freezes the
+             batch (each takes seconds). Ingest stays fast; OCR runs afterward as
+             a resumable background pass the user starts from the banner.
+             For big batches we don't hold the buffer (memory); the user re-runs
+             OCR which re-reads from the pushed record path. For small batches we
+             keep the buffer so OCR is instant. */
           r._hasImagePage = true;
-          // small batch: keep a copy for the on-demand OCR pass
-          try { const src = new Uint8Array(it.buf); const copy = new Uint8Array(src.length); copy.set(src); r._pdfBuf = copy.buffer; }
-          catch(_){ r._pdfBuf = null; }
+          if (!BIG_BATCH) {
+            try { const src = new Uint8Array(it.buf); const copy = new Uint8Array(src.length); copy.set(src); r._pdfBuf = copy.buffer; }
+            catch(_){ r._pdfBuf = null; }
+          }
+          DIAG.info('ocr', `flagged for OCR: ${it.name}`, { reason:'image page — will be read in the OCR pass' });
         }
       }
-      if (view._ocrUsed || it.image) {
+      if (view._deferImage) {
+        // deferred image: flag for the OCR pass and KEEP its buffer (an image has
+        // no other data source, so we must retain it even in a big batch; images
+        // are typically few, so the memory cost is small)
+        r._hasImagePage = true; r._fromImage = true;
+        try { const src = new Uint8Array(it.buf); const copy = new Uint8Array(src.length); copy.set(src); r._pdfBuf = copy.buffer; r._isRawImage = true; }
+        catch(_){ r._pdfBuf = null; }
+      } else if (view._ocrUsed || it.image) {
         r._ocr = true; if (it.image) r._fromImage = true;
         // record an explicit check so it surfaces in Review as needing verification
         r.checks = r.checks || [];
@@ -2765,7 +2754,13 @@ async function runOcrPass(){
     const tFile = Date.now();
     try {
       let diag = null;
-      const view = await pdfToViewWithOcr(d._pdfBuf, d.filename, (dg)=>{ diag = dg; });
+      let view;
+      if (d._isRawImage) {
+        const ocrItems = await OCR.ocrImage(d._pdfBuf, (dg)=>{ diag = dg; });
+        view = L.buildViewFromPages([{ items: ocrItems }], d.filename);
+      } else {
+        view = await pdfToViewWithOcr(d._pdfBuf, d.filename, (dg)=>{ diag = dg; });
+      }
       const r2 = L.processView(view);
       Object.assign(d.invoice, r2.invoice);
       d.applicants = r2.applicants; d.candidates = r2.candidates; d.checks = r2.checks || [];
