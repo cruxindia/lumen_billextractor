@@ -1108,6 +1108,28 @@ function extractDetail(view) {
   }
 
   if (!rows.length) return out;
+
+  /* Some annexure formats print the period's TOTAL amount once, on the first
+     applicant row, leaving the other rows' amount cells blank — the charge is
+     for the batch, not per applicant. Reading the blanks as 0 makes 12 of 13
+     rows show 0.00 (a false data-loss appearance). Detect this: exactly one row
+     has an amount and the rest are blank. Mark those rows as sharing the group
+     total so the sum is right and nothing reads as a wrong zero. */
+  const withAmt = rows.filter(r => typeof r.amount_paise === 'number' && r.amount_paise > 0);
+  const blankAmt = rows.filter(r => r.amount_paise == null);
+  if (withAmt.length === 1 && blankAmt.length === rows.length - 1 && rows.length > 1) {
+    const groupTotal = withAmt[0].amount_paise;
+    rows.forEach(r => { r._groupShared = true; r._groupTotal = groupTotal; });
+    // the single printed figure is the group total, not row 1's own charge
+    out.push({ field: '_applicant_rows', raw: rows, normalized: rows, valueType: 'json',
+      confidence: .85, method: 'header_anchored_table_grouptotal',
+      locator: { sheet: grid.name }, evidence: rows.length + ' rows sharing one printed total' });
+    out.push({ field: 'taxable_paise', raw: groupTotal / 100, normalized: groupTotal,
+      valueType: 'paise', confidence: .8, method: 'annexure_group_total',
+      locator: { sheet: grid.name }, evidence: 'single total across ' + rows.length + ' applicants' });
+    return out;
+  }
+
   out.push({ field: '_applicant_rows', raw: rows, normalized: rows, valueType: 'json', confidence: .85, method: 'header_anchored_table', locator: { sheet: grid.name }, evidence: rows.length + ' detail rows' });
 
   const amts = rows.map(r => r.amount_paise).filter(x => typeof x === 'number');
@@ -2117,7 +2139,7 @@ const OCR = {
     if (this._poolLoading) return this._poolLoading;
     setOcrStatus('loading');
     this._poolLoading = (async () => {
-      const ok = await this._withTimeout(this._loadScript(), 60000, 'OCR engine download');
+      const ok = await this._withTimeout(this._loadScript(), 120000, 'OCR engine download');
       if (!ok) { setOcrStatus('error'); throw new Error('OCR engine unavailable'); }
       const n = this.poolSize();
       const mk = () => Tesseract.createWorker('eng', 1, {
@@ -2158,7 +2180,7 @@ const OCR = {
     if (this._loading) return this._loading;
     setOcrStatus('loading');
     this._loading = (async () => {
-      const ok = await this._withTimeout(this._loadScript(), 60000, 'OCR engine download');
+      const ok = await this._withTimeout(this._loadScript(), 120000, 'OCR engine download');
       if (!ok) { setOcrStatus('error'); throw new Error('OCR engine unavailable'); }
       /* IMPORTANT: point corePath at the EXACT file we host, not the directory.
          If given a directory, Tesseract auto-selects a SIMD variant
@@ -2169,7 +2191,7 @@ const OCR = {
         workerPath: this.base + '/worker.min.js',
         langPath: this.base,               // eng.traineddata lives here
         cacheMethod: 'none'
-      }), 90000, 'OCR engine start');
+      }), 180000, 'OCR engine start');
       this._worker = w; setOcrStatus('ready'); return w;
     })().catch(e => { setOcrStatus('error'); this._loading = null; throw e; });
     return this._loading;
@@ -2369,7 +2391,7 @@ async function ingest(fileList){
     Object.entries(g).forEach(([r, n]) => log(`  skipped ${n} — ${SKIP_REASONS[r] || r}`, 'wn'));
   }
 
-  let done = 0, dupes = 0, failed = 0, scans = 0, excelPreferred = 0;
+  let done = 0, dupes = 0, failed = 0, scans = 0, excelPreferred = 0, ocrStreamed = 0, pushedCount = 0;
   const session = { id: L.newId('ses'), at: new Date().toISOString(), count: 0,
                     filesSeen: fileList.length, readable: items.length,
                     skipped: acc.skipped.length, skipDetail: {},
@@ -2382,10 +2404,25 @@ async function ingest(fileList){
      Excel twin exists. */
   const ordered = [...items].sort((a,b) => (a.pdf?1:0) - (b.pdf?1:0));
 
+  /* Memory guard: for large batches we must NOT keep per-file PDF buffers in
+     RAM (thousands × ~1MB = gigabytes → the tab freezes). Above this threshold
+     we skip retaining the view-the-bill blob; OCR still works because it runs
+     per-file and releases immediately (see the streaming OCR below). */
+  const BIG_BATCH = items.length > 300;
+
   /* invoice numbers covered by a NON-pdf (Excel) source this session, plus any
      already in the database from a prior Excel ingest */
   const excelCovered = new Set();
   DB.docs.forEach(d => { if (d && !d._fromPdf) { const k = invNoKey(d.invoice && d.invoice.invoice_no); if (k) excelCovered.add(k); } });
+
+  /* For a big batch we OCR image bills inline, so warm the engine ONCE up front.
+     If it can't load, we degrade gracefully: image bills get flagged (their
+     buffers dropped) rather than the whole run failing. */
+  let ocrReady = false;
+  if (BIG_BATCH && ordered.some(it => it.pdf)) {
+    try { await OCR.worker(); ocrReady = true; log('  OCR engine ready for image bills.', 'dim'); }
+    catch(e){ log('  OCR engine unavailable — image bills will be flagged, not read. ('+e.message+')', 'wn'); }
+  }
 
   for (const it of ordered) {
     try {
@@ -2430,10 +2467,36 @@ async function ingest(fileList){
         if (key && excelCovered.has(key)) {
           r._ocrCoveredByExcel = true;      // record, but no OCR needed
           excelPreferred++;
+        } else if (BIG_BATCH && ocrReady) {
+          /* STREAMING OCR for big backfills: OCR this image PDF right now, using
+             the buffer we already have, then let it be freed. We never stockpile
+             thousands of buffers. If OCR isn't ready/available, we mark the bill
+             so it can be re-ingested later, but we do NOT hold its bytes. */
+          try {
+            const src = new Uint8Array(it.buf); const copy = new Uint8Array(src.length); copy.set(src);
+            const ocrView = await pdfToViewWithOcr(copy.buffer, it.name);
+            const r2 = L.processView(ocrView);
+            Object.assign(r.invoice, r2.invoice);
+            r.applicants = r2.applicants; r.candidates = r2.candidates; r.checks = r2.checks || [];
+            r.verdict = r2.verdict; r.verification = r2.verification;
+            r._ocr = true; r._ocrDone = true;
+            r.checks.push({ check_id:'C16_ocr_source', status:'FAIL', severity:'warning',
+              detail:'Read from an image by OCR — verify the amounts.' });
+            if (r.verdict==='PROVEN') r.verdict='UNPROVEN';
+            ocrStreamed++;
+          } catch(e){
+            // OCR failed for this one — flag it, but don't hold its buffer
+            r._hasImagePage = true; r._ocrFailed = true;
+            r.checks = r.checks || [];
+            r.checks.push({ check_id:'C16_ocr_source', status:'FAIL', severity:'warning',
+              detail:'Image bill — OCR did not complete; re-ingest this file alone to read it.' });
+          }
+        } else if (BIG_BATCH) {
+          // big batch but OCR not ready: flag without holding the buffer
+          r._hasImagePage = true; r._ocrFailed = true;
         } else {
           r._hasImagePage = true;
-          // keep an independent copy so the OCR pass can re-read the PDF later
-          // (the working buffer gets detached by PDF.js during parsing)
+          // small batch: keep a copy for the on-demand OCR pass
           try { const src = new Uint8Array(it.buf); const copy = new Uint8Array(src.length); copy.set(src); r._pdfBuf = copy.buffer; }
           catch(_){ r._pdfBuf = null; }
         }
@@ -2446,13 +2509,32 @@ async function ingest(fileList){
           detail: 'Some of this bill was read from an image by OCR — the amounts especially need checking.' });
         if (r.verdict === 'PROVEN') r.verdict = 'UNPROVEN';
       }
-      // keep the original bytes so the bill can be opened from Review (this session only)
-      try { r._sourceBlob = new Blob([it.buf], { type: it.pdf ? 'application/pdf' : 'application/octet-stream' }); } catch(_){}
+      // keep the original bytes for "view the bill" ONLY on small batches
+      // (holding thousands of blobs would exhaust memory)
+      if (!BIG_BATCH) { try { r._sourceBlob = new Blob([it.buf], { type: it.pdf ? 'application/pdf' : 'application/octet-stream' }); } catch(_){} }
       DB.docs.push(r); DB.hashes.add(hash); session.count++;
     } catch (e) { failed++; log(`${it.name} — ${e.message}`, 'er'); }
     done++;
-    if (done % 5 === 0 || done === items.length) { $('#prog').style.width = (done/items.length*100)+'%'; await new Promise(r => setTimeout(r)); }
+    // progress + yield to the browser so the tab never appears frozen
+    if (done % 3 === 0 || done === items.length) {
+      $('#prog').style.width = (done/items.length*100)+'%';
+      updateOcrProgress(done, items.length);
+      await new Promise(r => setTimeout(r));
+    }
+    // BIG BATCH: push this doc to the database as we go, then drop its heavy
+    // fields so memory is released instead of accumulating across thousands.
+    if (BIG_BATCH && DB.docs.length) {
+      const justAdded = DB.docs[DB.docs.length - 1];
+      if (justAdded && !justAdded._pushed) {
+        try { await Cloud.enrichFromMaster(justAdded); await Cloud.pushOne(justAdded); justAdded._pushed = true; pushedCount++; }
+        catch(e){ /* network hiccup: leave unpushed, a later manual push catches it */ }
+        // free heavy per-file memory now that it's stored
+        delete justAdded._pdfBuf; delete justAdded._sourceBlob;
+        if (justAdded.candidates) justAdded.candidates = {};   // drop bulky candidate trees
+      }
+    }
   }
+  if (typeof updateOcrProgress==='function') updateOcrProgress(0,0);
   session.dupes = dupes; session.failed = failed; session.scans = scans;
   DB.sessions.push(session);
   const secs = (performance.now() - t0) / 1000;
@@ -2469,6 +2551,8 @@ async function ingest(fileList){
     if (proved) log(`  ${proved} proved automatically, needing no review`, 'ok');
     if (dupes)  log(`  ${dupes} already ingested, skipped by content hash`, 'dim');
     if (excelPreferred) log(`  ${excelPreferred} image PDF(s) skipped OCR — an Excel of the same bill was used instead (faster, more reliable)`, 'ok');
+    if (ocrStreamed) log(`  ${ocrStreamed} image bill(s) read by OCR during ingest`, 'ok');
+    if (pushedCount) log(`  ${pushedCount} saved to the database as they processed`, 'dim');
     if (scans)  log(`  ${scans} scanned PDF(s) could not be read even with OCR`, 'wn');
     if (failed) log(`  ${failed} could not be read — see above`, 'er');
   }
