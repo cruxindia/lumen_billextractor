@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='36fd339c4de2';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='2bb21b63381d';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -1933,12 +1933,57 @@ const Cloud = {
     'Content-Type': 'application/json' }, extra || {}); },
 
   /* map a processed doc to the flat invoice row the schema expects */
+  /* Postgres date columns reject hand-typed Indian formats ("15th Dec 2025",
+     ": 10 JULY", "15TH JUNE 2026", a bare ":"). Normalize every date to ISO
+     yyyy-mm-dd, or null if it can't be understood — never send a raw string that
+     would 400 the whole row. This is why 138 bills failed to save before. */
+  toISODate(v){
+    if (v == null) return null;
+    if (v instanceof Date && !isNaN(v)) return v.toISOString().slice(0,10);
+    let str = String(v).trim();
+    if (!str) return null;
+    // strip leading label junk like ": " and collapse spaces
+    str = str.replace(/^[:\s]+/, '').replace(/\s+/g, ' ').trim();
+    if (!str || str === ':') return null;
+    // already ISO?
+    let m = /^(\d{4})-(\d{2})-(\d{2})/.exec(str);
+    if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+    const months = { jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12,
+      january:1,february:2,march:3,april:4,june:6,july:7,august:8,september:9,october:10,november:11,december:12 };
+    // "15th Dec 2025", "15 JUNE 2026", "15TH JULY 2026" (case-insensitive suffix)
+    m = /^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+)\.?\s*(\d{4})?$/i.exec(str);
+    if (m) {
+      const d = +m[1], mo = months[m[2].toLowerCase()];
+      let y = m[3] ? +m[3] : null;
+      if (mo && d>=1 && d<=31) {
+        if (!y) return null;                 // no year → can't safely store
+        return `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+      }
+    }
+    // "Dec 15 2025" / "July 15, 2026"
+    m = /^([A-Za-z]+)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(\d{4})$/.exec(str);
+    if (m) { const mo = months[m[1].toLowerCase()], d=+m[2], y=+m[3];
+      if (mo) return `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`; }
+    // dd-mm-yyyy or dd/mm/yyyy (Indian day-first)
+    m = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})$/.exec(str);
+    if (m) { let d=+m[1], mo=+m[2], y=+m[3]; if (y<100) y+=2000;
+      if (d>12 && mo<=12) {} else if (mo>12 && d<=12){ [d,mo]=[mo,d]; }
+      if (mo>=1&&mo<=12&&d>=1&&d<=31) return `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`; }
+    // dd-MON-yyyy (17-JUN-2026)
+    m = /^(\d{1,2})[-\s]([A-Za-z]{3,})[-\s](\d{4})$/.exec(str);
+    if (m) { const mo=months[m[2].toLowerCase()]; if(mo) return `${m[3]}-${String(mo).padStart(2,'0')}-${String(+m[1]).padStart(2,'0')}`; }
+    // last resort: let JS try, but only accept a sane year
+    const d2 = new Date(str);
+    if (!isNaN(d2) && d2.getFullYear()>2000 && d2.getFullYear()<2100) return d2.toISOString().slice(0,10);
+    return null;    // unparseable → null, never a 400
+  },
+
   invoiceRow(doc){
     const i = doc.invoice, m = doc.metadata || {};
     return {
       content_hash: doc.hash,
       invoice_no: i.invoice_no, invoice_no_normalized: i.invoice_no_normalized,
-      invoice_date: i.invoice_date, period: i.period, due_date: i.due_date,
+      invoice_date: this.toISODate(i.invoice_date), period: i.period, due_date: this.toISODate(i.due_date),
       client_raw: i.client_raw, branch_raw: i.branch_raw, branch_email: i.branch_email, branch_code: i.branch_code, sac_hsn: i.sac_hsn,
       supplier_gstin: i.supplier_gstin, recipient_gstin: i.recipient_gstin, supplier_pan: i.supplier_pan,
       taxable_paise: i.taxable_paise, cgst_paise: i.cgst_paise, sgst_paise: i.sgst_paise,
@@ -1950,7 +1995,7 @@ const Cloud = {
       verdict: doc.verdict, verification: doc.verification, source_file: doc.filename,
       settlement_status: i.settlement_status, commercial_state: i.commercial_state,
       processing_state: i.processing_state, written_off: i.written_off,
-      allocated_paise: i.allocated_paise, last_payment_date: i.last_payment_date,
+      allocated_paise: i.allocated_paise, last_payment_date: this.toISODate(i.last_payment_date),
       doc_type: doc.documentType, type_confidence: doc.typeConfidence,
       page_count: m.pageCount, is_scanned: m.isScanned, text_items: m.textItems
     };
@@ -1961,7 +2006,7 @@ const Cloud = {
     const raw = ((doc.candidates && doc.candidates._applicant_rows || [])[0] || {}).normalized || [];
     if (raw.length) return raw.map((r,idx) => ({
       line_no: parseInt(r.serial,10) || (idx+1), serial: r.serial || null,
-      applicant_name: r.applicant_name || null, receipt_date: r.receipt_date || null,
+      applicant_name: r.applicant_name || null, receipt_date: this.toISODate(r.receipt_date),
       service_type: r.service_type || null, location: r.location || null,
       amount_paise: r.amount_paise ?? null, tax_paise: r.tax_paise ?? null,
       gross_paise: (r.amount_paise!=null?r.amount_paise:0) + (r.tax_paise!=null?r.tax_paise:0) || null,
@@ -1969,7 +2014,7 @@ const Cloud = {
     }));
     // fall back to allocation rows if no raw annexure
     return doc.applicants.map((a,idx) => ({
-      line_no: idx+1, applicant_name: a.applicant_name || null, receipt_date: a.receipt_date || null,
+      line_no: idx+1, applicant_name: a.applicant_name || null, receipt_date: this.toISODate(a.receipt_date),
       service_type: a.service_type || null, location: a.location || null,
       amount_paise: a.taxable_paise ?? null,
       tax_paise: ((a.cgst_paise||0)+(a.sgst_paise||0)+(a.igst_paise||0)) || null,
