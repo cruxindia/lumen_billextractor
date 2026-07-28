@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='96353bb5c1e4';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='4c8961edc5c2';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2447,7 +2447,7 @@ const SHEET_EXT = /\.(xlsx|xlsm|xltx|xltm|xlsb|xls)$/i;
 const CSV_EXT   = /\.(csv|tsv)$/i;
 const PDF_EXT   = /\.pdf$/i;
 const ARCHIVE_EXT = /\.(zip|rar|7z|tar|gz|tgz|bz2)$/i;
-const MAX_ARCHIVE_DEPTH = 8, MAX_ARCHIVE_ENTRIES = 50000;
+const MAX_ARCHIVE_DEPTH = 40, MAX_ARCHIVE_ENTRIES = 200000;
 let busy = false;
 
 /* Route by SNIFFED type, never by extension. A .zip that is really a RAR, an
@@ -2509,7 +2509,13 @@ const SKIP_REASONS = {
 /* Recursive discovery — unbounded nesting: folder > zip > folder > zip > file. */
 async function collect(entries, depth, acc){
   acc = acc || { docs: [], skipped: [], archives: 0 };
-  if (depth > MAX_ARCHIVE_DEPTH) { entries.forEach(e => acc.skipped.push([e.name, 'depth'])); return acc; }
+  if (depth > MAX_ARCHIVE_DEPTH) {
+    entries.forEach(e => { acc.skipped.push([e.name, 'depth']);
+      if (typeof DIAG!=='undefined') DIAG.error('skip', `skipped (too deeply nested): ${e.name}`,
+        { reason:`archive nesting exceeded ${MAX_ARCHIVE_DEPTH} levels — flatten some layers and re-drop` }); });
+    log(`Some files were nested deeper than ${MAX_ARCHIVE_DEPTH} archive levels and were skipped — see the diagnostic log.`, 'er');
+    return acc;
+  }
 
   for (const e of entries) {
     const name = e.name, base = name.split('/').pop();
