@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='4c8961edc5c2';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='19682152d443';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -266,6 +266,7 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
       <div id="ocrBanner"></div>
       <div class="row" style="justify-content:space-between;align-items:center">
         <h2 style="margin:0">Activity</h2>
+        <button class="btn sm" id="testOcr" title="Load the OCR engine and read one test image — run this on a fresh page to check OCR works before a big ingest">⚙ Test OCR engine</button>
         <button class="btn sm" id="dlDiag" title="Download a detailed timestamped log of every file, decision and reason — for debugging">↓ Download diagnostic log</button>
       </div>
       <div class="log" id="log"><div class="dim">Ready. Nothing ingested yet.</div></div>
@@ -2290,11 +2291,13 @@ const OCR = {
     if (typeof Tesseract !== 'undefined') return true;
     if (this._scriptTried) return typeof Tesseract !== 'undefined';
     this._scriptTried = true;
+    const t0 = Date.now();
+    if (typeof DIAG!=='undefined') DIAG.info('ocr', 'OCR stage 1: loading tesseract.min.js…');
     return new Promise((res) => {
       const sc = document.createElement('script');
       sc.src = this.base + '/tesseract.min.js';
-      sc.onload = () => res(true);
-      sc.onerror = () => { log('OCR engine could not be loaded from storage. Check the OCR bucket is public.', 'er'); res(false); };
+      sc.onload = () => { if (typeof DIAG!=='undefined') DIAG.ok('ocr', `OCR stage 1 done: library loaded in ${((Date.now()-t0)/1000).toFixed(1)}s`); res(true); };
+      sc.onerror = () => { if (typeof DIAG!=='undefined') DIAG.error('ocr','OCR stage 1 FAILED: tesseract.min.js could not load',{base:this.base}); log('OCR engine could not be loaded from storage. Check the OCR bucket is public.', 'er'); res(false); };
       document.head.appendChild(sc);
     });
   },
@@ -2326,7 +2329,7 @@ const OCR = {
       const mk = () => Tesseract.createWorker('eng', 1, {
         corePath: this.base + '/tesseract-core-lstm.wasm.js',
         workerPath: this.base + '/worker.min.js',
-        langPath: this.base, cacheMethod: 'none'
+        langPath: this.base, cacheMethod: 'write'
       });
       const workers = await this._withTimeout(Promise.all(Array.from({length:n}, mk)), 120000, 'OCR pool start');
       this._pool = { workers, n, busy: new Array(n).fill(false) };
@@ -2367,12 +2370,22 @@ const OCR = {
          If given a directory, Tesseract auto-selects a SIMD variant
          (tesseract-core-relaxedsimd-lstm.wasm.js) that we did not upload, and
          loading fails. Naming the file forces it to use the one that's there. */
+      const tW = Date.now();
+      let lastStatus = '';
       const w = await this._withTimeout(Tesseract.createWorker('eng', 1, {
         corePath: this.base + '/tesseract-core-lstm.wasm.js',
         workerPath: this.base + '/worker.min.js',
         langPath: this.base,               // eng.traineddata lives here
-        cacheMethod: 'none'
+        cacheMethod: 'write',
+        // report each internal load stage so a stall is pinpointed, not vague
+        logger: m => {
+          if (m && m.status && m.status !== lastStatus) {
+            lastStatus = m.status;
+            if (typeof DIAG!=='undefined') DIAG.info('ocr', `OCR loading: ${m.status} (${((Date.now()-tW)/1000).toFixed(1)}s)`, { progress: m.progress });
+          }
+        }
       }), 180000, 'OCR engine start');
+      if (typeof DIAG!=='undefined') DIAG.ok('ocr', `OCR engine started in ${((Date.now()-tW)/1000).toFixed(1)}s`);
       this._worker = w; setOcrStatus('ready'); return w;
     })().catch(e => { setOcrStatus('error'); this._loading = null; throw e; });
     return this._loading;
@@ -3717,6 +3730,24 @@ DROP_HTML = drop.innerHTML;
 drop.addEventListener('drop', e => { if (e.dataTransfer.files.length) ingest([...e.dataTransfer.files]); });
 wireDrop();
 $('#dlDiag') && ($('#dlDiag').onclick = () => { DIAG.info('system','diagnostic log downloaded by user'); DIAG.download(); });
+$('#testOcr') && ($('#testOcr').onclick = async () => {
+  const btn = $('#testOcr'); btn.disabled = true; btn.textContent = 'Testing OCR…';
+  log('Testing OCR engine — this loads the ~11MB engine from your Supabase…', 'head');
+  DIAG.info('ocr','=== manual OCR test started ===');
+  const t0 = Date.now();
+  try {
+    await OCR.worker();
+    const secs = ((Date.now()-t0)/1000).toFixed(1);
+    log(`✓ OCR engine loaded successfully in ${secs}s. OCR works on this page.`, 'ok');
+    DIAG.ok('ocr', `manual OCR test PASSED in ${secs}s`);
+    btn.textContent = `✓ OCR works (${secs}s)`;
+  } catch(e){
+    log(`✗ OCR engine failed to load: ${e.message}`, 'er');
+    log(`  Download the diagnostic log — it now shows which load stage stalled.`, 'dim');
+    DIAG.error('ocr', `manual OCR test FAILED: ${e.message}`);
+    btn.textContent = '✗ OCR failed — see log'; btn.disabled = false;
+  }
+});
 $('#fileIn').onchange = e => ingest([...e.target.files]);
 $('#folderIn').onchange = e => ingest([...e.target.files]);
 
@@ -4463,7 +4494,15 @@ window.setOcrStatus = function(state){
   setOcrStatus('checking');
   try {
     const r = await fetch(OCR.base + '/tesseract-core-lstm.wasm.js', { method:'HEAD' });
-    if (r.ok) { setOcrStatus('ready'); if(typeof DIAG!=='undefined')DIAG.ok('ocr','OCR engine reachable on Supabase'); }
+    if (r.ok) {
+      setOcrStatus('ready'); if(typeof DIAG!=='undefined')DIAG.ok('ocr','OCR engine reachable on Supabase');
+      /* Pre-load the engine NOW, while the page is fresh and unloaded — loading
+         it after a 2,000-file ingest was timing out because the browser was
+         starved. Warming it here means it's ready by the time you click Run OCR.
+         Done quietly in the background; failure just leaves it to load on demand. */
+      OCR.worker().then(()=>{ if(typeof DIAG!=='undefined')DIAG.ok('ocr','OCR engine pre-loaded at startup'); })
+        .catch(e=>{ if(typeof DIAG!=='undefined')DIAG.warn('ocr','OCR pre-load deferred',{reason:e.message}); });
+    }
     else { setOcrStatus('error'); if(typeof DIAG!=='undefined')DIAG.error('ocr','OCR files not reachable',{status:r.status}); }
   } catch(e){ setOcrStatus('off'); if(typeof DIAG!=='undefined')DIAG.warn('ocr','OCR reachability check failed',{reason:e.message}); }
 })();
