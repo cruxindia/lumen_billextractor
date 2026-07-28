@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='8dfaa109ca15';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='b00408db633b';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2598,8 +2598,15 @@ function invNoKey(no){
   return String(no).replace(/[^a-z0-9]/gi,'').toUpperCase();
 }
 
+const ingestQueue = [];
 async function ingest(fileList){
-  if (busy) return;
+  // If an ingest is already running, QUEUE this batch instead of dropping it
+  // silently — selecting several zips/folders in a row must process all of them.
+  if (busy) {
+    ingestQueue.push(fileList);
+    log(`Queued ${fileList.length} more item(s) — will process after the current batch.`, 'dim');
+    return;
+  }
   if (!window.XLSX) { log('Spreadsheet reader unavailable — this file needs an internet connection on first load.', 'er'); return; }
   busy = true; $('#prog').style.width = '0';
   DIAG.info('ingest', `=== ingest started: ${fileList.length} item(s) selected ===`);
@@ -2622,7 +2629,9 @@ async function ingest(fileList){
       if (names.length > 3) log(`      …and ${names.length - 3} more`, 'dim');
     });
     if (!acc.skipped.length) log('  The drop contained no files.', 'dim');
-    busy = false; return;
+    busy = false;
+    if (ingestQueue.length) { const next = ingestQueue.shift(); setTimeout(() => ingest(next), 50); }
+    return;
   }
   log(`${items.length} readable document(s) found${acc.archives ? ` in ${acc.archives} archive(s)` : ''}`, 'ok');
   if (acc.skipped.length) {
@@ -2852,6 +2861,11 @@ async function ingest(fileList){
     log(`No findings — every document reconciled.`, 'ok');
   }
   busy = false; renderAll(); persist();
+  // process any batches that were queued while this one ran
+  if (ingestQueue.length) {
+    const next = ingestQueue.shift();
+    setTimeout(() => ingest(next), 50);
+  }
   renderOcrBanner();
   DIAG.ok('ingest', `=== ingest finished ===`, {
     stored: session.count, duplicates: dupes, failed, scans,
