@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='5a1eca5b89b9';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='0cacad23fefa';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2077,7 +2077,7 @@ const Cloud = {
 
   async pullAll(){
     const r = await fetch(this.url + '/invoices?select=*&order=invoice_date.desc', {
-      headers: this.headers({ 'Range': '0-9999' }) });
+      headers: this.headers({ 'Range': '0-199999', 'Range-Unit':'items' }) });
     if (!r.ok) { const t = await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
     return await r.json();
   },
@@ -2732,6 +2732,9 @@ async function ingest(fileList){
       }
       const r = L.processView(view);
       r.hash = hash; r.path = it.path; r.sessionId = session.id;
+      // attach who uploaded and for which location (from the Start popup) so the
+      // Report can filter by uploader/location later
+      if (window.__runMeta) { r._uploader = window.__runMeta.uploader; r._uploadLocation = window.__runMeta.location; }
       r._fromPdf = !!it.pdf;
 
       /* record what was extracted, and WHY anything is missing/zero */
@@ -3774,16 +3777,49 @@ function stageFiles(files){
 $('#stageClear') && ($('#stageClear').onclick = () => { stagedFiles = []; $('#stagePanel').style.display='none'; log('Staged files cleared.', 'dim'); });
 $('#startRun') && ($('#startRun').onclick = async () => {
   if (!stagedFiles.length) { log('Nothing staged to process.', 'wn'); return; }
+  // ask who is uploading and for which location, before anything runs
+  const meta = await askRunMeta();
+  if (!meta) return;   // cancelled
+  window.__runMeta = meta;
   const btn = $('#startRun'); btn.disabled = true; btn.textContent = 'Checking…';
-  // 1. run self-tests first
   const okTests = await runSelfTests();
   if (!okTests) { btn.disabled=false; btn.textContent='▶ Start';
     log('Self-tests failed — see above. Fix before processing.', 'er'); return; }
-  // 2. process everything staged
   const toRun = stagedFiles; stagedFiles = [];
   $('#stagePanel').style.display='none'; btn.disabled=false; btn.textContent='▶ Start';
   await ingest(toRun);
 });
+
+/* Popup on Start: capture uploader name + branch/location so the batch is
+   attributed. Returns {uploader, location} or null if cancelled. */
+function askRunMeta(){
+  return new Promise(resolve => {
+    // build a location list from what's already in the database
+    const locations = [...new Set((window.dbRows||[]).map(r => r.branch_raw).filter(Boolean))].sort();
+    const opts = locations.map(l => `<option value="${esc(l)}">${esc(l)}</option>`).join('');
+    const html = `<div style="padding:6px">
+      <h2 style="margin:0 0 4px">Before we start</h2>
+      <p class="dim" style="margin:0 0 16px">This tags the batch so you can filter your own uploads later.</p>
+      <label class="edfield" style="margin-bottom:12px"><span>Your name (who is uploading)</span>
+        <input id="rmUploader" placeholder="e.g. Agneya" style="padding:8px;border:1px solid var(--line);border-radius:6px"></label>
+      <label class="edfield" style="margin-bottom:12px"><span>Branch / location</span>
+        <input id="rmLocation" list="rmLocList" placeholder="type or pick" style="padding:8px;border:1px solid var(--line);border-radius:6px">
+        <datalist id="rmLocList">${opts}</datalist></label>
+      <div class="row" style="justify-content:flex-end;gap:8px;margin-top:16px">
+        <button class="btn" id="rmCancel">Cancel</button>
+        <button class="btn pri" id="rmGo">Start processing</button>
+      </div></div>`;
+    showModal(html);
+    $('#rmCancel').onclick = () => { closeModal(); resolve(null); };
+    $('#rmGo').onclick = () => {
+      const uploader = ($('#rmUploader').value||'').trim();
+      const location = ($('#rmLocation').value||'').trim();
+      closeModal();
+      resolve({ uploader: uploader||'(unspecified)', location: location||'(unspecified)' });
+    };
+    setTimeout(()=>{ const u=$('#rmUploader'); if(u) u.focus(); }, 50);
+  });
+}
 $('#dlDiag') && ($('#dlDiag').onclick = () => { DIAG.info('system','diagnostic log downloaded by user'); DIAG.download(); });
 $('#testOcr') && ($('#testOcr').onclick = async () => {
   const btn = $('#testOcr'); btn.disabled = true; btn.textContent = 'Testing OCR…';
@@ -4321,16 +4357,27 @@ $('#cloudBranches') && ($('#cloudBranches').onclick = async () => {
     setCloud('Loading database…','dim');
     const rows = await Cloud.pullAll();
     window.dbRows = rows;
-    // make pulled rows available to Review and the MIS report by default
+    // also fetch failing checks so Review's "needs attention" works on DB rows
+    let checksByHash = {};
+    try {
+      const cr = await fetch(Cloud.url + '/checks?select=content_hash,check_id,status,severity,detail&status=eq.FAIL',
+        { headers: Cloud.headers({ 'Range':'0-199999' }) });
+      if (cr.ok) { (await cr.json()).forEach(c => { (checksByHash[c.content_hash]=checksByHash[c.content_hash]||[]).push(c); }); }
+    } catch(_){}
     window.reviewPulled = rows.map(row => ({ content_hash: row.content_hash, hash: row.content_hash,
-      invoice: row, checks: [], verdict: row.verdict, verification: row.verification }));
-    window.misRows = rows.map(row => ({ invoice: row, applicants: [], checks: [],
+      invoice: row, checks: checksByHash[row.content_hash]||[], verdict: row.verdict, verification: row.verification, filename: row.source_file }));
+    window.misRows = rows.map(row => ({ invoice: row, applicants: [], checks: checksByHash[row.content_hash]||[],
       verdict: row.verdict, verification: row.verification, hash: row.content_hash,
       candidates: {}, filename: row.source_file }));
-    setCloud(`${rows.length} in database`, 'ok');
+    window.__misSource = 'database';
+    const needs = window.reviewPulled.filter(r => r.verdict && r.verdict!=='PROVEN').length;
+    setCloud(`${rows.length} in database · ${needs} need attention`, needs?'wn':'ok');
+    // default Review to "all" if nothing has checks, so the data is visible
+    if (!window.reviewPulled.some(r=>r.checks.length)) window.__reviewMode = 'all';
     if (typeof buildMisFilters==='function') buildMisFilters();
     renderReview(); renderReport();
-  } catch(e){ setCloud('Database offline — working locally','wn'); }
+    DIAG && DIAG.ok('system', `auto-pulled ${rows.length} bills on load`, { needs_attention: needs });
+  } catch(e){ setCloud('Database offline — working locally','wn'); DIAG && DIAG.warn('system','auto-pull failed',{reason:e.message}); }
 })();
 
 $('#cloudPull') && ($('#cloudPull').onclick = async () => {
