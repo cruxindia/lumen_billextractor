@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='0cacad23fefa';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='653d95da2aa6';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -279,7 +279,6 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
       <div id="ocrBanner"></div>
       <div class="row" style="justify-content:space-between;align-items:center">
         <h2 style="margin:0">Activity</h2>
-        <button class="btn sm" id="testOcr" title="Load the OCR engine and read one test image — run this on a fresh page to check OCR works before a big ingest">⚙ Test OCR engine</button>
         <button class="btn sm" id="dlDiag" title="Download a detailed timestamped log of every file, decision and reason — for debugging">↓ Download diagnostic log</button>
       </div>
       <div class="log" id="log"><div class="dim">Ready. Nothing ingested yet.</div></div>
@@ -1957,11 +1956,62 @@ function stripHTML(checks){
 /* ================= central database (Supabase) ================= */
 const Cloud = {
   url: 'https://czdjbbhxboweawqbjywr.supabase.co/rest/v1',
+  wsUrl: 'wss://czdjbbhxboweawqbjywr.supabase.co/realtime/v1/websocket',
   key: 'sb_publishable_J7fFRVLVB_h5SHZcquWfXA_p_O30PkF',
 
   headers(extra){ return Object.assign({
     'apikey': this.key, 'Authorization': 'Bearer ' + this.key,
     'Content-Type': 'application/json' }, extra || {}); },
+
+  /* ---- Realtime: subscribe to database changes over a websocket so the tool
+     refreshes silently whenever anything changes in the invoices table — no
+     manual pull, no page refresh. Requires Realtime to be enabled for the table
+     in Supabase (Database → Replication → enable for `invoices`). Degrades
+     gracefully: if the socket can't connect, we fall back to periodic polling. */
+  _rt: null, _rtHeartbeat: null, _rtRef: 0,
+  subscribeRealtime(onChange){
+    if (this._rt) return;
+    try {
+      const ws = new WebSocket(this.wsUrl + '?apikey=' + this.key + '&vsn=1.0.0');
+      this._rt = ws;
+      ws.onopen = () => {
+        // join the postgres_changes channel for the invoices table
+        ws.send(JSON.stringify({
+          topic: 'realtime:public:invoices', event: 'phx_join',
+          payload: { config: { postgres_changes: [{ event: '*', schema: 'public', table: 'invoices' }] } },
+          ref: String(++this._rtRef)
+        }));
+        // heartbeat every 25s keeps the socket alive
+        this._rtHeartbeat = setInterval(() => {
+          if (ws.readyState === 1) ws.send(JSON.stringify({ topic:'phoenix', event:'heartbeat', payload:{}, ref:String(++this._rtRef) }));
+        }, 25000);
+        if (typeof DIAG!=='undefined') DIAG.ok('system','realtime connected — live database sync active');
+      };
+      let debounce = null;
+      ws.onmessage = (m) => {
+        try { const msg = JSON.parse(m.data);
+          if (msg.event === 'postgres_changes' || (msg.payload && msg.payload.data)) {
+            // a row changed — debounce so a burst of inserts triggers one refresh
+            clearTimeout(debounce); debounce = setTimeout(() => onChange && onChange(), 800);
+          }
+        } catch(_){}
+      };
+      ws.onerror = () => { if (typeof DIAG!=='undefined') DIAG.warn('system','realtime socket error — falling back to polling'); this._startPolling(onChange); };
+      ws.onclose = () => { clearInterval(this._rtHeartbeat); this._rt = null;
+        // try to reconnect after a short delay
+        setTimeout(() => this.subscribeRealtime(onChange), 5000); };
+    } catch(e){ this._startPolling(onChange); }
+  },
+  _startPolling(onChange){
+    if (this._poll) return;
+    // fallback: poll the row count every 20s; refresh if it changed
+    this._poll = setInterval(async () => {
+      try { const r = await fetch(this.url + '/invoices?select=content_hash', { headers: this.headers({ 'Prefer':'count=exact','Range':'0-0' }) });
+        const cr = r.headers.get('content-range'); const total = cr ? cr.split('/')[1] : null;
+        if (total && total !== this._lastCount) { this._lastCount = total; onChange && onChange(); }
+      } catch(_){}
+    }, 20000);
+  },
 
   /* map a processed doc to the flat invoice row the schema expects */
   /* Postgres date columns reject hand-typed Indian formats ("15th Dec 2025",
@@ -2893,6 +2943,15 @@ async function ingest(fileList){
      first so what's stored is already corrected. Failures are surfaced, never
      silent. */
   autoSync(mine);
+
+  /* Auto-run OCR on any image bills from this batch — no manual button needed.
+     It still runs as a separate resumable pass (so ingest itself never blocks),
+     but we kick it off automatically once ingest is done. */
+  const needsOcr = DB.docs.filter(d => d._hasImagePage && !d._ocrDone && d._pdfBuf).length;
+  if (needsOcr) {
+    log(`Auto-starting OCR on ${needsOcr} image bill(s)…`, 'dim');
+    setTimeout(() => runOcrPass(), 500);
+  }
 }
 
 /* OCR pass — runs on demand over the bills flagged as having image pages.
@@ -2962,7 +3021,8 @@ async function runOcrPass(){
   setOcrStatus('ready');
   updateOcrProgress(0,0);
   renderOcrBanner();
-  log(`OCR pass finished — ${ok} read, ${failed} failed, in ${secs.toFixed(0)}s (${(secs/Math.max(1,total)).toFixed(1)}s per bill).`, ok?'ok':'wn');
+  log(`OCR complete: ${ok} of ${total} bill(s) read successfully, ${failed} failed — in ${secs.toFixed(0)}s (${(secs/Math.max(1,total)).toFixed(1)}s per bill).`, ok?'ok':'wn');
+  DIAG.ok('ocr', `OCR pass complete: ${ok}/${total} succeeded, ${failed} failed`, { seconds: Math.round(secs) });
   renderAll();
 }
 function renderOcrBanner(){
@@ -3794,8 +3854,12 @@ $('#startRun') && ($('#startRun').onclick = async () => {
    attributed. Returns {uploader, location} or null if cancelled. */
 function askRunMeta(){
   return new Promise(resolve => {
-    // build a location list from what's already in the database
-    const locations = [...new Set((window.dbRows||[]).map(r => r.branch_raw).filter(Boolean))].sort();
+    // build the location list from locations your team has entered before
+    // (upload_location), not from client branch names. Falls back to any saved
+    // list. This grows as people use it.
+    let locations = [...new Set((window.dbRows||[]).map(r => r.upload_location).filter(Boolean))];
+    try { const saved = JSON.parse(localStorage.getItem('lumen_locations')||'[]'); locations = [...new Set([...locations, ...saved])]; } catch(_){}
+    locations.sort();
     const opts = locations.map(l => `<option value="${esc(l)}">${esc(l)}</option>`).join('');
     const html = `<div style="padding:6px">
       <h2 style="margin:0 0 4px">Before we start</h2>
@@ -3814,6 +3878,11 @@ function askRunMeta(){
     $('#rmGo').onclick = () => {
       const uploader = ($('#rmUploader').value||'').trim();
       const location = ($('#rmLocation').value||'').trim();
+      // remember this location so it appears in the dropdown next time
+      if (location) { try { const saved = JSON.parse(localStorage.getItem('lumen_locations')||'[]');
+        if (!saved.includes(location)) { saved.push(location); localStorage.setItem('lumen_locations', JSON.stringify(saved)); } } catch(_){} }
+      // remember the uploader name too
+      if (uploader) { try { localStorage.setItem('lumen_last_uploader', uploader); } catch(_){} }
       closeModal();
       resolve({ uploader: uploader||'(unspecified)', location: location||'(unspecified)' });
     };
@@ -4349,15 +4418,16 @@ $('#cloudBranches') && ($('#cloudBranches').onclick = async () => {
   } catch(e){ setCloud('Could not load branches: '+e.message, 'er'); }
   btn.disabled=false;
 });
-/* On startup, pull the full database so every tab reflects all stored bills by
-   default. This is what makes the database the source of truth, not the session. */
-(async () => {
+/* Pull the full database and refresh every tab. Runs on load AND whenever
+   Realtime tells us the database changed — so the tool always shows live data
+   without a manual pull or page refresh. `silent` skips the "Loading…" flash for
+   background realtime refreshes. */
+async function syncFromDatabase(silent){
   if (typeof Cloud === 'undefined') return;
   try {
-    setCloud('Loading database…','dim');
+    if (!silent) setCloud('Loading database…','dim');
     const rows = await Cloud.pullAll();
     window.dbRows = rows;
-    // also fetch failing checks so Review's "needs attention" works on DB rows
     let checksByHash = {};
     try {
       const cr = await fetch(Cloud.url + '/checks?select=content_hash,check_id,status,severity,detail&status=eq.FAIL',
@@ -4371,13 +4441,21 @@ $('#cloudBranches') && ($('#cloudBranches').onclick = async () => {
       candidates: {}, filename: row.source_file }));
     window.__misSource = 'database';
     const needs = window.reviewPulled.filter(r => r.verdict && r.verdict!=='PROVEN').length;
-    setCloud(`${rows.length} in database · ${needs} need attention`, needs?'wn':'ok');
-    // default Review to "all" if nothing has checks, so the data is visible
+    setCloud(`${rows.length} in database · ${needs} need attention${Cloud._rt?' · live':''}`, needs?'wn':'ok');
     if (!window.reviewPulled.some(r=>r.checks.length)) window.__reviewMode = 'all';
     if (typeof buildMisFilters==='function') buildMisFilters();
     renderReview(); renderReport();
-    DIAG && DIAG.ok('system', `auto-pulled ${rows.length} bills on load`, { needs_attention: needs });
-  } catch(e){ setCloud('Database offline — working locally','wn'); DIAG && DIAG.warn('system','auto-pull failed',{reason:e.message}); }
+    if (!silent) DIAG && DIAG.ok('system', `synced ${rows.length} bills from database`, { needs_attention: needs });
+  } catch(e){ if(!silent) setCloud('Database offline — working locally','wn'); DIAG && DIAG.warn('system','db sync failed',{reason:e.message}); }
+}
+window.syncFromDatabase = syncFromDatabase;
+
+(async () => {
+  await syncFromDatabase(false);
+  // subscribe to live database changes — refreshes silently on any change
+  if (typeof Cloud !== 'undefined' && Cloud.subscribeRealtime) {
+    Cloud.subscribeRealtime(() => syncFromDatabase(true));
+  }
 })();
 
 $('#cloudPull') && ($('#cloudPull').onclick = async () => {
