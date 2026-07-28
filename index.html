@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='52c18296b3a0';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='96353bb5c1e4';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -183,6 +183,22 @@ label.chk input{accent-color:var(--accent)}
 /* modal */
 .modalwrap{position:fixed;inset:0;background:rgba(20,12,30,.45);display:flex;align-items:center;justify-content:center;z-index:1000;padding:20px}
 .modalbox{background:var(--bg,#fff);border-radius:14px;max-width:720px;width:100%;max-height:88vh;overflow:auto;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.modalbox.wide{max-width:1200px}
+.editor-head{display:flex;align-items:center;gap:8px;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--line)}
+.editor-cols{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+@media(max-width:900px){.editor-cols{grid-template-columns:1fr}}
+.editor-noview{padding:40px 20px;text-align:center;border:1px dashed var(--line);border-radius:8px;color:var(--text-2)}
+.editor-edit{max-height:72vh;overflow:auto}
+.edgroup{margin-bottom:16px}
+.edgroup-h{font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--text-2);margin-bottom:8px;display:flex;align-items:center}
+.edgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.edfield{display:flex;flex-direction:column;gap:3px;font-size:12px}
+.edfield span{color:var(--text-2)}
+.edfield input{padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px;background:var(--bg)}
+.edfield input:focus{border-color:var(--brand);outline:none}
+table.edlines{width:100%;font-size:12px;border-collapse:collapse}
+table.edlines th{text-align:left;color:var(--text-2);font-weight:600;padding:4px}
+table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);border-radius:5px;font-size:12px}
 .modal-head{font-size:16px;margin-bottom:12px;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
 .probbox{background:var(--warn-bg,#fff8e6);border:1px solid var(--warn,#e0a800);border-radius:10px;padding:12px 14px;margin:10px 0;font-size:13px;line-height:1.7}
 .pickrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:12px 0;font-size:13px}
@@ -2142,6 +2158,47 @@ const Cloud = {
     if (!i.branch_email && m.branch_email) { i.branch_email = m.branch_email; doc.enriched.branch_email = 'master'; }
     if (!i.recipient_gstin && m.recipient_gstin) { i.recipient_gstin = m.recipient_gstin; doc.enriched.recipient_gstin = 'master'; }
     if (!i.branch_code && m.branch_code) { i.branch_code = m.branch_code; doc.enriched.branch_code = 'master'; }
+  },
+
+  /* Fetch the applicant/customer rows for one bill from the database. */
+  async fetchLines(hash){
+    try {
+      const r = await fetch(this.url + '/invoice_lines?content_hash=eq.' + encodeURIComponent(hash) + '&order=line_no',
+        { headers: this.headers() });
+      if (r.ok) return await r.json();
+    } catch(_){}
+    return [];
+  },
+
+  /* Replace ALL applicant rows for a bill (delete then insert) — used when the
+     editor saves edited/added customers. */
+  async replaceLines(hash, lines){
+    // delete existing
+    await fetch(this.url + '/invoice_lines?content_hash=eq.' + encodeURIComponent(hash),
+      { method:'DELETE', headers: this.headers({'Prefer':'return=minimal'}) });
+    if (lines && lines.length) {
+      const rows = lines.map((l,i)=>({ content_hash: hash, line_no: i+1,
+        applicant_name: l.applicant_name||null,
+        amount_paise: l.amount_paise!=null?l.amount_paise:null,
+        tax_paise: l.tax_paise!=null?l.tax_paise:null,
+        gross_paise: l.gross_paise!=null?l.gross_paise:null,
+        service_type: l.service_type||null, receipt_date: this.toISODate(l.receipt_date) }));
+      const r = await fetch(this.url + '/invoice_lines',
+        { method:'POST', headers: this.headers({'Prefer':'return=minimal'}), body: JSON.stringify(rows) });
+      if (!r.ok){ const t=await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
+    }
+    return true;
+  },
+
+  /* Delete a bill entirely (invoice + its lines + checks) to free space, once
+     it's been fully verified and no longer needed as a raw record. */
+  async deleteOne(hash){
+    const h = encodeURIComponent(hash);
+    for (const tbl of ['invoice_lines','checks','invoices']) {
+      try { await fetch(this.url + '/' + tbl + '?content_hash=eq.' + h,
+        { method:'DELETE', headers: this.headers({'Prefer':'return=minimal'}) }); } catch(_){}
+    }
+    return true;
   },
 
   async updateOne(hash, patch){
@@ -4167,6 +4224,155 @@ const CLOUD_EDIT_COLS = [
 let cloudRows = [];
 const cloudEdits = new Map();
 
+/* ---- Full bill editor: opens when you click an invoice number in Sync.
+   Shows the original bill (if held this session) side by side with an editor
+   exposing EVERY database field plus the applicant/customer rows, with add and
+   remove. Pushing back updates the database and can delete the raw source. ---- */
+
+// all editable header fields, grouped, with type
+const EDITOR_FIELDS = [
+  ['Identity', [
+    ['invoice_no','Invoice no','text'], ['invoice_date','Invoice date','date'],
+    ['due_date','Due date','date'], ['period','Period','text'],
+    ['last_payment_date','Last payment date','date'], ['doc_type','Doc type','text'] ]],
+  ['Parties', [
+    ['client_raw','Client','text'], ['branch_raw','Branch','text'],
+    ['branch_code','Branch code','text'], ['branch_email','Branch email','text'],
+    ['supplier_gstin','Supplier GSTIN','text'], ['supplier_pan','Supplier PAN','text'],
+    ['recipient_gstin','Recipient GSTIN','text'], ['sac_hsn','SAC/HSN','text'] ]],
+  ['Amounts', [
+    ['taxable_paise','Taxable','money'], ['cgst_paise','CGST','money'],
+    ['sgst_paise','SGST','money'], ['igst_paise','IGST','money'],
+    ['tax_total_paise','Tax total','money'], ['round_off_paise','Round off','money'],
+    ['total_paise','Total','money'], ['face_total_paise','Face total','money'],
+    ['annexure_total_paise','Annexure total','money'], ['tax_rate','Tax rate %','text'] ]],
+  ['Status', [
+    ['settlement_status','Settlement','text'], ['verdict','Verdict','text'],
+    ['verification','Verification','text'], ['written_off','Written off','text'] ]]
+];
+
+let editorState = null;   // { hash, invoice, lines }
+
+async function openBillEditor(hash){
+  const row = cloudRows.find(r => r.content_hash === hash)
+    || (window.reviewPulled||[]).map(r=>r.invoice).find(iv => (iv&&iv.content_hash)===hash)
+    || DB.docs.map(d=>({...d.invoice, content_hash:d.hash})).find(iv => iv.content_hash===hash);
+  if (!row) { log('Could not find this bill.', 'er'); return; }
+
+  // fetch applicant lines from the DB
+  let lines = [];
+  try { lines = await Cloud.fetchLines(hash); } catch(_){}
+  editorState = { hash, invoice: { ...row }, lines: lines.map(l=>({...l})) };
+
+  // the original bill, if we still hold it this session
+  const held = DB.docs.find(d => d.hash === hash);
+  const billUrl = held && held._sourceBlob ? URL.createObjectURL(held._sourceBlob) : null;
+
+  const fieldsHtml = EDITOR_FIELDS.map(([group, fields]) => `
+    <div class="edgroup"><div class="edgroup-h">${group}</div>
+      <div class="edgrid">
+        ${fields.map(([k,label,type])=>{
+          let v = editorState.invoice[k];
+          if (type==='money') v = (v!=null ? (v/100).toFixed(2) : '');
+          else v = (v??'');
+          return `<label class="edfield"><span>${esc(label)}</span>
+            <input data-k="${k}" data-type="${type}" value="${esc(String(v))}" ${type==='date'?'placeholder="YYYY-MM-DD"':''}></label>`;
+        }).join('')}
+      </div></div>`).join('');
+
+  const linesHtml = renderEditorLines();
+
+  const body = `
+    <div class="editor-wrap">
+      <div class="editor-head">
+        <b>Editing ${esc(row.invoice_no||'(no number)')}</b>
+        <span class="spacer"></span>
+        <button class="btn" onclick="closeModal()">Cancel</button>
+        <button class="btn pri" onclick="saveBillEditor()">Push edits back</button>
+        <button class="btn" onclick="saveBillEditor(true)" title="Save, then delete the raw source from the database to free space">Push &amp; delete source</button>
+      </div>
+      <div class="editor-cols">
+        <div class="editor-view">
+          ${billUrl ? `<iframe src="${billUrl}" style="width:100%;height:70vh;border:1px solid var(--line);border-radius:8px"></iframe>`
+            : `<div class="editor-noview">The original bill isn't held in this session.<br><span class="dim">Edit the fields on the right; they're what's in the database.</span></div>`}
+        </div>
+        <div class="editor-edit">
+          ${fieldsHtml}
+          <div class="edgroup"><div class="edgroup-h">Customers / applicants
+            <button class="btn sm" onclick="addEditorLine()" style="margin-left:8px">+ Add customer</button></div>
+            <div id="editorLines">${linesHtml}</div>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  openModalHtml(body, 'editor-modal');
+}
+
+function renderEditorLines(){
+  if (!editorState) return '';
+  if (!editorState.lines.length) return '<p class="dim" style="padding:8px">No customer rows yet. Click "Add customer" to add one.</p>';
+  return `<table class="edlines"><thead><tr>
+    <th>#</th><th>Name</th><th>Amount</th><th>Tax</th><th>Gross</th><th>Service</th><th></th></tr></thead><tbody>
+    ${editorState.lines.map((l,i)=>`<tr data-i="${i}">
+      <td>${i+1}</td>
+      <td><input data-lk="applicant_name" value="${esc(l.applicant_name||'')}"></td>
+      <td><input data-lk="amount_paise" data-money="1" value="${l.amount_paise!=null?(l.amount_paise/100).toFixed(2):''}"></td>
+      <td><input data-lk="tax_paise" data-money="1" value="${l.tax_paise!=null?(l.tax_paise/100).toFixed(2):''}"></td>
+      <td><input data-lk="gross_paise" data-money="1" value="${l.gross_paise!=null?(l.gross_paise/100).toFixed(2):''}"></td>
+      <td><input data-lk="service_type" value="${esc(l.service_type||'')}"></td>
+      <td><button class="btn sm" onclick="removeEditorLine(${i})" title="Remove">✕</button></td>
+    </tr>`).join('')}
+  </tbody></table>`;
+}
+
+window.openBillEditor = openBillEditor;
+window.addEditorLine = () => { editorState.lines.push({applicant_name:'',amount_paise:null,tax_paise:null,gross_paise:null,service_type:''}); syncEditorLinesFromDom(); document.getElementById('editorLines').innerHTML = renderEditorLines(); };
+window.removeEditorLine = (i) => { syncEditorLinesFromDom(); editorState.lines.splice(i,1); document.getElementById('editorLines').innerHTML = renderEditorLines(); };
+
+function syncEditorLinesFromDom(){
+  const tb = document.querySelectorAll('#editorLines tr[data-i]');
+  tb.forEach(tr=>{
+    const i = +tr.dataset.i; if (!editorState.lines[i]) return;
+    tr.querySelectorAll('input[data-lk]').forEach(inp=>{
+      const k = inp.dataset.lk, money = inp.dataset.money==='1';
+      const v = inp.value.trim();
+      editorState.lines[i][k] = money ? (v===''?null:Math.round(parseFloat(v)*100)) : (v===''?null:v);
+    });
+  });
+}
+
+async function saveBillEditor(alsoDelete){
+  if (!editorState) return;
+  const hash = editorState.hash;
+  const modalEl = document.getElementById('modal');
+  // gather header field edits
+  const patch = {};
+  modalEl.querySelectorAll('.editor-edit input[data-k]').forEach(inp=>{
+    const k = inp.dataset.k, type = inp.dataset.type, v = inp.value.trim();
+    if (type==='money') { const n = v===''?null:Math.round(parseFloat(v)*100); if (v===''||!isNaN(n)) patch[k]=n; }
+    else if (type==='date') patch[k] = Cloud.toISODate(v);
+    else patch[k] = v===''?null:v;
+  });
+  syncEditorLinesFromDom();
+  try {
+    await Cloud.updateOne(hash, patch);
+    await Cloud.replaceLines(hash, editorState.lines);
+    // mark verified — it's been human-edited
+    await Cloud.markVerified(hash);
+    if (alsoDelete) { await Cloud.deleteOne(hash); log('Bill saved and raw source deleted to free space.', 'ok'); }
+    else log('Edits pushed back to the database and marked verified.', 'ok');
+    DIAG && DIAG.info('system', `bill edited via editor: ${hash}`, { deleted: !!alsoDelete, lines: editorState.lines.length });
+    // update local state
+    const local = DB.docs.find(d=>d.hash===hash);
+    if (local) { local.verdict='VERIFIED'; local._hasImagePage=false; delete local._pdfBuf; delete local._sourceBlob; }
+    cloudRows = cloudRows.filter(r => r.content_hash !== hash || !alsoDelete);
+  } catch(e){ log('Could not save edits: '+e.message, 'er'); return; }
+  editorState = null; closeModal(); renderReview(); renderAll();
+  // refresh the sync view
+  try { const rows = await Cloud.pullAll(); renderCloud(null, rows); } catch(_){}
+}
+window.saveBillEditor = saveBillEditor;
+
 function renderCloud(fails, pulled){
   const el = $('#cloudBody'); if(!el) return;
   if (pulled) { cloudRows = pulled; cloudEdits.clear(); }
@@ -4181,8 +4387,10 @@ function renderCloud(fails, pulled){
       <div class="tblwrap" style="max-height:60vh;overflow:auto"><table><thead><tr>
         ${CLOUD_EDIT_COLS.map(([,l])=>`<th>${esc(l)}</th>`).join('')}<th>Rev</th></tr></thead><tbody>
         ${cloudRows.slice(0,500).map(r=>`<tr data-h="${esc(r.content_hash)}">
-          ${CLOUD_EDIT_COLS.map(([k,,mny])=>{
+          ${CLOUD_EDIT_COLS.map(([k,,mny],ci)=>{
             const val = mny ? (r[k]!=null ? (r[k]/100).toFixed(2) : '') : (r[k]??'');
+            // first column (invoice_no) is a link to the full editor
+            if (ci===0) return `<td style="min-width:80px"><a href="#" class="lnk" onclick="openBillEditor('${esc(r.content_hash)}');return false" style="color:var(--brand);text-decoration:underline;cursor:pointer">${esc(String(val))||'(no number)'}</a></td>`;
             return `<td contenteditable="true" data-k="${k}" data-money="${mny?1:0}" style="min-width:80px">${esc(String(val))}</td>`;
           }).join('')}
           <td class="num">${r.revision>1?'v'+r.revision:''}</td></tr>`).join('')}
@@ -4255,8 +4463,9 @@ window.setOcrStatus = function(state){
 })();
 
 /* modal helpers */
-window.showModal = (html) => { const w=$('#modalWrap'); $('#modal').innerHTML=html; w.style.display='flex'; };
-window.closeModal = () => { const w=$('#modalWrap'); if(w) w.style.display='none'; };
+window.showModal = (html) => { const w=$('#modalWrap'); $('#modal').innerHTML=html; $('#modal').classList.remove('wide'); w.style.display='flex'; };
+window.openModalHtml = (html, cls) => { const w=$('#modalWrap'); const m=$('#modal'); m.innerHTML=html; m.classList.add('wide'); w.style.display='flex'; };
+window.closeModal = () => { const w=$('#modalWrap'); if(w) w.style.display='none'; const m=$('#modal'); if(m) m.classList.remove('wide'); };
 document.addEventListener('keydown', e => { if(e.key==='Escape') closeModal(); });
 
 /* Review: pull database records in so historical bills can be corrected too */
