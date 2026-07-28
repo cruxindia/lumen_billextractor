@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='19682152d443';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='8dfaa109ca15';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2329,7 +2329,7 @@ const OCR = {
       const mk = () => Tesseract.createWorker('eng', 1, {
         corePath: this.base + '/tesseract-core-lstm.wasm.js',
         workerPath: this.base + '/worker.min.js',
-        langPath: this.base, cacheMethod: 'write'
+        langPath: this.base, gzip: false, cacheMethod: 'write'
       });
       const workers = await this._withTimeout(Promise.all(Array.from({length:n}, mk)), 120000, 'OCR pool start');
       this._pool = { workers, n, busy: new Array(n).fill(false) };
@@ -2376,6 +2376,11 @@ const OCR = {
         corePath: this.base + '/tesseract-core-lstm.wasm.js',
         workerPath: this.base + '/worker.min.js',
         langPath: this.base,               // eng.traineddata lives here
+        gzip: false,                       // we host eng.traineddata UNcompressed,
+                                           // not eng.traineddata.gz — without this
+                                           // Tesseract fetches a .gz that doesn't
+                                           // exist and hangs at "loading language
+                                           // traineddata" until timeout.
         cacheMethod: 'write',
         // report each internal load stage so a stall is pinpointed, not vague
         logger: m => {
