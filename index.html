@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='b00408db633b';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='5a1eca5b89b9';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -253,15 +253,28 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
         workspace is stored in this browser only. On a shared computer, use <b>Clear</b> in the sidebar when you finish.</span></div>
       <div class="drop" id="drop">
         <h3>Drop files or a folder here</h3>
-        <p>PDF, Excel (.xlsx .xlsm .xls .xlsb), CSV, TSV, images (JPG/PNG/TIFF, read by OCR) and ZIP — including archives nested inside archives. Files already ingested are recognised by content hash and skipped. RAR is opened on a best-effort basis and needs internet on first use; extracting it and dropping the folder always works.</p>
+        <p>PDF, Excel (.xlsx .xlsm .xls .xlsb), CSV, TSV, images (JPG/PNG/TIFF, read by OCR) and ZIP — including archives nested inside archives. Add from as many places as you like, then press <b>Start</b>. Files already ingested are recognised by content hash and skipped. RAR must be extracted first, then use Choose folder.</p>
         <div class="row" style="justify-content:center">
-          <button class="btn pri" id="pickFiles">Choose files</button>
-          <button class="btn" id="pickFolder">Choose folder</button>
+          <button class="btn pri" id="pickFiles">+ Add files</button>
+          <button class="btn" id="pickFolder">+ Add folder</button>
         </div>
         <input type="file" id="fileIn" multiple hidden>
         <input type="file" id="folderIn" webkitdirectory directory multiple hidden>
       </div>
+      <div id="stagePanel" style="display:none;margin:14px 0;padding:14px;border:1px solid var(--line);border-radius:10px;background:var(--bg-soft)">
+        <div class="row" style="justify-content:space-between;align-items:center">
+          <span><b id="stageCount">0</b> file(s) staged, ready to process <span class="dim" id="stageNote"></span></span>
+          <div class="row">
+            <button class="btn sm" id="stageClear">Clear staged</button>
+            <button class="btn pri" id="startRun">▶ Start</button>
+          </div>
+        </div>
+      </div>
       <div class="bar"><i id="prog"></i></div>
+      <div class="row" id="runControls" style="display:none;gap:8px;margin:8px 0">
+        <button class="btn" id="stopRun">■ Stop</button>
+        <span class="dim" id="runProgress"></span>
+      </div>
       <div class="grid k4" id="ingestStats" style="margin:14px 0"></div>
       <div id="ocrBanner"></div>
       <div class="row" style="justify-content:space-between;align-items:center">
@@ -3746,8 +3759,31 @@ const drop = $('#drop');
 DROP_HTML = drop.innerHTML;
 ['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('hot'); }));
 ['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('hot'); }));
-drop.addEventListener('drop', e => { if (e.dataTransfer.files.length) ingest([...e.dataTransfer.files]); });
+drop.addEventListener('drop', e => { if (e.dataTransfer.files.length) stageFiles([...e.dataTransfer.files]); });
 wireDrop();
+
+/* ---- staging: collect files across multiple selections, run on Start ---- */
+let stagedFiles = [];
+function stageFiles(files){
+  stagedFiles.push(...files);
+  const panel = $('#stagePanel'); const count = $('#stageCount');
+  if (count) count.textContent = stagedFiles.length;
+  if (panel) panel.style.display = stagedFiles.length ? 'block' : 'none';
+  log(`Added ${files.length} — ${stagedFiles.length} staged. Add more, or press Start.`, 'dim');
+}
+$('#stageClear') && ($('#stageClear').onclick = () => { stagedFiles = []; $('#stagePanel').style.display='none'; log('Staged files cleared.', 'dim'); });
+$('#startRun') && ($('#startRun').onclick = async () => {
+  if (!stagedFiles.length) { log('Nothing staged to process.', 'wn'); return; }
+  const btn = $('#startRun'); btn.disabled = true; btn.textContent = 'Checking…';
+  // 1. run self-tests first
+  const okTests = await runSelfTests();
+  if (!okTests) { btn.disabled=false; btn.textContent='▶ Start';
+    log('Self-tests failed — see above. Fix before processing.', 'er'); return; }
+  // 2. process everything staged
+  const toRun = stagedFiles; stagedFiles = [];
+  $('#stagePanel').style.display='none'; btn.disabled=false; btn.textContent='▶ Start';
+  await ingest(toRun);
+});
 $('#dlDiag') && ($('#dlDiag').onclick = () => { DIAG.info('system','diagnostic log downloaded by user'); DIAG.download(); });
 $('#testOcr') && ($('#testOcr').onclick = async () => {
   const btn = $('#testOcr'); btn.disabled = true; btn.textContent = 'Testing OCR…';
@@ -3767,8 +3803,45 @@ $('#testOcr') && ($('#testOcr').onclick = async () => {
     btn.textContent = '✗ OCR failed — see log'; btn.disabled = false;
   }
 });
-$('#fileIn').onchange = e => ingest([...e.target.files]);
-$('#folderIn').onchange = e => ingest([...e.target.files]);
+/* Self-tests run before a batch starts — verify the readers and core logic are
+   working so we never start a big run on a broken engine. */
+async function runSelfTests(){
+  log('Running pre-flight self-tests…', 'head');
+  const checks = [];
+  // 1. libraries present
+  checks.push(['PDF reader', !!window.pdfjsLib]);
+  checks.push(['Excel reader', !!window.XLSX]);
+  checks.push(['ZIP reader', !!window.JSZip]);
+  // 2. extraction engine responds on a tiny synthetic workbook
+  let coreOk = false;
+  try {
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet([['Invoice No','TEST-1'],['Total','100']]);
+    XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
+    const view = L.viewFromWorkbook(wb, 'selftest.xlsx', XLSX);
+    const r = L.processView(view);
+    coreOk = !!r && !!r.invoice;
+  } catch(_){ coreOk = false; }
+  checks.push(['Extraction engine', coreOk]);
+  // 3. database reachable (non-fatal — offline is allowed)
+  let dbOk = false;
+  try { const r = await fetch(Cloud.url + '/invoices?select=content_hash&limit=1', { headers: Cloud.headers() }); dbOk = r.ok; } catch(_){}
+  checks.push(['Database connection', dbOk, true /*non-fatal*/]);
+  // 4. OCR (non-fatal — only needed for image bills)
+  checks.push(['OCR engine', $('#ocrPill') && $('#ocrPill').dataset.state==='ready', true]);
+
+  let allCritical = true;
+  checks.forEach(([name, ok, nonFatal])=>{
+    log(`  ${ok?'✓':'✗'} ${name}${ok?'':(nonFatal?' (optional — will work without it)':' — REQUIRED')}`, ok?'ok':(nonFatal?'wn':'er'));
+    if (!ok && !nonFatal) allCritical = false;
+  });
+  DIAG.info('system', 'self-tests run', { results: checks.map(c=>({t:c[0],ok:c[1]})) });
+  if (allCritical) log('Self-tests passed — starting.', 'ok');
+  return allCritical;
+}
+
+$('#fileIn').onchange = e => { stageFiles([...e.target.files]); e.target.value=''; };
+$('#folderIn').onchange = e => { stageFiles([...e.target.files]); e.target.value=''; };
 
 $('#q').oninput = renderLedger; $('#fVerdict').onchange = renderLedger; $('#fSettle').onchange = renderLedger;
 $('#ledger').onclick = e => { const tr = e.target.closest('tr[data-id]'); if (tr) openDoc(tr.dataset.id); };
