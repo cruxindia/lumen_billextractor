@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='e22adf46180c';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='16e4617ea19f';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -3344,9 +3344,22 @@ function renderReview(){
   const t = $('#review');
   const flaggedOnly = (window.__reviewMode||'flagged') === 'flagged';
 
-  // source rows: session docs, plus any pulled-from-DB rows held in reviewPulled
-  const source = (window.reviewPulled && window.reviewPulled.length)
-    ? window.reviewPulled : DB.docs;
+  // Review shows what needs fixing: bills flagged during processing PLUS the
+  // failed bills stored in Supabase (upload/OCR failures kept for manual repair).
+  // Failed bills carry their original file so the editor can show it.
+  const failed = (window.failedBills || []).map(f => ({
+    hash: f.content_hash, content_hash: f.content_hash,
+    invoice: { invoice_no: f.invoice_no, client_raw: f.client_raw, branch_raw: f.branch_raw,
+      total_paise: f.total_paise, taxable_paise: f.taxable_paise, source_file: f.source_file,
+      content_hash: f.content_hash },
+    checks: [{ check_id:'FAILED_UPLOAD', status:'FAIL', severity:'error',
+      detail: f.error_reason || 'This bill could not be processed — fix it by hand.' }],
+    verdict: 'FAILED', _isFailed: true, filename: f.source_file
+  }));
+
+  // session/db rows, plus the failed bills (failed first — highest priority)
+  const base = (window.reviewPulled && window.reviewPulled.length) ? window.reviewPulled : DB.docs;
+  const source = [...failed, ...base];
 
   const rows = source.filter(r => flaggedOnly
     ? r.checks && r.checks.some(c => c.status === 'FAIL')
@@ -3384,7 +3397,7 @@ function renderReview(){
       <td>${esc(r.invoice.client_raw||'—')}<br><span class="dim">${esc(r.invoice.branch_raw||'')}</span></td>
       <td>${clean?'<span class="dim">Nothing — this bill is clean.</span>'
               :problems.map(p=>`<div><b>${esc(p.title)}.</b> <span class="dim">${esc(p.say)}</span></div>`).join('')}</td>
-      <td><button class="btn sm" onclick="openReview('${esc(r.hash||r.content_hash||r.id)}')">${clean?'View':'Fix'}</button></td>
+      <td><button class="btn sm" onclick="openBillEditor('${esc(r.hash||r.content_hash||r.id)}')">${clean?'View':'Fix'}</button></td>
     </tr>`;
   }).join('')
    : `<tr><td colspan="5"><div class="empty"><h3>${flaggedOnly?'Nothing needs fixing':'No bills yet'}</h3><p>${flaggedOnly?'Every bill is clean.':'Ingest or pull some bills.'}</p></div></td></tr>`;
@@ -4670,8 +4683,11 @@ async function openBillEditor(hash){
       </div>
       <div class="editor-cols">
         <div class="editor-view">
-          ${billUrl ? `<iframe src="${billUrl}" style="width:100%;height:70vh;border:1px solid var(--line);border-radius:8px"></iframe>`
-            : `<div class="editor-noview">The original bill isn't held in this session.<br><span class="dim">Edit the fields on the right; they're what's in the database.</span></div>`}
+          ${billUrl ? (
+            /\.(jpe?g|png|gif|tiff?|bmp|webp)(\?|$)/i.test(billUrl) || (editorState.invoice.source_file||'').match(/\.(jpe?g|png|gif|tiff?|bmp|webp)$/i)
+              ? `<img src="${billUrl}" alt="original bill" style="width:100%;max-height:70vh;object-fit:contain;border:1px solid var(--line);border-radius:8px;background:#fff">`
+              : `<iframe src="${billUrl}" style="width:100%;height:70vh;border:1px solid var(--line);border-radius:8px"></iframe>`)
+            : `<div class="editor-noview">The original bill couldn't be loaded for viewing.<br><span class="dim">Edit the fields on the right using the details you have.</span></div>`}
         </div>
         <div class="editor-edit">
           ${fieldsHtml}
@@ -4816,7 +4832,7 @@ function renderCloud(fails, pulled){
           ${CLOUD_EDIT_COLS.map(([k,,mny],ci)=>{
             const val = mny ? (r[k]!=null ? (r[k]/100).toFixed(2) : '') : (r[k]??'');
             // first column (invoice_no) is a link to the full editor
-            if (ci===0) return `<td style="min-width:80px"><a href="#" class="lnk" onclick="openBillEditor('${esc(r.content_hash)}');return false" style="color:var(--brand);text-decoration:underline;cursor:pointer">${esc(String(val))||'(no number)'}</a></td>`;
+            if (ci===0) return `<td style="min-width:80px" class="mono">${esc(String(val))||'(no number)'}</td>`;
             return `<td contenteditable="true" data-k="${k}" data-money="${mny?1:0}" style="min-width:80px">${esc(String(val))}</td>`;
           }).join('')}
           <td class="num">${r.revision>1?'v'+r.revision:''}</td></tr>`).join('')}
