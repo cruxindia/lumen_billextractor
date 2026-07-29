@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='2e18513f6a3d';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='0e113a06ea5f';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -3220,10 +3220,24 @@ async function autoSync(docs){
   let ok=0, fail=0; const fails=[];
   for (const d of toPush){
     try { await Cloud.enrichFromMaster(d); const res = await Cloud.pushOne(d); d._pushed = true; ok++; }
-    catch(e){ fail++; fails.push([d.filename, e.message]); }
+    catch(e){
+      // "Failed to fetch" is usually a transient network blip — retry once
+      // before giving up, so a momentary hiccup doesn't lose a bill.
+      let saved = false;
+      try { await new Promise(r=>setTimeout(r,800)); await Cloud.pushOne(d); d._pushed = true; ok++; saved = true; }
+      catch(_){}
+      if (!saved) {
+        fail++; fails.push([d.filename, e.message]);
+        // keep the bill so it isn't lost — store it (with its file) for manual
+        // fixing in Review, exactly like an OCR/upload failure.
+        try { if (d._pdfBuf || d._sourceBlob) { await Cloud.saveFailedBill(d, 'Push failed: '+e.message); }
+          else { await Cloud.saveFailedBill(d, 'Push failed (no file): '+e.message); } } catch(_){}
+      }
+    }
   }
-  if (fail) { setCloud(`Saved ${ok}, ${fail} failed to save`, 'er'); log(`${fail} document(s) could not be saved to the database:`, 'er');
-    fails.forEach(([f,m])=>log(`   ${f} — ${m}`, 'dim')); }
+  if (fail) { setCloud(`Saved ${ok}, ${fail} failed to save`, 'er'); log(`${fail} document(s) could not be saved to the database — kept in Review to retry:`, 'er');
+    fails.forEach(([f,m])=>log(`   ${f} — ${m}`, 'dim'));
+    try { window.failedBills = await Cloud.fetchFailed(); renderReview(); } catch(_){} }
   else setCloud(`All ${ok} saved to the database`, 'ok');
   // refresh the MIS pull so Report/Review reflect the new data immediately
   try { if (window.misRows !== null) { window.misRows = null; if(window.__misSource==='database') await setMisSource('database'); } } catch(_){}
