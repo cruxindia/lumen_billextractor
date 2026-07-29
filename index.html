@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='5768164a4b74';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='2e18513f6a3d';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -373,6 +373,7 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
         <button class="btn" id="cloudClients">View clients</button>
         <button class="btn" id="cloudPush">Re-save this session</button>
         <button class="btn" id="cloudPull">Reload from database</button>
+        <button class="btn" id="cloudClearFiles" title="Delete all stored bill files from the bills bucket — use with reset_data.sql for a clean slate">Clear stored files</button>
         <span class="pill" id="cloudStatus"><i class="dot"></i> Ready</span>
       </div>
 
@@ -4644,6 +4645,28 @@ window.syncFromDatabase = syncFromDatabase;
     Cloud.subscribeRealtime(() => syncFromDatabase(true));
   }
 })();
+
+$('#cloudClearFiles') && ($('#cloudClearFiles').onclick = async () => {
+  if (!confirm('Delete ALL stored bill files from the database?\n\nThis clears the original PDFs/images kept for viewing failed and review bills. Use this together with reset_data.sql for a clean slate. The bills themselves in the database are NOT affected by this button.')) return;
+  const btn = $('#cloudClearFiles'); btn.disabled = true; btn.textContent = 'Clearing…';
+  const B = Cloud.storageUrl, H = { apikey: Cloud.key, Authorization: 'Bearer '+Cloud.key, 'Content-Type':'application/json' };
+  let total = 0;
+  try {
+    for (const prefix of ['', 'review', 'ocr-pending']) {
+      const r = await fetch(`${B}/object/list/bills`, { method:'POST', headers:H,
+        body: JSON.stringify({ prefix, limit: 100000 }) });
+      const items = await r.json();
+      const names = (items||[]).map(o => prefix ? `${prefix}/${o.name}` : o.name).filter(n => !n.endsWith('/'));
+      if (names.length) {
+        await fetch(`${B}/object/bills`, { method:'DELETE', headers:H, body: JSON.stringify({ prefixes: names }) });
+        total += names.length;
+      }
+    }
+    log(`Cleared ${total} stored bill file(s) from the database.`, 'ok');
+    DIAG && DIAG.ok('system', `cleared ${total} stored bill files`);
+  } catch(e){ log('Could not clear stored files: '+e.message, 'er'); }
+  btn.disabled = false; btn.textContent = 'Clear stored files';
+});
 
 $('#cloudPull') && ($('#cloudPull').onclick = async () => {
   const btn=$('#cloudPull'); btn.disabled=true; setCloud('Pulling…','dim');
