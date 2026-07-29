@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='a2d7cf33ca38';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='432623de9b7c';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -200,6 +200,12 @@ label.chk input{accent-color:var(--accent)}
 .edfield span{color:var(--text-2)}
 .edfield input{padding:6px 8px;border:1px solid var(--line);border-radius:6px;font-size:13px;background:var(--bg)}
 .edfield input:focus{border-color:var(--brand);outline:none}
+.edfield-flag input{border-color:var(--fail);background:color-mix(in srgb, var(--fail) 6%, transparent)}
+.edfield-flag input:focus{border-color:var(--fail);box-shadow:0 0 0 2px color-mix(in srgb, var(--fail) 20%, transparent)}
+.editor-checks{background:color-mix(in srgb, var(--fail) 7%, transparent);border:1px solid color-mix(in srgb, var(--fail) 30%, transparent);border-radius:10px;padding:12px 14px;margin-bottom:16px}
+.editor-checks-h{font-weight:700;color:var(--fail);margin-bottom:8px;font-size:14px}
+.editor-check-item{font-size:13px;margin-bottom:5px;line-height:1.4}
+.editor-check-hint{font-size:12px;color:var(--text-2);margin-top:8px;padding-top:8px;border-top:1px solid color-mix(in srgb, var(--fail) 20%, transparent)}
 table.edlines{width:100%;font-size:12px;border-collapse:collapse}
 table.edlines th{text-align:left;color:var(--text-2);font-weight:600;padding:4px}
 table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);border-radius:5px;font-size:12px}
@@ -2405,10 +2411,23 @@ const Cloud = {
   },
 
   async updateOne(hash, patch){
-    const r = await fetch(this.url + '/invoices?content_hash=eq.' + encodeURIComponent(hash), {
-      method: 'PATCH', headers: this.headers({ 'Prefer': 'return=minimal' }),
-      body: JSON.stringify(patch) });
-    if (!r.ok) { const t = await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
+    let body = { ...patch };
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const r = await fetch(this.url + '/invoices?content_hash=eq.' + encodeURIComponent(hash), {
+        method: 'PATCH', headers: this.headers({ 'Prefer': 'return=minimal' }),
+        body: JSON.stringify(body) });
+      if (r.ok) return true;
+      const t = await r.text();
+      // If the DB rejects an unknown column, drop just that field and retry —
+      // one missing column shouldn't block saving everything else.
+      const m = t.match(/Could not find the '([a-z_]+)' column/i);
+      if (m && body.hasOwnProperty(m[1])) {
+        delete body[m[1]];
+        if (typeof DIAG!=='undefined') DIAG.warn('push', `skipped unknown column '${m[1]}' and retried`, { hint:`run add_branch_code.sql / the latest migration to store it` });
+        continue;
+      }
+      throw new Error(`${r.status} ${t.slice(0,160)}`);
+    }
     return true;
   },
 
@@ -4777,6 +4796,36 @@ async function openBillEditor(hash){
     ? 'This bill has no stored file — it was processed before file-storing was enabled, or the Storage bucket isn\'t set up. Re-ingest it to store the file.'
     : (!billUrl ? 'The file is recorded but couldn\'t be fetched from Storage — check the bucket policy.' : '');
 
+  // Which checks apply to this bill, and which fields they implicate — so we can
+  // tell the user what to check and mark those fields red.
+  const billChecks = (failedRow ? row.checks : (
+    (window.reviewPulled||[]).find(r=>(r.content_hash||r.hash)===hash)?.checks
+    || (DB.docs.find(d=>d.hash===hash)||{}).checks || [])) || [];
+  const activeChecks = billChecks.filter(c => c.status==='FAIL');
+  // map a check to the fields it's about, so those fields turn red
+  const CHECK_FIELDS = {
+    C1_total_reconciles:['total_paise','taxable_paise','tax_total_paise'],
+    C14_row_completeness:['total_paise','annexure_total_paise'],
+    face_detail_mismatch:['total_paise','face_total_paise'],
+    C16_ocr_source:['taxable_paise','total_paise','tax_total_paise'],
+    tax_place_mismatch:['cgst_paise','sgst_paise','igst_paise'],
+    C15_applicant_detail:[],
+    FAILED_UPLOAD:['invoice_no','client_raw','branch_raw','taxable_paise','total_paise'],
+  };
+  const redFields = new Set();
+  activeChecks.forEach(c => { (CHECK_FIELDS[c.check_id]||[]).forEach(f => redFields.add(f)); });
+
+  const checkSummaryHtml = activeChecks.length ? `
+    <div class="editor-checks">
+      <div class="editor-checks-h">⚠ ${activeChecks.length} thing${activeChecks.length>1?'s':''} to check on this bill</div>
+      ${activeChecks.map(c => {
+        const say = (typeof plainFor==='function') ? plainFor({invoice:editorState.invoice, checks:[c]}, c) : null;
+        return `<div class="editor-check-item"><b>${esc(say?say.title:(c.check_id||'Issue'))}.</b>
+          <span class="dim">${esc(say?say.say:(c.detail||''))}</span></div>`;
+      }).join('')}
+      <div class="editor-check-hint">The fields to check are outlined in red on the right. Fix them, then Save &amp; update.</div>
+    </div>` : '';
+
   const fieldsHtml = EDITOR_FIELDS.map(([group, fields]) => `
     <div class="edgroup"><div class="edgroup-h">${group}</div>
       <div class="edgrid">
@@ -4784,7 +4833,8 @@ async function openBillEditor(hash){
           let v = editorState.invoice[k];
           if (type==='money') v = (v!=null ? (v/100).toFixed(2) : '');
           else v = (v??'');
-          return `<label class="edfield"><span>${esc(label)}</span>
+          const red = redFields.has(k);
+          return `<label class="edfield${red?' edfield-flag':''}"><span>${esc(label)}${red?' <b style="color:var(--fail)">• check</b>':''}</span>
             <input data-k="${k}" data-type="${type}" value="${esc(String(v))}" ${type==='date'?'placeholder="YYYY-MM-DD"':''}></label>`;
         }).join('')}
       </div></div>`).join('');
@@ -4797,8 +4847,7 @@ async function openBillEditor(hash){
         <b>Editing ${esc(row.invoice_no||'(no number)')}</b>
         <span class="spacer"></span>
         <button class="btn" onclick="closeModal()">Cancel</button>
-        <button class="btn pri" onclick="saveBillEditor()">Push edits back</button>
-        <button class="btn" onclick="saveBillEditor(true)" title="Save, then delete the raw source from the database to free space">Push &amp; delete source</button>
+        <button class="btn pri" onclick="saveBillEditor()">Save &amp; update</button>
       </div>
       <div class="editor-cols">
         <div class="editor-view">
@@ -4811,6 +4860,7 @@ async function openBillEditor(hash){
             : `<div class="editor-noview">The original bill couldn't be loaded for viewing.<br><span class="dim">${esc(window.__editorNoFileReason||'Edit the fields on the right using the details you have.')}</span></div>`}
         </div>
         <div class="editor-edit">
+          ${checkSummaryHtml}
           ${fieldsHtml}
           <div class="edgroup"><div class="edgroup-h">Customers / applicants
             <button class="btn sm" onclick="addEditorLine()" style="margin-left:8px">+ Add customer</button></div>
@@ -4876,11 +4926,14 @@ function syncEditorLinesFromDom(){
   });
 }
 
-async function saveBillEditor(alsoDelete){
-  if (!editorState) return;
+async function saveBillEditor(){
+  if (!editorState) { log('Nothing to save.', 'wn'); return; }
   const hash = editorState.hash;
   const modalEl = document.getElementById('modal');
-  // gather header field edits
+  const btn = modalEl.querySelector('.editor-head .btn.pri');
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+
+  // gather every edited field
   const patch = {};
   modalEl.querySelectorAll('.editor-edit input[data-k]').forEach(inp=>{
     const k = inp.dataset.k, type = inp.dataset.type, v = inp.value.trim();
@@ -4890,49 +4943,62 @@ async function saveBillEditor(alsoDelete){
   });
   syncEditorLinesFromDom();
 
-  /* Failed bills MUST be filled completely before they can be promoted. Every
-     field must have a value — 'NA' is allowed where a real value doesn't exist.
-     Missing fields are collected and shown, rather than saving a half-filled row. */
+  // failed bills must be complete before promotion ('NA' allowed)
   if (editorState.isFailed) {
     const required = ['invoice_no','invoice_date','client_raw','branch_raw','taxable_paise','total_paise'];
     const labels = { invoice_no:'Invoice no', invoice_date:'Invoice date', client_raw:'Client',
       branch_raw:'Branch', taxable_paise:'Taxable', total_paise:'Total' };
-    const missing = required.filter(k => { const v = patch[k]; return v==null || v==='' ; });
+    const missing = required.filter(k => { const v = patch[k]; return v==null || v===''; });
     if (missing.length) {
       const list = missing.map(k=>labels[k]||k).join(', ');
-      log(`Cannot submit — please fill: ${list}. Enter "NA" where a value doesn't exist.`, 'er');
-      alert(`These fields are still empty:\n\n${list}\n\nFill them in (type "NA" if a real value doesn't exist) — every field is required before submitting a failed bill.`);
+      alert(`Please fill these before saving:\n\n${list}\n\nType "NA" if a real value doesn't exist.`);
+      if (btn) { btn.disabled = false; btn.textContent = 'Save & update'; }
       return;
     }
   }
 
   try {
-    // build a doc-shaped object from the patch for failed-bill promotion
+    // one path: write the corrected data, refresh the applicant rows, mark it
+    // verified, and clean up the stored source file. Works for both failed bills
+    // and ordinary review bills.
+    const doc = { hash, filename: editorState.invoice.source_file || editorState.invoice.filename,
+      invoice: { ...editorState.invoice, ...patch }, verdict:'VERIFIED', verification:'manual',
+      applicants: [], candidates: {}, metadata: {}, checks: [],
+      _uploader: editorState.invoice.uploaded_by, _uploadLocation: editorState.invoice.upload_location };
+
     if (editorState.isFailed) {
-      const doc = { hash, filename: editorState.invoice.source_file || editorState.invoice.filename,
-        invoice: { ...editorState.invoice, ...patch }, verdict:'VERIFIED', verification:'manual',
-        applicants: [], candidates: {}, metadata: {}, checks: [],
-        _uploader: editorState.invoice.uploaded_by, _uploadLocation: editorState.invoice.upload_location };
+      // promote from failed_uploads into invoices, then delete the failed row + file
       await Cloud.resolveFailed(doc, editorState.storagePath);
       await Cloud.replaceLines(hash, editorState.lines);
-      log('Failed bill completed, saved to the database, and removed from the failed list.', 'ok');
-      DIAG && DIAG.info('system', `failed bill resolved: ${hash}`);
       window.failedBills = (window.failedBills||[]).filter(f => f.content_hash !== hash);
     } else {
+      // ordinary review bill: update the invoice, refresh its lines, mark verified,
+      // and remove its stored review file (no longer needed once verified)
       await Cloud.updateOne(hash, patch);
       await Cloud.replaceLines(hash, editorState.lines);
       await Cloud.markVerified(hash);
-      if (alsoDelete) { await Cloud.deleteOne(hash); log('Bill saved and raw source deleted to free space.', 'ok'); }
-      else log('Edits pushed back to the database and marked verified.', 'ok');
-      DIAG && DIAG.info('system', `bill edited via editor: ${hash}`, { deleted: !!alsoDelete, lines: editorState.lines.length });
-      const local = DB.docs.find(d=>d.hash===hash);
-      if (local) { local.verdict='VERIFIED'; local._hasImagePage=false; delete local._pdfBuf; delete local._sourceBlob; }
-      cloudRows = cloudRows.filter(r => r.content_hash !== hash || !alsoDelete);
+      const rfp = editorState.invoice.review_file_path;
+      if (rfp) { try { await fetch(`${Cloud.storageUrl}/object/bills/${rfp}`,
+        { method:'DELETE', headers:{ 'apikey':Cloud.key, 'Authorization':'Bearer '+Cloud.key } }); } catch(_){} }
     }
-  } catch(e){ log('Could not save edits: '+e.message, 'er'); return; }
+
+    // update local state so it drops out of Review immediately
+    const local = DB.docs.find(d=>d.hash===hash);
+    if (local) { local.verdict='VERIFIED'; local.checks=[]; local._hasImagePage=false; delete local._pdfBuf; delete local._sourceBlob; }
+    if (window.reviewPulled) window.reviewPulled = window.reviewPulled.map(r =>
+      (r.content_hash===hash || r.hash===hash) ? {...r, verdict:'VERIFIED', checks:[]} : r);
+    cloudRows = cloudRows.filter(r => r.content_hash !== hash);
+
+    log('Saved — the bill is updated in the database and cleared from Review.', 'ok');
+    DIAG && DIAG.ok('system', `bill saved via editor: ${hash}`);
+  } catch(e){
+    log('Could not save: '+e.message, 'er');
+    DIAG && DIAG.error('system', `editor save failed: ${hash}`, { reason: e.message });
+    if (btn) { btn.disabled = false; btn.textContent = 'Save & update'; }
+    return;
+  }
   editorState = null; closeModal(); renderReview(); renderAll();
-  // refresh everything from the database (realtime will also fire)
-  try { await syncFromDatabase(true); const rows = await Cloud.pullAll(); renderCloud(null, rows); } catch(_){}
+  try { await syncFromDatabase(true); } catch(_){}
 }
 window.saveBillEditor = saveBillEditor;
 
