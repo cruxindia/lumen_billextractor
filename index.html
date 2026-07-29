@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='0e113a06ea5f';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='a2d7cf33ca38';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2286,8 +2286,25 @@ const Cloud = {
     try {
       const r = await fetch(`${this.storageUrl}/object/sign/bills/${storagePath}`, {
         method:'POST', headers: this.headers(), body: JSON.stringify({ expiresIn: 3600 }) });
-      if (r.ok) { const j = await r.json(); return this.storageUrl + j.signedURL; }
-    } catch(_){}
+      if (r.ok) {
+        const j = await r.json();
+        let s = j.signedURL || j.signedUrl || '';
+        if (!s) return null;
+        // Supabase returns the signed path in a few shapes depending on version:
+        //   "/object/sign/bills/…?token=…"  → prepend storage base
+        //   "object/sign/bills/…?token=…"   → prepend base + "/"
+        //   full "https://…"                → use as-is
+        let url;
+        if (/^https?:\/\//i.test(s)) url = s;
+        else if (s.startsWith('/')) url = this.storageUrl + s;
+        else url = this.storageUrl + '/' + s;
+        if (typeof DIAG!=='undefined') DIAG.info('system', `signed bill URL built`, { path: storagePath, url: url.slice(0,80) });
+        return url;
+      } else {
+        const t = await r.text();
+        if (typeof DIAG!=='undefined') DIAG.error('system', `signed URL request failed`, { status:r.status, reason:t.slice(0,120), path:storagePath });
+      }
+    } catch(e){ if (typeof DIAG!=='undefined') DIAG.error('system', `signed URL error`, { reason:e.message, path:storagePath }); }
     return null;
   },
 
@@ -4787,8 +4804,10 @@ async function openBillEditor(hash){
         <div class="editor-view">
           ${billUrl ? (
             /\.(jpe?g|png|gif|tiff?|bmp|webp)(\?|$)/i.test(billUrl) || (editorState.invoice.source_file||'').match(/\.(jpe?g|png|gif|tiff?|bmp|webp)$/i)
-              ? `<img src="${billUrl}" alt="original bill" style="width:100%;max-height:70vh;object-fit:contain;border:1px solid var(--line);border-radius:8px;background:#fff">`
-              : `<iframe src="${billUrl}" style="width:100%;height:70vh;border:1px solid var(--line);border-radius:8px"></iframe>`)
+              ? `<img src="${billUrl}" alt="original bill" style="width:100%;max-height:66vh;object-fit:contain;border:1px solid var(--line);border-radius:8px;background:#fff">
+                 <div style="margin-top:6px"><a href="${billUrl}" target="_blank" rel="noopener" class="dim" style="font-size:12px">↗ Open bill in new tab</a></div>`
+              : `<iframe src="${billUrl}" style="width:100%;height:66vh;border:1px solid var(--line);border-radius:8px"></iframe>
+                 <div style="margin-top:6px"><a href="${billUrl}" target="_blank" rel="noopener" class="dim" style="font-size:12px">↗ Open bill in new tab (if it doesn't show above)</a></div>`)
             : `<div class="editor-noview">The original bill couldn't be loaded for viewing.<br><span class="dim">${esc(window.__editorNoFileReason||'Edit the fields on the right using the details you have.')}</span></div>`}
         </div>
         <div class="editor-edit">
