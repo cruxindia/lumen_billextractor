@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='653d95da2aa6';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='b807921640e6';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2074,6 +2074,7 @@ const Cloud = {
       match_status: i.match_status, match_diff_paise: i.match_diff_paise,
       rows_read: i.rows_read, rows_printed: i.rows_printed,
       verdict: doc.verdict, verification: doc.verification, source_file: doc.filename,
+      uploaded_by: doc._uploader || null, upload_location: doc._uploadLocation || null,
       settlement_status: i.settlement_status, commercial_state: i.commercial_state,
       processing_state: i.processing_state, written_off: i.written_off,
       allocated_paise: i.allocated_paise, last_payment_date: this.toISODate(i.last_payment_date),
@@ -2225,6 +2226,71 @@ const Cloud = {
   },
 
   /* Fetch the applicant/customer rows for one bill from the database. */
+  /* ---- Failed-bill workflow ----
+     When a bill can't be auto-processed, keep its original file in Storage and
+     its details in failed_uploads, so a human can fix it while viewing the bill. */
+  storageUrl: 'https://czdjbbhxboweawqbjywr.supabase.co/storage/v1',
+
+  async saveFailedBill(doc, errorReason){
+    const hash = doc.hash;
+    let storagePath = null;
+    // upload the original file to the `bills` bucket so it can be viewed later
+    try {
+      if (doc._pdfBuf || doc._sourceBlob) {
+        const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type:'application/pdf' });
+        const ext = (doc.filename||'bill').split('.').pop() || 'pdf';
+        storagePath = `${hash}.${ext}`;
+        const up = await fetch(`${this.storageUrl}/object/bills/${storagePath}`, {
+          method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key },
+          body: blob });
+        if (!up.ok) storagePath = null;
+      }
+    } catch(_){ storagePath = null; }
+    const iv = doc.invoice || {};
+    const row = {
+      content_hash: hash, source_file: doc.filename||null, storage_path: storagePath,
+      error_reason: errorReason||'upload failed',
+      invoice_no: iv.invoice_no||null, invoice_date: this.toISODate(iv.invoice_date),
+      client_raw: iv.client_raw||null, branch_raw: iv.branch_raw||null,
+      taxable_paise: iv.taxable_paise??null, tax_total_paise: iv.tax_total_paise??null,
+      total_paise: iv.total_paise??null, raw_json: iv,
+      uploaded_by: doc._uploader||null, upload_location: doc._uploadLocation||null
+    };
+    const r = await fetch(this.url + '/failed_uploads', {
+      method:'POST', headers: this.headers({ 'Prefer':'resolution=merge-duplicates' }),
+      body: JSON.stringify(row) });
+    return r.ok;
+  },
+
+  async fetchFailed(){
+    try { const r = await fetch(this.url + '/failed_uploads?select=*&order=created_at.desc',
+      { headers: this.headers({ 'Range':'0-99999' }) });
+      if (r.ok) return await r.json();
+    } catch(_){}
+    return [];
+  },
+
+  /* short-lived signed URL so the editor can show the original bill file */
+  async signedBillUrl(storagePath){
+    if (!storagePath) return null;
+    try {
+      const r = await fetch(`${this.storageUrl}/object/sign/bills/${storagePath}`, {
+        method:'POST', headers: this.headers(), body: JSON.stringify({ expiresIn: 3600 }) });
+      if (r.ok) { const j = await r.json(); return this.storageUrl + j.signedURL; }
+    } catch(_){}
+    return null;
+  },
+
+  /* promote a fixed failed bill into invoices, then remove the failed row + file */
+  async resolveFailed(doc, storagePath){
+    await this.pushOne(doc);                              // insert corrected bill
+    try { await fetch(this.url + '/rpc/resolve_failed_upload', {
+      method:'POST', headers: this.headers(), body: JSON.stringify({ p_hash: doc.hash }) }); } catch(_){}
+    if (storagePath) { try { await fetch(`${this.storageUrl}/object/bills/${storagePath}`,
+      { method:'DELETE', headers:{ 'apikey':this.key, 'Authorization':'Bearer '+this.key } }); } catch(_){} }
+    return true;
+  },
+
   async fetchLines(hash){
     try {
       const r = await fetch(this.url + '/invoice_lines?content_hash=eq.' + encodeURIComponent(hash) + '&order=line_no',
@@ -2877,7 +2943,10 @@ async function ingest(fileList){
       if (justAdded && !justAdded._pushed) {
         try { await Cloud.enrichFromMaster(justAdded); await Cloud.pushOne(justAdded); justAdded._pushed = true; pushedCount++;
           DIAG.info('push', `saved: ${justAdded.filename}`, { invoice: justAdded.invoice.invoice_no }); }
-        catch(e){ DIAG.error('push', `save failed: ${justAdded.filename}`, { reason: e.message }); }
+        catch(e){ DIAG.error('push', `save failed: ${justAdded.filename}`, { reason: e.message });
+          // keep the failed bill (with its original file) for manual fixing
+          try { await Cloud.saveFailedBill(justAdded, e.message); justAdded._savedAsFailed = true; } catch(_){}
+        }
         // free heavy per-file memory now that it's stored — BUT keep the PDF
         // buffer for image bills, which the OCR pass needs to read them.
         if (!justAdded._hasImagePage) { delete justAdded._pdfBuf; }
@@ -4428,6 +4497,8 @@ async function syncFromDatabase(silent){
     if (!silent) setCloud('Loading database…','dim');
     const rows = await Cloud.pullAll();
     window.dbRows = rows;
+    // also fetch failed bills so they show in Sync for manual completion
+    try { window.failedBills = await Cloud.fetchFailed(); } catch(_){ window.failedBills = []; }
     let checksByHash = {};
     try {
       const cr = await fetch(Cloud.url + '/checks?select=content_hash,check_id,status,severity,detail&status=eq.FAIL',
@@ -4508,7 +4579,10 @@ const EDITOR_FIELDS = [
 let editorState = null;   // { hash, invoice, lines }
 
 async function openBillEditor(hash){
-  const row = cloudRows.find(r => r.content_hash === hash)
+  // check failed bills first — they carry the stored original file
+  const failedRow = (window.failedBills||[]).find(f => f.content_hash === hash);
+  const row = failedRow
+    || cloudRows.find(r => r.content_hash === hash)
     || (window.reviewPulled||[]).map(r=>r.invoice).find(iv => (iv&&iv.content_hash)===hash)
     || DB.docs.map(d=>({...d.invoice, content_hash:d.hash})).find(iv => iv.content_hash===hash);
   if (!row) { log('Could not find this bill.', 'er'); return; }
@@ -4516,11 +4590,15 @@ async function openBillEditor(hash){
   // fetch applicant lines from the DB
   let lines = [];
   try { lines = await Cloud.fetchLines(hash); } catch(_){}
-  editorState = { hash, invoice: { ...row }, lines: lines.map(l=>({...l})) };
+  editorState = { hash, invoice: { ...row }, lines: lines.map(l=>({...l})),
+    isFailed: !!failedRow, storagePath: failedRow ? failedRow.storage_path : null };
 
-  // the original bill, if we still hold it this session
+  // the original bill: held in session, OR (for failed bills) fetched from Storage
   const held = DB.docs.find(d => d.hash === hash);
-  const billUrl = held && held._sourceBlob ? URL.createObjectURL(held._sourceBlob) : null;
+  let billUrl = held && held._sourceBlob ? URL.createObjectURL(held._sourceBlob) : null;
+  if (!billUrl && failedRow && failedRow.storage_path) {
+    try { billUrl = await Cloud.signedBillUrl(failedRow.storage_path); } catch(_){}
+  }
 
   const fieldsHtml = EDITOR_FIELDS.map(([group, fields]) => `
     <div class="edgroup"><div class="edgroup-h">${group}</div>
@@ -4560,6 +4638,27 @@ async function openBillEditor(hash){
       </div>
     </div>`;
   openModalHtml(body, 'editor-modal');
+  // auto-tally: total = taxable + cgst + sgst + igst (+ round off) as you type
+  const modalEl = document.getElementById('modal');
+  const num = sel => { const el = modalEl.querySelector(sel); if(!el) return 0; const v=parseFloat(el.value); return isNaN(v)?0:v; };
+  const recompute = () => {
+    const totalEl = modalEl.querySelector('input[data-k="total_paise"]');
+    const taxTotalEl = modalEl.querySelector('input[data-k="tax_total_paise"]');
+    if (!totalEl) return;
+    const taxable = num('input[data-k="taxable_paise"]');
+    const cgst = num('input[data-k="cgst_paise"]'), sgst = num('input[data-k="sgst_paise"]'), igst = num('input[data-k="igst_paise"]');
+    const round = num('input[data-k="round_off_paise"]');
+    const tax = cgst + sgst + igst;
+    if (taxTotalEl && !taxTotalEl.matches(':focus')) taxTotalEl.value = tax ? tax.toFixed(2) : taxTotalEl.value;
+    if (!totalEl.matches(':focus')) {
+      const total = taxable + tax + round;
+      if (total) totalEl.value = total.toFixed(2);
+    }
+  };
+  ['taxable_paise','cgst_paise','sgst_paise','igst_paise','round_off_paise'].forEach(k=>{
+    const el = modalEl.querySelector(`input[data-k="${k}"]`);
+    if (el) el.addEventListener('input', recompute);
+  });
 }
 
 function renderEditorLines(){
@@ -4608,22 +4707,50 @@ async function saveBillEditor(alsoDelete){
     else patch[k] = v===''?null:v;
   });
   syncEditorLinesFromDom();
+
+  /* Failed bills MUST be filled completely before they can be promoted. Every
+     field must have a value — 'NA' is allowed where a real value doesn't exist.
+     Missing fields are collected and shown, rather than saving a half-filled row. */
+  if (editorState.isFailed) {
+    const required = ['invoice_no','invoice_date','client_raw','branch_raw','taxable_paise','total_paise'];
+    const labels = { invoice_no:'Invoice no', invoice_date:'Invoice date', client_raw:'Client',
+      branch_raw:'Branch', taxable_paise:'Taxable', total_paise:'Total' };
+    const missing = required.filter(k => { const v = patch[k]; return v==null || v==='' ; });
+    if (missing.length) {
+      const list = missing.map(k=>labels[k]||k).join(', ');
+      log(`Cannot submit — please fill: ${list}. Enter "NA" where a value doesn't exist.`, 'er');
+      alert(`These fields are still empty:\n\n${list}\n\nFill them in (type "NA" if a real value doesn't exist) — every field is required before submitting a failed bill.`);
+      return;
+    }
+  }
+
   try {
-    await Cloud.updateOne(hash, patch);
-    await Cloud.replaceLines(hash, editorState.lines);
-    // mark verified — it's been human-edited
-    await Cloud.markVerified(hash);
-    if (alsoDelete) { await Cloud.deleteOne(hash); log('Bill saved and raw source deleted to free space.', 'ok'); }
-    else log('Edits pushed back to the database and marked verified.', 'ok');
-    DIAG && DIAG.info('system', `bill edited via editor: ${hash}`, { deleted: !!alsoDelete, lines: editorState.lines.length });
-    // update local state
-    const local = DB.docs.find(d=>d.hash===hash);
-    if (local) { local.verdict='VERIFIED'; local._hasImagePage=false; delete local._pdfBuf; delete local._sourceBlob; }
-    cloudRows = cloudRows.filter(r => r.content_hash !== hash || !alsoDelete);
+    // build a doc-shaped object from the patch for failed-bill promotion
+    if (editorState.isFailed) {
+      const doc = { hash, filename: editorState.invoice.source_file || editorState.invoice.filename,
+        invoice: { ...editorState.invoice, ...patch }, verdict:'VERIFIED', verification:'manual',
+        applicants: [], candidates: {}, metadata: {}, checks: [],
+        _uploader: editorState.invoice.uploaded_by, _uploadLocation: editorState.invoice.upload_location };
+      await Cloud.resolveFailed(doc, editorState.storagePath);
+      await Cloud.replaceLines(hash, editorState.lines);
+      log('Failed bill completed, saved to the database, and removed from the failed list.', 'ok');
+      DIAG && DIAG.info('system', `failed bill resolved: ${hash}`);
+      window.failedBills = (window.failedBills||[]).filter(f => f.content_hash !== hash);
+    } else {
+      await Cloud.updateOne(hash, patch);
+      await Cloud.replaceLines(hash, editorState.lines);
+      await Cloud.markVerified(hash);
+      if (alsoDelete) { await Cloud.deleteOne(hash); log('Bill saved and raw source deleted to free space.', 'ok'); }
+      else log('Edits pushed back to the database and marked verified.', 'ok');
+      DIAG && DIAG.info('system', `bill edited via editor: ${hash}`, { deleted: !!alsoDelete, lines: editorState.lines.length });
+      const local = DB.docs.find(d=>d.hash===hash);
+      if (local) { local.verdict='VERIFIED'; local._hasImagePage=false; delete local._pdfBuf; delete local._sourceBlob; }
+      cloudRows = cloudRows.filter(r => r.content_hash !== hash || !alsoDelete);
+    }
   } catch(e){ log('Could not save edits: '+e.message, 'er'); return; }
   editorState = null; closeModal(); renderReview(); renderAll();
-  // refresh the sync view
-  try { const rows = await Cloud.pullAll(); renderCloud(null, rows); } catch(_){}
+  // refresh everything from the database (realtime will also fire)
+  try { await syncFromDatabase(true); const rows = await Cloud.pullAll(); renderCloud(null, rows); } catch(_){}
 }
 window.saveBillEditor = saveBillEditor;
 
