@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='16e4617ea19f';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='557173108ce9';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -176,6 +176,10 @@ label.chk input{accent-color:var(--accent)}
 
 /* review toolbar + segmented toggle */
 .reviewbar{display:flex;align-items:center;gap:12px;margin:8px 0 14px;flex-wrap:wrap}
+.subtabs{display:flex;gap:4px;border-bottom:2px solid var(--line);margin:6px 0 16px}
+.subtabs button{background:none;border:none;padding:9px 16px;font-size:14px;color:var(--text-2);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;font-weight:500}
+.subtabs button.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+.subtabs button:hover{color:var(--accent)}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .seg button{background:var(--surface);border:none;padding:7px 14px;font:inherit;font-size:13px;cursor:pointer;color:var(--text-2)}
 .seg button.on{background:var(--accent,#4C2082);color:#fff}
@@ -228,14 +232,11 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
   <nav class="rail" id="rail">
     <div class="rail-head">WORK</div>
     <button data-v="ingest" aria-current="true">◈ <span class="t">Ingest</span></button>
-    <button data-v="ledger">▤ <span class="t">Ledger</span><span class="num" id="nLedger">0</span></button>
     <button data-v="review">△ <span class="t">Review</span><span class="num" id="nReview">0</span></button>
     <div class="rail-head">OUTPUT</div>
     <button data-v="report">▦ <span class="t">Report</span></button>
-    <button data-v="audit">◎ <span class="t">Audit</span></button>
-    <button data-v="tally">Σ <span class="t">Tally</span></button>
     <div class="rail-head">DATABASE</div>
-    <button data-v="cloud">⛁ <span class="t">Sync</span><span class="num" id="nCloud"></span></button>
+    <button data-v="cloud">⛁ <span class="t">Database</span><span class="num" id="nCloud"></span></button>
     <div class="rail-head">WORKSPACE</div>
     <button id="saveWs">↓ <span class="t">Save</span></button>
     <button id="openWs">↑ <span class="t">Open</span></button>
@@ -318,6 +319,12 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
     <!-- ===== REPORT ===== -->
     <section class="view" id="v-report">
       <h1>Report &amp; MIS</h1>
+      <div class="subtabs" id="reportSubtabs">
+        <button class="on" data-sub="report" onclick="showReportSub('report')">MIS Report</button>
+        <button data-sub="ledger" onclick="showReportSub('ledger')">Ledger</button>
+        <button data-sub="tally" onclick="showReportSub('tally')">Tally</button>
+      </div>
+      <div id="reportSubBody">
       <p class="sub">Build a report from this session, or pull the whole database for a full MIS. Filter by client,
          branch, date, verdict or payment status — the report and every export respect the filters.</p>
       <div class="reviewbar">
@@ -343,6 +350,7 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
         <button class="btn" id="expDef">Export definition</button>
       </div>
       <div class="tblwrap" style="max-height:calc(100vh - 330px)"><table id="report"><thead></thead><tbody></tbody></table></div>
+      </div><!-- /reportSubBody -->
     </section>
 
     <!-- ===== CLOUD SYNC ===== -->
@@ -2075,6 +2083,7 @@ const Cloud = {
       rows_read: i.rows_read, rows_printed: i.rows_printed,
       verdict: doc.verdict, verification: doc.verification, source_file: doc.filename,
       uploaded_by: doc._uploader || null, upload_location: doc._uploadLocation || null,
+      review_file_path: (doc.invoice && doc.invoice.review_file_path) || doc._reviewFilePath || null,
       settlement_status: i.settlement_status, commercial_state: i.commercial_state,
       processing_state: i.processing_state, written_off: i.written_off,
       allocated_paise: i.allocated_paise, last_payment_date: this.toISODate(i.last_payment_date),
@@ -2293,6 +2302,25 @@ const Cloud = {
 
   /* Stash an image bill's file in Storage so its in-RAM buffer can be freed.
      The OCR pass re-fetches it one at a time, keeping peak memory bounded. */
+  /* Store a review bill's original file so it can be viewed in the editor while
+     verifying. Records the storage path on the invoice row (review_file_path)
+     so the editor knows where to find it. One file, uploaded then dropped. */
+  async stashReviewFile(doc){
+    if (!doc._sourceBlob && !doc._pdfBuf) return false;
+    const ext = (doc.filename||'bill').split('.').pop() || 'pdf';
+    const path = `review/${doc.hash}.${ext}`;
+    const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type:'application/pdf' });
+    try {
+      const r = await fetch(`${this.storageUrl}/object/bills/${path}`, {
+        method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'x-upsert':'true' },
+        body: blob });
+      if (r.ok) { doc._reviewFilePath = path;
+        if (doc.invoice) doc.invoice.review_file_path = path;
+        return true; }
+    } catch(_){}
+    return false;
+  },
+
   async stashBillFile(doc){
     if (!doc._pdfBuf) return false;
     const ext = (doc.filename||'bill').split('.').pop() || 'pdf';
@@ -2933,6 +2961,10 @@ async function ingest(fileList){
               detail:'Read from an image by OCR — verify the amounts.' });
             if (r.verdict==='PROVEN') r.verdict='UNPROVEN';
             ocrStreamed++;
+            // store the original file so it's viewable in Review for verification
+            // (one file at a time — upload then drop, never held in memory)
+            try { r._sourceBlob = new Blob([it.buf], { type:'application/pdf' });
+              await Cloud.stashReviewFile(r); delete r._sourceBlob; } catch(_){}
             DIAG.ok('ocr', `OCR read ${it.name}`, { invoice: r.invoice.invoice_no });
           } catch(e){
             // OCR failed for this one bill — keep its file in Supabase for manual
@@ -3796,7 +3828,7 @@ function renderAudit(){
 }
 
 function renderAll(){
-  $('#nLedger').textContent = DB.docs.length || '';
+  { const nl = $('#nLedger'); if (nl) nl.textContent = DB.docs.length || ''; }
   const s0 = stats();
   /* Stated plainly and permanently: a verdict is a judgement about evidence,
      never a filter. Nothing is ever withheld from the database or the reports. */
@@ -3915,6 +3947,33 @@ function persist(){
 $('#rail').addEventListener('click', e => { const b = e.target.closest('button[data-v]'); if(!b) return;
   $$('#rail button[data-v]').forEach(x => x.setAttribute('aria-current', String(x === b)));
   $$('.view').forEach(v => v.classList.toggle('on', v.id === 'v-' + b.dataset.v)); });
+
+/* Report now hosts three sub-views: MIS Report, Ledger, Tally. They used to be
+   separate top-level tabs; consolidating them here means fewer doors to similar
+   rooms. The Ledger and Tally view sections still exist in the DOM — we just show
+   the right one inside Report and hide the others. */
+window.showReportSub = (sub) => {
+  $$('#reportSubtabs button').forEach(x => x.classList.toggle('on', x.dataset.sub === sub));
+  const rb = $('#reportSubBody'), ledger = $('#v-ledger'), tally = $('#v-tally');
+  rb.style.display = sub==='report' ? '' : 'none';
+  if (ledger) { ledger.style.display = sub==='ledger'?'':'none'; }
+  if (tally)  { tally.style.display  = sub==='tally' ?'':'none'; }
+  if (sub==='ledger' && typeof renderLedger==='function') renderLedger();
+  if (sub==='tally' && typeof renderTally==='function') renderTally();
+};
+
+/* Relocate the Ledger and Tally view sections INSIDE the Report view, so the
+   three live together under one tab instead of three separate rail buttons. */
+(function consolidateTabs(){
+  const report = $('#v-report'), ledger = $('#v-ledger'), tally = $('#v-tally'), audit = $('#v-audit');
+  if (report && ledger) { ledger.classList.add('on'); ledger.style.display='none'; report.appendChild(ledger); }
+  if (report && tally)  { tally.classList.add('on');  tally.style.display='none';  report.appendChild(tally); }
+  // Audit's findings are the same "needs attention" list as Review — fold it in.
+  const review = $('#v-review');
+  if (review && audit) { audit.classList.add('on'); audit.style.display='none'; review.appendChild(audit);
+    // add an Audit sub-tab to Review
+    const rv = $('#v-review'); }
+})();
 
 $('#themeBtn').onclick = () => { const h = document.documentElement;
   h.dataset.theme = h.dataset.theme === 'dark' ? 'light' : 'dark'; };
@@ -4571,7 +4630,8 @@ async function syncFromDatabase(silent){
     window.__misSource = 'database';
     const needs = window.reviewPulled.filter(r => r.verdict && r.verdict!=='PROVEN').length;
     setCloud(`${rows.length} in database · ${needs} need attention${Cloud._rt?' · live':''}`, needs?'wn':'ok');
-    if (!window.reviewPulled.some(r=>r.checks.length)) window.__reviewMode = 'all';
+    // Review defaults to "needs fixing only" — clean bills should NOT appear here.
+    window.__reviewMode = 'flagged';
     if (typeof buildMisFilters==='function') buildMisFilters();
     renderReview(); renderReport();
     if (!silent) DIAG && DIAG.ok('system', `synced ${rows.length} bills from database`, { needs_attention: needs });
@@ -4651,11 +4711,14 @@ async function openBillEditor(hash){
   editorState = { hash, invoice: { ...row }, lines: lines.map(l=>({...l})),
     isFailed: !!failedRow, storagePath: failedRow ? failedRow.storage_path : null };
 
-  // the original bill: held in session, OR (for failed bills) fetched from Storage
+  // the original bill: held in session, OR fetched from Storage
   const held = DB.docs.find(d => d.hash === hash);
   let billUrl = held && held._sourceBlob ? URL.createObjectURL(held._sourceBlob) : null;
-  if (!billUrl && failedRow && failedRow.storage_path) {
-    try { billUrl = await Cloud.signedBillUrl(failedRow.storage_path); } catch(_){}
+  // failed bills store their file at storage_path; OCR/review bills at review_file_path
+  const storedPath = (failedRow && failedRow.storage_path) || row.review_file_path
+    || (held && held._reviewFilePath);
+  if (!billUrl && storedPath) {
+    try { billUrl = await Cloud.signedBillUrl(storedPath); } catch(_){}
   }
 
   const fieldsHtml = EDITOR_FIELDS.map(([group, fields]) => `
@@ -4939,9 +5002,8 @@ document.addEventListener('click', async (e) => {
         verdict: row.verdict, verification: row.verification
       }));
       const flagged = window.reviewPulled.filter(r=>r.checks.length).length;
-      log(`Pulled ${rows.length} records from the database into Review (${flagged} need fixing).`, 'ok');
-      // if none have checks, show All so the user still sees the data
-      if (!flagged) window.__reviewMode = 'all';
+      log(`Pulled ${rows.length} records from the database (${flagged} need fixing).`, 'ok');
+      window.__reviewMode = 'flagged';   // Review only shows what needs fixing
     } catch(err){ log('Pull failed: '+err.message, 'er'); }
     renderReview();
   }
