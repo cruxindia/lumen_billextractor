@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='557173108ce9';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='5768164a4b74';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2316,8 +2316,12 @@ const Cloud = {
         body: blob });
       if (r.ok) { doc._reviewFilePath = path;
         if (doc.invoice) doc.invoice.review_file_path = path;
+        if (typeof DIAG!=='undefined') DIAG.ok('ocr', `bill file stored for viewing: ${doc.filename}`, { path });
         return true; }
-    } catch(_){}
+      else { const t = await r.text();
+        if (typeof DIAG!=='undefined') DIAG.error('ocr', `could NOT store bill file: ${doc.filename}`, { status:r.status, reason: t.slice(0,120), hint:'is the `bills` Storage bucket created? run failed_uploads.sql' });
+      }
+    } catch(e){ if (typeof DIAG!=='undefined') DIAG.error('ocr', `bill file upload error: ${doc.filename}`, { reason:e.message }); }
     return false;
   },
 
@@ -2937,12 +2941,6 @@ async function ingest(fileList){
           r._ocrCoveredByExcel = true;      // record, but no OCR needed
           excelPreferred++;
           DIAG.info('excel', `OCR skipped for ${it.name}`, { reason:'Excel of same invoice already covers it', invoice: key });
-        } else {
-          /* Flag image bills for the SEPARATE OCR pass — never OCR inline during
-             ingest. Inline OCR of hundreds/thousands of image PDFs freezes the
-             batch (each takes seconds). Ingest stays fast; OCR runs afterward as
-             a resumable background pass the user starts from the banner.
-          /* Flag image bills for the SEPARATE OCR pass — never OCR inline during
         } else {
           /* ONE FILE AT A TIME (per the agreed design): OCR this image bill
              right now, using the buffer we already have in hand, then drop it
@@ -4719,7 +4717,11 @@ async function openBillEditor(hash){
     || (held && held._reviewFilePath);
   if (!billUrl && storedPath) {
     try { billUrl = await Cloud.signedBillUrl(storedPath); } catch(_){}
+    if (!billUrl && typeof DIAG!=='undefined') DIAG.warn('system', `bill file path exists but couldn't be fetched: ${storedPath}`);
   }
+  window.__editorNoFileReason = !storedPath
+    ? 'This bill has no stored file — it was processed before file-storing was enabled, or the Storage bucket isn\'t set up. Re-ingest it to store the file.'
+    : (!billUrl ? 'The file is recorded but couldn\'t be fetched from Storage — check the bucket policy.' : '');
 
   const fieldsHtml = EDITOR_FIELDS.map(([group, fields]) => `
     <div class="edgroup"><div class="edgroup-h">${group}</div>
@@ -4750,7 +4752,7 @@ async function openBillEditor(hash){
             /\.(jpe?g|png|gif|tiff?|bmp|webp)(\?|$)/i.test(billUrl) || (editorState.invoice.source_file||'').match(/\.(jpe?g|png|gif|tiff?|bmp|webp)$/i)
               ? `<img src="${billUrl}" alt="original bill" style="width:100%;max-height:70vh;object-fit:contain;border:1px solid var(--line);border-radius:8px;background:#fff">`
               : `<iframe src="${billUrl}" style="width:100%;height:70vh;border:1px solid var(--line);border-radius:8px"></iframe>`)
-            : `<div class="editor-noview">The original bill couldn't be loaded for viewing.<br><span class="dim">Edit the fields on the right using the details you have.</span></div>`}
+            : `<div class="editor-noview">The original bill couldn't be loaded for viewing.<br><span class="dim">${esc(window.__editorNoFileReason||'Edit the fields on the right using the details you have.')}</span></div>`}
         </div>
         <div class="editor-edit">
           ${fieldsHtml}
