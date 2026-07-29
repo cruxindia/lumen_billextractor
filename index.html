@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='b807921640e6';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='e22adf46180c';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2291,6 +2291,29 @@ const Cloud = {
     return true;
   },
 
+  /* Stash an image bill's file in Storage so its in-RAM buffer can be freed.
+     The OCR pass re-fetches it one at a time, keeping peak memory bounded. */
+  async stashBillFile(doc){
+    if (!doc._pdfBuf) return false;
+    const ext = (doc.filename||'bill').split('.').pop() || 'pdf';
+    const path = `ocr-pending/${doc.hash}.${ext}`;
+    const blob = new Blob([doc._pdfBuf], { type: 'application/pdf' });
+    const r = await fetch(`${this.storageUrl}/object/bills/${path}`, {
+      method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'x-upsert':'true' },
+      body: blob });
+    if (r.ok) { doc._stashPath = path; return true; }
+    return false;
+  },
+  async fetchBillFile(path){
+    try {
+      const signed = await this.signedBillUrl(path);
+      if (!signed) return null;
+      const r = await fetch(signed);
+      if (r.ok) return await r.arrayBuffer();
+    } catch(_){}
+    return null;
+  },
+
   async fetchLines(hash){
     try {
       const r = await fetch(this.url + '/invoice_lines?content_hash=eq.' + encodeURIComponent(hash) + '&order=line_no',
@@ -2795,7 +2818,7 @@ async function ingest(fileList){
   /* OCR does NOT run during ingest — it runs as a separate pass afterward. So
      we do not warm the engine here (warming it up front was causing a long
      "OCR working…" hang before the batch could even start). */
-  let ocrReady = false;
+  let ocrReady = false, ocrWarmed = false;
 
   for (const it of ordered) {
     try {
@@ -2806,27 +2829,20 @@ async function ingest(fileList){
         continue; }
       let view;
       if (it.image) {
-        // an image file IS a bill with no text. Small batch: OCR now. Big batch:
-        // flag it for the separate OCR pass so ingest never freezes.
-        if (BIG_BATCH) {
-          view = L.buildViewFromPages([{ items: [] }], it.name);
-          view.metadata = view.metadata || {}; view.metadata.hasImagePage = true;
-          view._deferImage = true;
-          DIAG.info('ocr', `image flagged for OCR pass: ${it.name}`, { reason:'big batch — deferred to keep ingest fast' });
-        } else {
-          if (!ocrReady) { try { await OCR.worker(); ocrReady = true; } catch(_){} }
-          try {
-            let diag=null;
-            const ocrItems = await OCR.ocrImage(it.buf, (d)=>{diag=d;});
-            view = L.buildViewFromPages([{ items: ocrItems }], it.name);
-            view._ocrUsed = true; view.metadata = view.metadata || {}; view.metadata.hasImagePage = true;
-            DIAG.ok('ocr', `OCR read image ${it.name}`, diag);
-          } catch(e){
-            done++;
-            DIAG.error('ocr', `image OCR failed: ${it.name}`, { reason: e.message });
-            log(`${it.name} — image, OCR failed: ${e.message}`, 'er');
-            continue;
-          }
+        // an image file IS a bill with no text — OCR it right now, one at a
+        // time, then drop it. No deferral, no held buffers.
+        if (!ocrReady) { try { await OCR.worker(); ocrReady = true; ocrWarmed = true; } catch(_){} }
+        try {
+          let diag=null;
+          const ocrItems = await OCR.ocrImage(it.buf, (d)=>{diag=d;});
+          view = L.buildViewFromPages([{ items: ocrItems }], it.name);
+          view._ocrUsed = true; view.metadata = view.metadata || {}; view.metadata.hasImagePage = true;
+          DIAG.ok('ocr', `OCR read image ${it.name}`, diag);
+        } catch(e){
+          done++;
+          DIAG.error('ocr', `image OCR failed: ${it.name}`, { reason: e.message });
+          log(`${it.name} — image, OCR failed: ${e.message}`, 'er');
+          continue;
         }
       } else if (it.pdf) {
         view = await pdfToView(it.buf, it.name);
@@ -2899,23 +2915,40 @@ async function ingest(fileList){
              batch (each takes seconds). Ingest stays fast; OCR runs afterward as
              a resumable background pass the user starts from the banner.
           /* Flag image bills for the SEPARATE OCR pass — never OCR inline during
-             ingest (that froze the batch). We DO keep each image bill's PDF
-             buffer so the Run OCR button works afterward. Only image bills hold
-             buffers (a subset), and non-image files still drop theirs below — so
-             memory stays far lower than the old "hold everything" freeze. */
-          r._hasImagePage = true;
-          try { const src = new Uint8Array(it.buf); const copy = new Uint8Array(src.length); copy.set(src); r._pdfBuf = copy.buffer; }
-          catch(_){ r._pdfBuf = null; }
-          DIAG.info('ocr', `flagged for OCR: ${it.name}`, { reason:'image page — buffer kept for the OCR pass' });
+        } else {
+          /* ONE FILE AT A TIME (per the agreed design): OCR this image bill
+             right now, using the buffer we already have in hand, then drop it
+             before moving to the next file. Peak memory is ONE file, never a
+             pile — so a 2000-image batch can't crash the browser. No held
+             buffers, no separate pass. */
+          try {
+            if (!ocrWarmed) { try { await OCR.worker(); ocrWarmed = true; } catch(_){} }
+            const ocrView = await pdfToViewWithOcr(it.buf, it.name);
+            const r2 = L.processView(ocrView);
+            Object.assign(r.invoice, r2.invoice);
+            r.applicants = r2.applicants; r.candidates = r2.candidates; r.checks = r2.checks || [];
+            r.verdict = r2.verdict; r.verification = r2.verification;
+            r._ocr = true; r._ocrDone = true;
+            r.checks.push({ check_id:'C16_ocr_source', status:'FAIL', severity:'warning',
+              detail:'Read from an image by OCR — verify the amounts.' });
+            if (r.verdict==='PROVEN') r.verdict='UNPROVEN';
+            ocrStreamed++;
+            DIAG.ok('ocr', `OCR read ${it.name}`, { invoice: r.invoice.invoice_no });
+          } catch(e){
+            // OCR failed for this one bill — keep its file in Supabase for manual
+            // fixing (never held in RAM), then move on. One failure isn't fatal.
+            r._hasImagePage = true; r._ocrFailed = true;
+            r.checks = r.checks || [];
+            r.checks.push({ check_id:'C16_ocr_source', status:'FAIL', severity:'warning',
+              detail:'Image bill — OCR did not complete; open it in Sync to fix by hand.' });
+            try { r._sourceBlob = new Blob([it.buf], { type:'application/pdf' }); await Cloud.saveFailedBill(r, 'OCR failed: '+e.message); delete r._sourceBlob; } catch(_){}
+            DIAG.error('ocr', `OCR failed for ${it.name}`, { reason: e.message });
+          }
+          // buffer is dropped here — `it.buf` goes out of scope next iteration
         }
       }
-      if (view._deferImage) {
-        // deferred image: flag for the OCR pass and KEEP its buffer (an image has
-        // no other data source, so we must retain it even in a big batch; images
-        // are typically few, so the memory cost is small)
+      if (false) {  // (deferred-image path retired — images OCR inline below)
         r._hasImagePage = true; r._fromImage = true;
-        try { const src = new Uint8Array(it.buf); const copy = new Uint8Array(src.length); copy.set(src); r._pdfBuf = copy.buffer; r._isRawImage = true; }
-        catch(_){ r._pdfBuf = null; }
       } else if (view._ocrUsed || it.image) {
         r._ocr = true; if (it.image) r._fromImage = true;
         // record an explicit check so it surfaces in Review as needing verification
@@ -3029,7 +3062,7 @@ async function ingest(fileList){
 let ocrPassRunning = false;
 async function runOcrPass(){
   if (ocrPassRunning) return;
-  const pending = DB.docs.filter(d => d._hasImagePage && !d._ocrDone && d._pdfBuf);
+  const pending = DB.docs.filter(d => d._hasImagePage && !d._ocrDone && (d._pdfBuf || d._stashPath));
   if (!pending.length) { log('No image bills need OCR.', 'dim'); return; }
   ocrPassRunning = true;
   log(`Starting OCR on ${pending.length} image bill(s)…`, 'head');
@@ -3056,12 +3089,21 @@ async function runOcrPass(){
     try {
       let diag = null;
       let view;
+      // if this bill's buffer was stashed to Storage to save memory, fetch it now
+      let buf = d._pdfBuf;
+      let fetchedFromStash = false;
+      if (!buf && d._stashPath) {
+        buf = await Cloud.fetchBillFile(d._stashPath);
+        fetchedFromStash = true;
+      }
+      if (!buf) { d._ocrDone = true; failed++; continue; }
       if (d._isRawImage) {
-        const ocrItems = await OCR.ocrImage(d._pdfBuf, (dg)=>{ diag = dg; });
+        const ocrItems = await OCR.ocrImage(buf, (dg)=>{ diag = dg; });
         view = L.buildViewFromPages([{ items: ocrItems }], d.filename);
       } else {
-        view = await pdfToViewWithOcr(d._pdfBuf, d.filename, (dg)=>{ diag = dg; });
+        view = await pdfToViewWithOcr(buf, d.filename, (dg)=>{ diag = dg; });
       }
+      buf = null;   // release immediately after OCR
       const r2 = L.processView(view);
       Object.assign(d.invoice, r2.invoice);
       d.applicants = r2.applicants; d.candidates = r2.candidates; d.checks = r2.checks || [];
@@ -3075,6 +3117,9 @@ async function runOcrPass(){
       // free this bill's buffer now that it's OCR'd and saved — memory releases
       // progressively so even 100k image bills never accumulate in RAM
       delete d._pdfBuf; d._hasImagePage = false;
+      // if this bill's file was stashed in Storage for memory, delete it now
+      if (d._stashPath) { try { await fetch(`${Cloud.storageUrl}/object/bills/${d._stashPath}`,
+        { method:'DELETE', headers:{ 'apikey':Cloud.key, 'Authorization':'Bearer '+Cloud.key } }); } catch(_){} d._stashPath = null; }
       // show timing for the FIRST few so slowness is visible immediately
       if (i < 3) log(`  ${d.filename}: ${((Date.now()-tFile)/1000).toFixed(1)}s`
         + (diag ? ` (render ${diag.render}ms + OCR ${diag.ocr}ms)` : ''), 'dim');
@@ -3096,7 +3141,7 @@ async function runOcrPass(){
 }
 function renderOcrBanner(){
   const el = document.getElementById('ocrBanner'); if(!el) return;
-  const pending = DB.docs.filter(d => d._hasImagePage && !d._ocrDone && d._pdfBuf).length;
+  const pending = DB.docs.filter(d => d._hasImagePage && !d._ocrDone && (d._pdfBuf || d._stashPath)).length;
   if (!pending) { el.innerHTML = ''; return; }
   el.innerHTML = `<div class="assure" style="border-color:var(--warn);background:var(--warn-bg)">
     <span>◉</span><span><b>${pending} bill(s) have an image page</b> that needs OCR to read the client,
