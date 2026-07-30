@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='d98c60494d78';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='2cd2bff91ceb';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -188,6 +188,19 @@ label.chk input{accent-color:var(--accent)}
 .wcard.busy{border-color:var(--accent);background:var(--accent-soft)}
 .wcard.offline{opacity:.6;border-style:dashed}
 .wcard.qa{border-color:var(--proof);background:color-mix(in srgb, var(--proof) 8%, transparent)}
+.wcard.recruit{border-style:dashed;border-color:var(--accent);background:transparent;display:flex;flex-direction:column;justify-content:center}
+.dash{border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:14px 0;background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 4%,transparent),transparent)}
+.dashhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.dashtitle{font-weight:600;font-size:14px}
+.dashlive{font-size:12px;color:var(--text-2)}
+.dashlive.on{color:var(--accent);font-weight:500}
+.dashgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}
+@media(max-width:900px){.dashgrid{grid-template-columns:repeat(2,1fr)}}
+.dashcard{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--bg)}
+.dashcard.warn{border-color:var(--warn)}
+.dashk{font-size:11px;color:var(--text-2);text-transform:uppercase;letter-spacing:.04em}
+.dashv{font-size:26px;font-weight:600;line-height:1.1;margin-top:2px;font-variant-numeric:tabular-nums}
+.dashsub{font-size:11px;color:var(--text-2);margin-top:2px}
 .wcard.qa .wdot{background:var(--proof)}
 .wcard .whead{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-2);margin-bottom:4px}
 .wdot{width:8px;height:8px;border-radius:50%;background:var(--line);flex:none}
@@ -300,6 +313,7 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
         </div>
       </div>
       <div class="bar"><i id="prog"></i></div>
+      <div id="liveDash"></div>
       <div class="row" id="runControls" style="display:none;gap:8px;margin:8px 0">
         <button class="btn" id="stopRun">■ Stop</button>
         <span class="dim" id="runProgress"></span>
@@ -2691,11 +2705,40 @@ const OCR = {
   workerTrait(i){ return (this._roster[i % this._roster.length] || { trait:'' }).trait; },
 
   poolSize(){
-    // hardwareConcurrency = logical cores. Use half (leave room for the UI and
-    // PDF rendering), clamped to 2..4. A weak 2-core machine gets 1; a good
-    // 8-core gets 4. Never so many that the machine chokes.
+    // The DEFAULT safe size: half the logical cores, clamped 1..4. But the
+    // manager can recruit more via the panel (up to the hard ceiling), with a
+    // compatibility warning. desiredCrew (if set) overrides the default.
+    if (window.__desiredCrew) return window.__desiredCrew;
     const cores = (navigator && navigator.hardwareConcurrency) || 2;
     return Math.max(1, Math.min(4, Math.floor(cores / 2)));
+  },
+  MAX_CREW: 20,   // hard ceiling — the roster has 20 named workers
+
+  // Assess whether a requested crew size is safe on this machine. Returns
+  // { level:'ok'|'caution'|'risky', cores, deviceMemory, msg }. Used by the
+  // recruit button to warn before spinning up more workers than the machine
+  // can comfortably run.
+  assessCrew(requested){
+    const cores = (navigator && navigator.hardwareConcurrency) || 2;
+    const mem = (navigator && navigator.deviceMemory) || null;   // GB, approximate, not all browsers
+    const safe = Math.max(1, Math.floor(cores / 2));
+    const aggressive = cores;   // one worker per core is the practical ceiling before contention
+    let level, msg;
+    if (requested <= safe) {
+      level = 'ok';
+      msg = `Your machine reports ${cores} CPU cores${mem?` and ~${mem} GB memory`:''}. ${requested} worker(s) is comfortable — it leaves room for the browser and your other work.`;
+    } else if (requested <= aggressive) {
+      level = 'caution';
+      msg = `Your machine reports ${cores} CPU cores${mem?` and ~${mem} GB memory`:''}. ${requested} worker(s) is more than the safe default (${safe}). It will run faster, but may make the browser and other apps feel sluggish while a big batch is processing.`;
+    } else {
+      level = 'risky';
+      msg = `Your machine reports ${cores} CPU cores${mem?` and ~${mem} GB memory`:''}. ${requested} worker(s) is well beyond what ${cores} cores can run in parallel — the extra workers will fight for the same CPU, which can SLOW the overall run and may freeze other functions or the tab. Not recommended.`;
+    }
+    if (mem && requested > mem * 2) {   // rough: each worker + OCR can hold real memory
+      level = 'risky';
+      msg += ` Also, with only ~${mem} GB memory, ${requested} workers risks running out of memory on large scans.`;
+    }
+    return { level, cores, deviceMemory: mem, safe, msg };
   },
 
   async pool(){
@@ -3427,7 +3470,16 @@ async function ingest(fileList){
   }
 
   DIAG.ok('ingest', `starting ${ordered.length} bill(s) across ${CREW} line workers`, { crew: CREW });
-  await Promise.all(Array.from({length: CREW}, (_, wid) => lineWorker(wid)));
+  const activeWorkers = [];
+  window.__spawnLineWorker = (wid) => {
+    // add a new worker mid-run (called by recruitWorker). It pulls from the same
+    // shared queue, so it just picks up the next unclaimed bills.
+    const p = lineWorker(wid); activeWorkers.push(p); return p;
+  };
+  for (let wid = 0; wid < CREW; wid++) activeWorkers.push(lineWorker(wid));
+  // wait for all workers, including any recruited mid-run
+  while (activeWorkers.length) { const batch = activeWorkers.splice(0); await Promise.all(batch); }
+  window.__spawnLineWorker = null;
   window.__procCrew = null;   // process crew done; OCR pass (if any) shows its own
   if (typeof updateOcrProgress==='function') updateOcrProgress(0,0);
   session.dupes = dupes; session.failed = failed; session.scans = scans;
@@ -3677,13 +3729,132 @@ function renderWorkerPanel(){
     <div class="wtime">${qs.kicked} sent back → failed_uploads (P1 for review)${failNote}</div>
   </div>`;
   const crewLabel = isProc ? 'Your processing crew' : 'Your OCR crew';
-  el.innerHTML = `<div class="wtitle">${crewLabel} — ${online} of ${pool.n} online${progress}${queued?` · ${queued} waiting`:''}
-      <span class="dim" style="text-transform:none;font-weight:400"> · Free a stuck one, or bench some to save memory</span></div>
-    <div class="wpanel">${cards}${qaCard}</div>`;
+  // Structure: one QA + one TL for every 4 workers. Show how many teams there are.
+  const teams = Math.ceil(pool.n / 4);
+  const teamNote = pool.n>4 ? ` · ${teams} team(s) of 4, each with a QA` : '';
+  // Recruit / release controls (only meaningful for the process crew sizing)
+  const canRecruit = pool.n < OCR.MAX_CREW;
+  const canRelease = pool.n > 1;
+  const recruitBtn = `<div class="wcard recruit">
+    <div class="whead" style="justify-content:center"><b>Team size</b></div>
+    <div style="text-align:center;font-size:26px;font-weight:600;margin:4px 0">${pool.n}</div>
+    <div class="wtrait" style="text-align:center">workers${teams>1?` · ${teams} teams`:''}</div>
+    <div class="wctrl" style="justify-content:center">
+      <button class="wbtn" onclick="releaseWorker()" ${canRelease?'':'disabled'} title="Remove a worker">−</button>
+      <button class="wbtn" onclick="recruitWorker()" ${canRecruit?'':'disabled'} title="Recruit a worker (checks your system first)">+ Recruit</button>
+    </div>
+  </div>`;
+  el.innerHTML = `<div class="wtitle">${crewLabel} — ${online} of ${pool.n} online${progress}${queued?` · ${queued} waiting`:''}${teamNote}
+      <span class="dim" style="text-transform:none;font-weight:400"> · Free a stuck one, bench to save memory, or recruit more for speed</span></div>
+    <div class="wpanel">${cards}${qaCard}${recruitBtn}</div>`;
   if (anyBusy && !_workerTick) _workerTick = setInterval(renderWorkerPanel, 1000);
   if (!anyBusy && _workerTick) { clearInterval(_workerTick); _workerTick = null; }
 }
 window.renderWorkerPanel = renderWorkerPanel;
+
+/* ===================== LIVE DASHBOARD =====================
+   A live meter of the database — total bills, revenue, today's activity, and a
+   live processing rate. It reads straight from Supabase and refreshes whenever
+   Realtime signals a change, so it updates even when a run is happening on
+   ANOTHER machine or location. This is the "meter in front of you" view. */
+window.__dashState = { total:0, revenuePaise:0, today:0, failed:0, lastRate:0, lastAt:0, lastTotal:0, updatedAt:null };
+
+async function refreshDashboard(){
+  if (typeof Cloud === 'undefined') return;
+  try {
+    // count total invoices (HEAD with count) — cheap
+    const cr = await fetch(`${Cloud.url}/invoices?select=content_hash`, { headers: Cloud.headers({ 'Prefer':'count=exact','Range':'0-0' }) });
+    const range = cr.headers.get('content-range') || '';
+    const total = parseInt((range.split('/')[1]||'0'),10) || 0;
+    // today's count + failed count
+    const today = new Date().toISOString().slice(0,10);
+    let todayN = 0, failedN = 0, revenue = 0;
+    try {
+      const tr = await fetch(`${Cloud.url}/ingest_log?select=id&at=gte.${today}T00:00:00`, { headers: Cloud.headers({ 'Prefer':'count=exact','Range':'0-0' }) });
+      todayN = parseInt(((tr.headers.get('content-range')||'').split('/')[1]||'0'),10) || 0;
+    } catch(_){}
+    try {
+      const fr = await fetch(`${Cloud.url}/failed_uploads?select=content_hash`, { headers: Cloud.headers({ 'Prefer':'count=exact','Range':'0-0' }) });
+      failedN = parseInt(((fr.headers.get('content-range')||'').split('/')[1]||'0'),10) || 0;
+    } catch(_){}
+    // revenue: sum total_paise — pull a lightweight column (cap to keep it cheap)
+    try {
+      const rr = await fetch(`${Cloud.url}/invoices?select=total_paise`, { headers: Cloud.headers({ 'Range':'0-99999' }) });
+      if (rr.ok) { const rows = await rr.json(); revenue = rows.reduce((a,r)=>a+(r.total_paise||0),0); }
+    } catch(_){}
+    // compute a live rate (bills since last refresh / seconds)
+    const now = Date.now(); const st = window.__dashState;
+    if (st.lastAt && total > st.lastTotal) { st.lastRate = Math.round((total - st.lastTotal) / Math.max(1,(now-st.lastAt)/1000) * 60); }
+    st.lastAt = now; st.lastTotal = total;
+    st.total = total; st.revenuePaise = revenue; st.today = todayN; st.failed = failedN; st.updatedAt = new Date();
+    renderDashboard();
+  } catch(e){ /* keep the last known values on a transient error */ }
+}
+
+function renderDashboard(){
+  const el = document.getElementById('liveDash'); if (!el) return;
+  const s = window.__dashState;
+  const money = (p)=> '₹' + (p/100).toLocaleString('en-IN',{maximumFractionDigits:0});
+  const stamp = s.updatedAt ? s.updatedAt.toLocaleTimeString() : '—';
+  const running = !!window.__procCrew;
+  el.innerHTML = `
+    <div class="dash">
+      <div class="dashhead">
+        <span class="dashtitle">◉ Live database</span>
+        <span class="dashlive ${running?'on':''}">${running?'● processing now':'● live'} · updated ${stamp}</span>
+      </div>
+      <div class="dashgrid">
+        <div class="dashcard"><div class="dashk">Total bills</div><div class="dashv">${s.total.toLocaleString('en-IN')}</div></div>
+        <div class="dashcard"><div class="dashk">Billed total</div><div class="dashv">${money(s.revenuePaise)}</div></div>
+        <div class="dashcard"><div class="dashk">Today</div><div class="dashv">${s.today.toLocaleString('en-IN')}</div><div class="dashsub">bills processed today</div></div>
+        <div class="dashcard"><div class="dashk">Rate</div><div class="dashv">${s.lastRate||0}<span style="font-size:14px">/min</span></div><div class="dashsub">${running?'live':'last run'}</div></div>
+        <div class="dashcard ${s.failed?'warn':''}"><div class="dashk">Need review</div><div class="dashv">${s.failed.toLocaleString('en-IN')}</div><div class="dashsub">in failed_uploads</div></div>
+      </div>
+    </div>`;
+}
+window.refreshDashboard = refreshDashboard;
+window.renderDashboard = renderDashboard;
+
+/* Recruit a worker — but FIRST check the machine can take it, and warn if the
+   requested size risks slowing the browser or other functions. The person
+   chooses to proceed or cancel. Goal is speed, but never at the cost of freezing
+   their machine without consent. */
+window.recruitWorker = function(){
+  const cur = (window.__procCrew && window.__procCrew.n) || (OCR._pool && OCR._pool.n) || OCR.poolSize();
+  const want = cur + 1;
+  if (want > OCR.MAX_CREW) { alert(`The maximum crew size is ${OCR.MAX_CREW} workers.`); return; }
+  const a = OCR.assessCrew(want);
+  const icon = a.level==='ok' ? '✓' : (a.level==='caution' ? '⚠' : '⛔');
+  const head = a.level==='ok' ? 'This is fine' : (a.level==='caution' ? 'Heads up' : 'Not recommended');
+  const proceed = confirm(`${icon}  ${head}\n\nRecruiting worker #${want}.\n\n${a.msg}\n\nProceed?`);
+  if (!proceed) return;
+  window.__desiredCrew = want;
+  // grow the active crew if one is running; otherwise it takes effect next run
+  if (window.__procCrew) {
+    const c = window.__procCrew; const i = c.n;
+    c.n = want; c.busy.push(false); c.startedAt.push(0); c.jobs.push(null);
+    c.offline.push(false); c.freed.push(0);
+    // spawn a new line worker if the ingest loop exposed a spawner
+    if (typeof window.__spawnLineWorker === 'function') window.__spawnLineWorker(i);
+  }
+  DIAG && DIAG.info('system', `manager recruited worker #${want}`, { level:a.level, cores:a.cores });
+  renderWorkerPanel();
+};
+
+window.releaseWorker = function(){
+  const cur = (window.__procCrew && window.__procCrew.n) || (OCR._pool && OCR._pool.n) || OCR.poolSize();
+  if (cur <= 1) return;
+  const want = cur - 1;
+  window.__desiredCrew = want;
+  if (window.__procCrew) {
+    const c = window.__procCrew; const idx = c.n - 1;
+    c.offline[idx] = true;   // stop giving it work; the loop will let it finish and idle
+    c.n = want;
+    c.busy.length = want; c.startedAt.length = want; c.jobs.length = want; c.offline.length = want; c.freed.length = want;
+  }
+  DIAG && DIAG.info('system', `manager released a worker — crew now ${want}`);
+  renderWorkerPanel();
+};
 window.OCR = OCR;   // so the worker-panel control buttons (Free/Bench/Hire) work
 function updateOcrProgress(cur, total){
   const el = document.getElementById('ocrProgress'); if(!el) return;
@@ -3796,19 +3967,26 @@ const LEDGER_COLS = [
 
 function filtered(){
   const q = $('#q').value.trim().toLowerCase(), v = $('#fVerdict').value, st = $('#fSettle').value;
-  return DB.docs.filter(r => {
+  // Read from the session if it has docs; otherwise fall back to what was pulled
+  // from the database, so the Ledger/Tally aren't blank after a fresh reload when
+  // the data lives only in Supabase.
+  const src = (DB.docs && DB.docs.length) ? DB.docs
+    : ((window.misRows && window.misRows.length) ? window.misRows
+    : ((window.reviewPulled && window.reviewPulled.length) ? window.reviewPulled : DB.docs));
+  return src.filter(r => {
     if (v && r.verdict !== v) return false;
     if (st && r.invoice.settlement_status !== st) return false;
     if (!q) return true;
     const i = r.invoice;
     return [i.invoice_no, i.client_raw, i.branch_raw, r.filename].some(x => String(x||'').toLowerCase().includes(q))
-        || r.applicants.some(a => a.applicant_name.toLowerCase().includes(q));
+        || (r.applicants||[]).some(a => (a.applicant_name||'').toLowerCase().includes(q));
   });
 }
 
 function renderLedger(){
   const rows = filtered();
-  $('#ledgerCount').textContent = `${rows.length} of ${DB.docs.length}`;
+  const total = (DB.docs&&DB.docs.length) ? DB.docs.length : ((window.misRows||window.reviewPulled||[]).length || rows.length);
+  $('#ledgerCount').textContent = `${rows.length} of ${total}`;
   const t = $('#ledger');
   t.tHead.innerHTML = '<tr>' + LEDGER_COLS.map(c => `<th>${c[0]}</th>`).join('') + '</tr>';
   if (!rows.length) { t.tBodies[0].innerHTML = `<tr><td colspan="${LEDGER_COLS.length}"><div class="empty"><h3>Nothing here yet</h3><p>Ingest documents to build the ledger.</p></div></td></tr>`; return; }
@@ -4247,7 +4425,10 @@ function renderReport(){
 }
 
 function renderTally(){
-  const D = DB.docs, el = $('#tallyBody');
+  const D = (DB.docs && DB.docs.length) ? DB.docs
+    : ((window.misRows && window.misRows.length) ? window.misRows
+    : ((window.reviewPulled && window.reviewPulled.length) ? window.reviewPulled : DB.docs));
+  const el = $('#tallyBody');
   if (!D.length) { el.innerHTML = '<div class="empty"><h3>Nothing ingested</h3><p>The tally appears once documents are loaded.</p></div>'; return; }
   const S = k => DB.sessions.reduce((a,s)=>a+(s[k]||0),0);
   const filesSeen = S('filesSeen'), readable = S('readable'), dropped = S('skipped'),
@@ -5363,10 +5544,16 @@ window.wireReconcile = wireReconcile;
 
 (async () => {
   await syncFromDatabase(false);
-  // subscribe to live database changes — refreshes silently on any change
+  refreshDashboard();   // initial live-dashboard read
+  // subscribe to live database changes — refreshes silently on any change,
+  // INCLUDING runs happening on other machines/locations. The dashboard meter
+  // updates live from those too.
   if (typeof Cloud !== 'undefined' && Cloud.subscribeRealtime) {
-    Cloud.subscribeRealtime(() => syncFromDatabase(true));
+    Cloud.subscribeRealtime(() => { syncFromDatabase(true); refreshDashboard(); });
   }
+  // periodic safety refresh (every 20s) in case a realtime event is missed, so
+  // the meter never goes stale even if the websocket drops.
+  setInterval(() => { if (document.getElementById('liveDash')) refreshDashboard(); }, 20000);
 })();
 
 $('#cloudClearFiles') && ($('#cloudClearFiles').onclick = async () => {
