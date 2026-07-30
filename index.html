@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='f06acc42f2a5';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='9ce2dd83ced8';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2620,7 +2620,10 @@ const OCR = {
         langPath: this.base, gzip: false, cacheMethod: 'write'
       });
       const workers = await this._withTimeout(Promise.all(Array.from({length:n}, mk)), 120000, 'OCR pool start');
-      this._pool = { workers, n, busy: new Array(n).fill(false) };
+      // busy[i] = false when free; startedAt[i] = when the current bill began;
+      // preempt[i] = a flag the running task checks to bail out cooperatively.
+      this._pool = { workers, n, busy: new Array(n).fill(false),
+        startedAt: new Array(n).fill(0), preempt: new Array(n).fill(false), waiting: 0 };
       log(`OCR ready with ${n} parallel worker${n>1?'s':''}.`, 'dim');
       setOcrStatus('ready');
       return this._pool;
@@ -2628,18 +2631,52 @@ const OCR = {
     return this._poolLoading;
   },
 
-  /* grab a free worker from the pool, run fn, release it */
+  /* Grab a free worker and run fn(worker). No hard timer. If every worker is
+     busy and other bills are waiting past a grace period, preempt the
+     LONGEST-running worker: terminate + replace it, and reject its task (which
+     sends that one bill to Review) so the queue keeps moving. A slow bill that
+     ISN'T blocking anyone is left alone to finish. */
   async _lease(fn){
     const pool = await this.pool();
-    // find a free worker, or wait briefly for one
+    const GRACE_MS = 45000;   // how long a waiting bill tolerates before it preempts the slowest
+    pool.waiting++;
     let idx = -1;
-    while (idx === -1) {
-      idx = pool.busy.indexOf(false);
-      if (idx === -1) await new Promise(r => setTimeout(r, 25));
-    }
-    pool.busy[idx] = true;
-    try { return await fn(pool.workers[idx]); }
-    finally { pool.busy[idx] = false; }
+    const waitStart = Date.now();
+    try {
+      while (idx === -1) {
+        idx = pool.busy.indexOf(false);
+        if (idx !== -1) break;
+        // all busy — if we've waited past the grace period, preempt the worker
+        // that has been busy the longest (only if it's meaningfully old)
+        if (Date.now() - waitStart > GRACE_MS) {
+          let oldest = -1, oldestT = Infinity;
+          for (let i=0;i<pool.n;i++){ if (pool.busy[i] && pool.startedAt[i] < oldestT && !pool.preempt[i]) { oldestT = pool.startedAt[i]; oldest = i; } }
+          if (oldest !== -1 && (Date.now() - oldestT) > GRACE_MS) {
+            pool.preempt[oldest] = true;                 // signal the running task to bail
+            try { await pool.workers[oldest].terminate(); } catch(_){}
+            try { pool.workers[oldest] = await Tesseract.createWorker('eng', 1, {
+              corePath: this.base + '/tesseract-core-lstm.wasm.js', workerPath: this.base + '/worker.min.js',
+              langPath: this.base, gzip: false, cacheMethod: 'write' }); } catch(_){}
+            // the preempted slot becomes free once its task settles; loop will pick it up
+            DIAG && DIAG.warn('ocr', `preempted a long-running bill to free a worker`, { waitedMs: Date.now()-waitStart });
+          }
+        }
+        await new Promise(r => setTimeout(r, 50));
+      }
+    } finally { pool.waiting--; }
+
+    pool.busy[idx] = true; pool.startedAt[idx] = Date.now(); pool.preempt[idx] = false;
+    try {
+      return await fn(pool.workers[idx]);
+    } catch (e) {
+      // task failed or was preempted — make sure this worker is fresh
+      if (pool.preempt[idx]) { e._preempted = true; }
+      else { try { await pool.workers[idx].terminate(); } catch(_){}
+        try { pool.workers[idx] = await Tesseract.createWorker('eng', 1, {
+          corePath: this.base + '/tesseract-core-lstm.wasm.js', workerPath: this.base + '/worker.min.js',
+          langPath: this.base, gzip: false, cacheMethod: 'write' }); } catch(_){} }
+      throw e;
+    } finally { pool.busy[idx] = false; pool.preempt[idx] = false; }
   },
 
   async terminatePool(){
@@ -2721,9 +2758,24 @@ const OCR = {
     // Use the simplest, fastest worker call. Plain recognize (no blocks tree) is
     // ~2x faster and gives us data.words with bounding boxes — enough to place
     // text. One shared worker; a hard timeout guards against any hang.
-    const worker = await this.worker();
+    // Lease a worker from the pool. No strict timer — a slow bill runs to
+    // completion as long as a worker isn't urgently needed. If every worker is
+    // busy AND bills are waiting, the pool preempts the LONGEST-running bill
+    // (sending it to Review) so the queue can't fully stall. This means big
+    // scans that legitimately take 60-260s still finish, instead of being killed.
     const tOcr0 = Date.now();
-    const { data } = await this._withTimeout(worker.recognize(canvas), 25000, 'OCR page');
+    let data;
+    try {
+      data = await this._lease(async (worker) => {
+        const r = await worker.recognize(canvas);
+        return r.data;
+      });
+    } catch (e) {
+      canvas.width = canvas.height = 0;   // free the canvas memory
+      DIAG && DIAG.warn('ocr', `OCR set a bill aside`, { reason: e.message });
+      throw new Error(e && e._preempted ? 'OCR set this bill aside to keep the queue moving — sent to Review.'
+        : 'OCR could not read this bill — sent to Review.');
+    }
     const tOcr = Date.now() - tOcr0;
     if (onDiag) onDiag({ render: tRender, ocr: tOcr });
 
@@ -2967,7 +3019,7 @@ async function ingest(fileList){
       if (it.image) {
         // an image file IS a bill with no text — OCR it right now, one at a
         // time, then drop it. No deferral, no held buffers.
-        if (!ocrReady) { try { await OCR.worker(); ocrReady = true; ocrWarmed = true; } catch(_){} }
+        if (!ocrReady) { try { await OCR.pool(); ocrReady = true; ocrWarmed = true; } catch(_){} }
         try {
           let diag=null;
           const ocrItems = await OCR.ocrImage(it.buf, (d)=>{diag=d;});
@@ -3052,7 +3104,7 @@ async function ingest(fileList){
              pile — so a 2000-image batch can't crash the browser. No held
              buffers, no separate pass. */
           try {
-            if (!ocrWarmed) { try { await OCR.worker(); ocrWarmed = true; } catch(_){} }
+            if (!ocrWarmed) { try { await OCR.pool(); ocrWarmed = true; } catch(_){} }
             const ocrView = await pdfToViewWithOcr(it.buf, it.name);
             const r2 = L.processView(ocrView);
             Object.assign(r.invoice, r2.invoice);
@@ -3202,11 +3254,12 @@ async function runOcrPass(){
   log(`Starting OCR on ${pending.length} image bill(s)…`, 'head');
   setOcrStatus('loading');
 
-  // Warm the worker ONCE, up front, with a clear message and its own timing.
+  // Warm the POOL once, up front (2-4 parallel workers), with clear timing.
   const tWarm = Date.now();
+  let poolN = 1;
   try {
-    await OCR.worker();
-    log(`  OCR engine ready in ${((Date.now()-tWarm)/1000).toFixed(1)}s.`, 'dim');
+    const p = await OCR.pool(); poolN = p.n;
+    log(`  OCR engine ready in ${((Date.now()-tWarm)/1000).toFixed(1)}s — ${poolN} parallel worker${poolN>1?'s':''}.`, 'dim');
   } catch(e){
     ocrPassRunning = false; setOcrStatus('error');
     log(`  OCR engine failed to load: ${e.message}. Check the OCR bucket is public and reachable.`, 'er');
@@ -3216,28 +3269,40 @@ async function runOcrPass(){
   let ok=0, failed=0;
   const total = pending.length;
   const tStart = Date.now();
-  for (let i=0; i<pending.length; i++){
-    const d = pending[i];
-    updateOcrProgress(i+1, total);
+
+  // Process bills through the pool with bounded concurrency: up to poolN bills
+  // OCR at the same time (one per worker). While a slow scan ties up one worker,
+  // the others keep clearing bills — no single bill blocks the queue. Memory
+  // stays bounded because at most poolN buffers are in flight, never thousands.
+  let next = 0, active = 0, done = 0;
+  await new Promise((resolveAll) => {
+    const pump = () => {
+      // launch as many as the pool allows
+      while (active < poolN && next < pending.length) {
+        const d = pending[next++]; active++;
+        processOneOcr(d).then(res => { if (res) ok++; else failed++; })
+          .catch(()=>{ failed++; })
+          .finally(() => { active--; done++; updateOcrProgress(done, total);
+            if (done >= pending.length) resolveAll(); else pump(); });
+      }
+    };
+    pump();
+  });
+
+  async function processOneOcr(d){
     const tFile = Date.now();
     try {
-      let diag = null;
-      let view;
-      // if this bill's buffer was stashed to Storage to save memory, fetch it now
+      let diag = null, view;
       let buf = d._pdfBuf;
-      let fetchedFromStash = false;
-      if (!buf && d._stashPath) {
-        buf = await Cloud.fetchBillFile(d._stashPath);
-        fetchedFromStash = true;
-      }
-      if (!buf) { d._ocrDone = true; failed++; continue; }
+      if (!buf && d._stashPath) buf = await Cloud.fetchBillFile(d._stashPath);
+      if (!buf) { d._ocrDone = true; return false; }
       if (d._isRawImage) {
         const ocrItems = await OCR.ocrImage(buf, (dg)=>{ diag = dg; });
         view = L.buildViewFromPages([{ items: ocrItems }], d.filename);
       } else {
         view = await pdfToViewWithOcr(buf, d.filename, (dg)=>{ diag = dg; });
       }
-      buf = null;   // release immediately after OCR
+      buf = null;
       const r2 = L.processView(view);
       Object.assign(d.invoice, r2.invoice);
       d.applicants = r2.applicants; d.candidates = r2.candidates; d.checks = r2.checks || [];
@@ -3246,24 +3311,22 @@ async function runOcrPass(){
       d.checks.push({ check_id:'C16_ocr_source', status:'FAIL', severity:'warning',
         detail:'Read from an image by OCR — verify the amounts.' });
       if (d.verdict==='PROVEN') d.verdict='UNPROVEN';
-      ok++;
       try { await Cloud.enrichFromMaster(d); await Cloud.pushOne(d); d._pushed = true; } catch(_){}
-      // free this bill's buffer now that it's OCR'd and saved — memory releases
-      // progressively so even 100k image bills never accumulate in RAM
       delete d._pdfBuf; d._hasImagePage = false;
-      // if this bill's file was stashed in Storage for memory, delete it now
       if (d._stashPath) { try { await fetch(`${Cloud.storageUrl}/object/bills/${d._stashPath}`,
         { method:'DELETE', headers:{ 'apikey':Cloud.key, 'Authorization':'Bearer '+Cloud.key } }); } catch(_){} d._stashPath = null; }
-      // show timing for the FIRST few so slowness is visible immediately
-      if (i < 3) log(`  ${d.filename}: ${((Date.now()-tFile)/1000).toFixed(1)}s`
+      if (done < 3) log(`  ${d.filename}: ${((Date.now()-tFile)/1000).toFixed(1)}s`
         + (diag ? ` (render ${diag.render}ms + OCR ${diag.ocr}ms)` : ''), 'dim');
-      // yield to the browser every few bills so the UI stays responsive
-      if (i % 5 === 0) await new Promise(r => setTimeout(r));
+      return true;
     } catch(e){
-      failed++; d._ocrDone = true;
+      d._ocrDone = true;
+      // a bill that timed out or failed: keep it for manual Review rather than lose it
+      try { if (d._pdfBuf || d._stashPath) await Cloud.saveFailedBill(d, 'OCR failed: '+e.message); } catch(_){}
       log(`  ${d.filename} — OCR failed after ${((Date.now()-tFile)/1000).toFixed(1)}s: ${e.message}`, 'er');
+      return false;
     }
   }
+
   const secs = (Date.now()-tStart)/1000;
   ocrPassRunning = false;
   setOcrStatus('ready');
