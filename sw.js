@@ -1,7 +1,7 @@
 /* Lumen service worker.
    Cache-first so the app opens instantly and keeps working with no network.
    The cache name carries the build hash, so a new deploy replaces it cleanly. */
-const CACHE = 'lumen-d6dbc0071947';
+const CACHE = 'lumen-96961356c09c';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', e => {

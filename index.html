@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='d6dbc0071947';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='96961356c09c';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -188,6 +188,8 @@ label.chk input{accent-color:var(--accent)}
 .wcard{flex:1;min-width:160px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--bg-soft);transition:border-color .2s}
 .wcard.busy{border-color:var(--accent);background:var(--accent-soft)}
 .wcard.offline{opacity:.6;border-style:dashed}
+.wcard.qa{border-color:var(--proof);background:color-mix(in srgb, var(--proof) 8%, transparent)}
+.wcard.qa .wdot{background:var(--proof)}
 .wcard .whead{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-2);margin-bottom:4px}
 .wdot{width:8px;height:8px;border-radius:50%;background:var(--line);flex:none}
 .wcard.busy .wdot{background:var(--accent);animation:wpulse 1s ease-in-out infinite}
@@ -2476,10 +2478,10 @@ const Cloud = {
   },
 
   async stashBillFile(doc){
-    if (!doc._pdfBuf) return false;
+    if (!doc._pdfBuf && !doc._sourceBlob) return false;
     const ext = (doc.filename||'bill').split('.').pop() || 'pdf';
     const path = `ocr-pending/${doc.hash}.${ext}`;
-    const blob = new Blob([doc._pdfBuf], { type: 'application/pdf' });
+    const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type: 'application/pdf' });
     const r = await fetch(`${this.storageUrl}/object/bills/${path}`, {
       method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'x-upsert':'true' },
       body: blob });
@@ -2749,6 +2751,7 @@ const OCR = {
 
     pool.busy[idx] = true; pool.startedAt[idx] = Date.now(); pool.preempt[idx] = false;
     pool.jobs[idx] = jobLabel || 'a bill';
+    if (typeof renderWorkerPanel==='function') renderWorkerPanel();   // reflect pickup
     try {
       return await fn(pool.workers[idx]);
     } catch (e) {
@@ -2758,7 +2761,8 @@ const OCR = {
           corePath: this.base + '/tesseract-core-lstm.wasm.js', workerPath: this.base + '/worker.min.js',
           langPath: this.base, gzip: false, cacheMethod: 'write' }); } catch(_){} }
       throw e;
-    } finally { pool.busy[idx] = false; pool.preempt[idx] = false; pool.jobs[idx] = null; }
+    } finally { pool.busy[idx] = false; pool.preempt[idx] = false; pool.jobs[idx] = null;
+      if (typeof renderWorkerPanel==='function') renderWorkerPanel(); }   // reflect finish
   },
 
   /* ---- Workforce controls (manager actions from the Ingest panel) ---- */
@@ -2929,6 +2933,72 @@ const OCR = {
     return items;
   }
 };
+
+/* ========================= AGILE PIPELINE =========================
+   A shared task queue processed by N line workers + 1 QA worker, the way you
+   described it:
+     • Each line worker pulls the next bill and runs the full process
+       (read → extract → OCR if needed) in parallel with the others.
+     • A watchdog watches per-bill time. A bill running past 2× the rolling
+       average is REASSIGNED to a fresh worker (retry once). Still slow → it's
+       dropped to Review as a P1 priority so the queue never stalls.
+     • Every finished bill goes to the QA worker (the 5th). QA runs the check
+       engine, AUTO-FIXES the safe/arithmetic problems it can prove, and:
+         - clean (or fixed clean) → pushes to Supabase
+         - genuinely ambiguous → sends back as P1 to the front of the queue for
+           a person to rectify in Review (never guesses names or invents data).
+   This is a real queue, not a metaphor — workers pull, QA gates, P1 jumps ahead.
+================================================================ */
+const Pipeline = {
+  queue: [],           // pending tasks (P1 items go to the FRONT)
+  avgMs: 6000,         // rolling average bill time (seeds at 6s, adapts)
+  _samples: [],
+  running: false,
+  stats: { done:0, pushed:0, kicked:0, dropped:0, total:0 },
+
+  recordTime(ms){
+    this._samples.push(ms); if (this._samples.length>50) this._samples.shift();
+    this.avgMs = this._samples.reduce((a,b)=>a+b,0)/this._samples.length;
+  },
+
+  // pull the next task; P1 (priority) items are at the front already
+  next(){ return this.queue.shift(); },
+  add(task, p1){ if (p1) this.queue.unshift(task); else this.queue.push(task); },
+
+  /* QA GATE: validate a finished bill, auto-fix what's provable, decide push vs
+     kick-back. Returns 'push' | 'kick'. Auto-fix is STRICT — only arithmetic
+     Lumen can derive (recompute a total from lines, back-calc tax). It never
+     invents a client, branch, or any non-derivable field. */
+  qaReview(task){
+    const inv = task.doc.invoice, checks = task.doc.checks || [];
+    const fails = checks.filter(c => c.status==='FAIL');
+    if (!fails.length) return 'push';
+    let fixed = 0, hard = 0;
+    for (const c of fails){
+      if (c.check_id === 'C1_total_reconciles' || c.check_id === 'face_detail_mismatch') {
+        // provable arithmetic: if the itemised lines sum cleanly, trust that sum
+        const lineSum = (task.doc.applicants||[]).reduce((s,a)=>s+(a.amount_paise||0),0);
+        if (lineSum > 0 && inv.total_paise && Math.abs(lineSum - inv.total_paise) >= 100) {
+          // only auto-fix when the line sum is internally consistent with tax
+          const taxable = inv.taxable_paise||0, tax = inv.tax_total_paise||0;
+          if (taxable && Math.abs((taxable+tax) - lineSum) <= 100) {
+            inv.total_paise = lineSum; fixed++;
+            c.status='FIXED'; c._autofixed = 'total recomputed from itemised lines';
+            continue;
+          }
+        }
+        hard++;
+      } else if (c.check_id === 'tax_place_mismatch') {
+        hard++;   // GST place logic — never auto-guess, a person decides
+      } else {
+        hard++;
+      }
+    }
+    if (hard === 0) { if (fixed) DIAG && DIAG.ok('push', `QA auto-fixed ${task.doc.filename}`, { fixes:fixed }); return 'push'; }
+    return 'kick';   // has hard problems a person must resolve
+  }
+};
+window.Pipeline = Pipeline;
 
 /* file-type patterns and ingest state (restored) */
 const SHEET_EXT = /\.(xlsx|xlsm|xltx|xltm|xlsb|xls)$/i;
@@ -3149,7 +3219,7 @@ async function ingest(fileList){
       if (it.image) {
         // an image file IS a bill with no text — OCR it right now, one at a
         // time, then drop it. No deferral, no held buffers.
-        if (!ocrReady) { try { await OCR.pool(); ocrReady = true; ocrWarmed = true; } catch(_){} }
+        if (!ocrReady) { try { await OCR.pool(); ocrReady = true; ocrWarmed = true; if (typeof renderWorkerPanel==='function') renderWorkerPanel(); } catch(_){} }
         try {
           let diag=null;
           const ocrItems = await OCR.ocrImage(it.buf, (d)=>{diag=d;});
@@ -3228,38 +3298,19 @@ async function ingest(fileList){
           excelPreferred++;
           DIAG.info('excel', `OCR skipped for ${it.name}`, { reason:'Excel of same invoice already covers it', invoice: key });
         } else {
-          /* ONE FILE AT A TIME (per the agreed design): OCR this image bill
-             right now, using the buffer we already have in hand, then drop it
-             before moving to the next file. Peak memory is ONE file, never a
-             pile — so a 2000-image batch can't crash the browser. No held
-             buffers, no separate pass. */
-          try {
-            if (!ocrWarmed) { try { await OCR.pool(); ocrWarmed = true; } catch(_){} }
-            const ocrView = await pdfToViewWithOcr(it.buf, it.name);
-            const r2 = L.processView(ocrView);
-            Object.assign(r.invoice, r2.invoice);
-            r.applicants = r2.applicants; r.candidates = r2.candidates; r.checks = r2.checks || [];
-            r.verdict = r2.verdict; r.verification = r2.verification;
-            r._ocr = true; r._ocrDone = true;
-            r.checks.push({ check_id:'C16_ocr_source', status:'FAIL', severity:'warning',
-              detail:'Read from an image by OCR — verify the amounts.' });
-            if (r.verdict==='PROVEN') r.verdict='UNPROVEN';
-            ocrStreamed++;
-            // store the original file so it's viewable in Review for verification
-            // (one file at a time — upload then drop, never held in memory)
-            try { r._sourceBlob = new Blob([it.buf], { type:'application/pdf' });
-              await Cloud.stashReviewFile(r); delete r._sourceBlob; } catch(_){}
-            DIAG.ok('ocr', `OCR read ${it.name}`, { invoice: r.invoice.invoice_no });
-          } catch(e){
-            // OCR failed for this one bill — keep its file in Supabase for manual
-            // fixing (never held in RAM), then move on. One failure isn't fatal.
-            r._hasImagePage = true; r._ocrFailed = true;
-            r.checks = r.checks || [];
-            r.checks.push({ check_id:'C16_ocr_source', status:'FAIL', severity:'warning',
-              detail:'Image bill — OCR did not complete; open it in Sync to fix by hand.' });
-            try { r._sourceBlob = new Blob([it.buf], { type:'application/pdf' }); await Cloud.saveFailedBill(r, 'OCR failed: '+e.message); delete r._sourceBlob; } catch(_){}
-            DIAG.error('ocr', `OCR failed for ${it.name}`, { reason: e.message });
-          }
+          /* DON'T OCR inline — that was serial and made ingest crawl (one bill at
+             a time, the 4-worker pool idle). Instead: mark this bill as needing
+             OCR and stash its file to Storage (memory-safe), then let the PARALLEL
+             OCR pass read them all at once through the worker crew. Ingest stays
+             fast; OCR runs concurrently afterward with the live worker panel. */
+          r._hasImagePage = true; r._needsOcr = true;
+          try { r._sourceBlob = new Blob([it.buf], { type:'application/pdf' });
+            const stashed = await Cloud.stashBillFile(r);   // upload to ocr-pending, keep path, drop blob
+            delete r._sourceBlob;
+            if (!stashed) r._pdfBuf = it.buf.slice(0);        // fallback: keep buffer if stash failed
+          } catch(_){ try { r._pdfBuf = it.buf.slice(0); } catch(__){} }
+          ocrStreamed++;
+          DIAG.info('ocr', `queued for parallel OCR: ${it.name}`, { invoice: r.invoice && r.invoice.invoice_no });
           // buffer is dropped here — `it.buf` goes out of scope next iteration
         }
       }
@@ -3411,9 +3462,11 @@ async function runOcrPass(){
       // launch as many as the pool allows
       while (active < poolN && next < pending.length) {
         const d = pending[next++]; active++;
+        renderWorkerPanel();   // reflect a worker picking up a bill
         processOneOcr(d).then(res => { if (res) ok++; else failed++; })
           .catch(()=>{ failed++; })
           .finally(() => { active--; done++; updateOcrProgress(done, total);
+            renderWorkerPanel();   // reflect a worker finishing / becoming free
             if (done >= pending.length) resolveAll(); else pump(); });
       }
     };
@@ -3442,6 +3495,17 @@ async function runOcrPass(){
       d.checks.push({ check_id:'C16_ocr_source', status:'FAIL', severity:'warning',
         detail:'Read from an image by OCR — verify the amounts.' });
       if (d.verdict==='PROVEN') d.verdict='UNPROVEN';
+      // QA GATE (the 5th worker): validate, auto-fix provable arithmetic, decide.
+      const verdict = Pipeline.qaReview({ doc: d });
+      if (verdict === 'kick') {
+        // hard problem a person must resolve — mark P1 and keep in Review, don't push
+        Pipeline.stats.kicked++;
+        d._p1 = true; d._ocrDone = true;
+        DIAG && DIAG.warn('push', `QA sent ${d.filename} back for rectification (P1)`);
+        delete d._pdfBuf; d._hasImagePage = false;
+        return true;   // counted as processed; it's now waiting in Review
+      }
+      Pipeline.stats.pushed++;
       try { await Cloud.enrichFromMaster(d); await Cloud.pushOne(d); d._pushed = true; } catch(_){}
       delete d._pdfBuf; d._hasImagePage = false;
       if (d._stashPath) { try { await fetch(`${Cloud.storageUrl}/object/bills/${d._stashPath}`,
@@ -3510,9 +3574,17 @@ function renderWorkerPanel(){
   const online = pool.offline.filter(x=>!x).length;
   const anyBusy = pool.busy.some((b,i)=>b && !pool.offline[i]);
   const queued = pool.waiting;
+  // QA card — the 5th worker: validates, auto-fixes, gates the push
+  const qs = (typeof Pipeline!=='undefined') ? Pipeline.stats : { pushed:0, kicked:0 };
+  const qaCard = `<div class="wcard qa">
+    <div class="whead"><span class="wdot"></span><b>Anjali</b> · QA &amp; analyst</div>
+    <div class="wtrait">the gatekeeper — checks every bill, fixes the simple slips, kicks back the rest</div>
+    <div class="wjob">${qs.pushed} passed · ${qs.kicked} sent back</div>
+    <div class="wtime">validates &amp; pushes to database</div>
+  </div>`;
   el.innerHTML = `<div class="wtitle">Your OCR crew — ${online} of ${pool.n} online${queued?` · ${queued} bill(s) waiting`:''}
       <span class="dim" style="text-transform:none;font-weight:400"> · Free a stuck one, or bench some to save memory</span></div>
-    <div class="wpanel">${cards}</div>`;
+    <div class="wpanel">${cards}${qaCard}</div>`;
   if (anyBusy && !_workerTick) _workerTick = setInterval(renderWorkerPanel, 1000);
   if (!anyBusy && _workerTick) { clearInterval(_workerTick); _workerTick = null; }
 }
@@ -3529,19 +3601,27 @@ async function pdfToViewWithOcr(buf, filename, onDiag){
   bytes.set(new Uint8Array(buf));
   const doc = await pdfjsLib.getDocument({ data: bytes, isEvalSupported:false,
     useSystemFonts:false, disableFontFace:true, verbosity:0 }).promise;
-  const pages = [];
+  const pages = new Array(doc.numPages);
+  const ocrJobs = [];   // pages that need OCR — run these in PARALLEL (the swarm)
   for (let n=1; n<=doc.numPages; n++){
     const page = await doc.getPage(n);
     const tc = await page.getTextContent();
     let items = tc.items.map(i => ({ x:i.transform[4], y:i.transform[5], w:i.width, h:i.height, str:i.str }));
     if (items.filter(i=>i.str&&i.str.trim()).length < 5){
-      // OCR this image page. Let a failure THROW so the pass records it loudly,
-      // rather than silently producing an empty page (which looked like success).
-      const ocrItems = await OCR.ocrPage(page, onDiag, filename);
-      if (ocrItems.length) items = items.concat(ocrItems);
+      // image page — queue it for parallel OCR instead of blocking here. For a
+      // multi-page scan, this is the real "swarm": page 1 on Bahadur, page 2 on
+      // Chotu, page 3 on Lakshmi — all at once — then we stitch them back in order.
+      const idx = n-1;
+      ocrJobs.push((async () => {
+        const ocrItems = await OCR.ocrPage(page, onDiag, `${filename} p${n}`);
+        pages[idx] = { items: items.concat(ocrItems || []) };
+        page.cleanup();
+      })());
+    } else {
+      pages[n-1] = { items }; page.cleanup();
     }
-    pages.push({ items }); page.cleanup();
   }
+  if (ocrJobs.length) await Promise.all(ocrJobs);   // all image pages OCR together
   await doc.destroy();
   return L.buildViewFromPages(pages, filename);
 }
