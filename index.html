@@ -9,16 +9,15 @@
   style-src 'unsafe-inline';
   img-src 'self' data: blob:;
   font-src 'self';
-  connect-src 'self' http://127.0.0.1:8420 http://localhost:8420 https://czdjbbhxboweawqbjywr.supabase.co;
+  connect-src 'self' http://127.0.0.1:8420 http://localhost:8420 https://czdjbbhxboweawqbjywr.supabase.co wss://czdjbbhxboweawqbjywr.supabase.co;
   worker-src 'self' blob:;
   manifest-src 'self';
-  frame-ancestors 'none';
   form-action 'none';
   base-uri 'none';">
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='96961356c09c';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='d6e7249bc8b6';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2973,29 +2972,30 @@ const Pipeline = {
     const inv = task.doc.invoice, checks = task.doc.checks || [];
     const fails = checks.filter(c => c.status==='FAIL');
     if (!fails.length) return 'push';
-    let fixed = 0, hard = 0;
+    // Auto-fix provable arithmetic first (safe, deterministic)
     for (const c of fails){
       if (c.check_id === 'C1_total_reconciles' || c.check_id === 'face_detail_mismatch') {
-        // provable arithmetic: if the itemised lines sum cleanly, trust that sum
         const lineSum = (task.doc.applicants||[]).reduce((s,a)=>s+(a.amount_paise||0),0);
         if (lineSum > 0 && inv.total_paise && Math.abs(lineSum - inv.total_paise) >= 100) {
-          // only auto-fix when the line sum is internally consistent with tax
           const taxable = inv.taxable_paise||0, tax = inv.tax_total_paise||0;
           if (taxable && Math.abs((taxable+tax) - lineSum) <= 100) {
-            inv.total_paise = lineSum; fixed++;
-            c.status='FIXED'; c._autofixed = 'total recomputed from itemised lines';
-            continue;
+            inv.total_paise = lineSum; c.status='FIXED'; c._autofixed = 'total recomputed from itemised lines';
           }
         }
-        hard++;
-      } else if (c.check_id === 'tax_place_mismatch') {
-        hard++;   // GST place logic — never auto-guess, a person decides
-      } else {
-        hard++;
       }
     }
-    if (hard === 0) { if (fixed) DIAG && DIAG.ok('push', `QA auto-fixed ${task.doc.filename}`, { fixes:fixed }); return 'push'; }
-    return 'kick';   // has hard problems a person must resolve
+    // Decide push vs kick. IMPORTANT: a bill that is READABLE (has an invoice
+    // number and a total) still goes to the invoices table WITH its checks — so
+    // it counts in the Report AND shows in Review for a person to verify. Only a
+    // genuinely UNUSABLE bill (missing the identity/amount that make it a record
+    // at all) is kicked to failed_uploads. This preserves MIS totals: flagged
+    // bills are not lost from the main table.
+    const stillFailing = checks.filter(c => c.status==='FAIL');
+    const unusable = stillFailing.some(c =>
+      c.check_id === 'C9_mandatory_fields' || c.check_id === 'FAILED_UPLOAD')
+      || (!inv.invoice_no) || (inv.total_paise == null);
+    if (unusable) return 'kick';   // can't be a proper record — send to Review as P1
+    return 'push';                 // readable but flagged — store it, flag stays for Review
   }
 };
 window.Pipeline = Pipeline;
@@ -3153,6 +3153,16 @@ async function ingest(fileList){
   const t0 = performance.now();
   log(`Scanning ${fileList.length} item(s)…`, 'dim');
 
+  // Show the crew IMMEDIATELY — the moment Start is clicked — so the panel is
+  // there through scanning, not only once processing begins. During the scan
+  // phase the crew is "opening the files"; it flips to per-bill work right after.
+  const _scanCrew = OCR.poolSize();
+  window.__procCrew = { n: _scanCrew, busy: new Array(_scanCrew).fill(true),
+    startedAt: new Array(_scanCrew).fill(Date.now()), jobs: new Array(_scanCrew).fill('opening & scanning your files…'),
+    offline: new Array(_scanCrew).fill(false), freed: new Array(_scanCrew).fill(0),
+    done: 0, total: fileList.length, _scanning: true };
+  if (typeof renderWorkerPanel==='function') renderWorkerPanel();
+
   const acc = await collect([...fileList].map(f => ({
     name: f.name, path: f.webkitRelativePath || f.name, read: () => f.arrayBuffer()
   })), 0);
@@ -3170,6 +3180,7 @@ async function ingest(fileList){
     });
     if (!acc.skipped.length) log('  The drop contained no files.', 'dim');
     busy = false;
+    window.__procCrew = null; if (typeof renderWorkerPanel==='function') renderWorkerPanel();
     if (ingestQueue.length) { const next = ingestQueue.shift(); setTimeout(() => ingest(next), 50); }
     return;
   }
@@ -3208,56 +3219,71 @@ async function ingest(fileList){
      "OCR working…" hang before the batch could even start). */
   let ocrReady = false, ocrWarmed = false;
 
-  for (const it of ordered) {
+  /* ---- WORKER-DRIVEN INGEST ----
+     The full process (read → extract → OCR-queue → push) now runs through a
+     crew of line workers pulling from a shared queue, in parallel — not one bill
+     at a time. Each worker logs its stages to the diagnostic with its name, so
+     the log shows exactly who handled what and how long each step took. The live
+     worker panel reflects this real work from the moment processing starts. */
+  const CREW = OCR.poolSize();          // line workers = same sizing as the OCR pool
+  // a lightweight process-crew state for the panel (separate from the OCR pool,
+  // which handles just the OCR sub-step within a bill)
+  window.__procCrew = { n: CREW, busy: new Array(CREW).fill(false),
+    startedAt: new Array(CREW).fill(0), jobs: new Array(CREW).fill(null),
+    offline: new Array(CREW).fill(false), freed: new Array(CREW).fill(0),
+    done: 0, total: ordered.length };
+  renderWorkerPanel();                  // show the crew immediately at process start
+
+  let cursor = 0;
+  async function processItem(it, wid){
+    const wname = OCR.workerName(wid);
+    const tItem = Date.now();
+    const stage = (name, extra) => { if (typeof DIAG!=='undefined') DIAG.info('worker', `${wname}: ${name} — ${it.name}`, extra||{}); };
     try {
+      const tHash = Date.now();
       const hash = await sha256(it.buf);
-      DIAG.info('ingest', `processing: ${it.name}`, { type: it.image?'image':(it.pdf?'pdf':(it.csv?'csv':'excel')), bytes: it.buf.byteLength });
-      if (DB.hashes.has(hash)) { dupes++; done++;
-        DIAG.info('skip', `duplicate skipped: ${it.name}`, { reason:'content hash already ingested', hash: hash.slice(0,16) });
-        continue; }
+      DIAG.info('ingest', `${wname} processing: ${it.name}`, { worker:wid, type: it.image?'image':(it.pdf?'pdf':(it.csv?'csv':'excel')), bytes: it.buf.byteLength });
+      if (DB.hashes.has(hash)) { dupes++; 
+        DIAG.info('skip', `${wname}: duplicate skipped: ${it.name}`, { reason:'content hash already ingested', hash: hash.slice(0,16) });
+        return; }
       let view;
       if (it.image) {
-        // an image file IS a bill with no text — OCR it right now, one at a
-        // time, then drop it. No deferral, no held buffers.
-        if (!ocrReady) { try { await OCR.pool(); ocrReady = true; ocrWarmed = true; if (typeof renderWorkerPanel==='function') renderWorkerPanel(); } catch(_){} }
+        if (!ocrReady) { try { await OCR.pool(); ocrReady = true; ocrWarmed = true; } catch(_){} }
         try {
-          let diag=null;
+          let diag=null; const tOcr = Date.now();
           const ocrItems = await OCR.ocrImage(it.buf, (d)=>{diag=d;});
           view = L.buildViewFromPages([{ items: ocrItems }], it.name);
           view._ocrUsed = true; view.metadata = view.metadata || {}; view.metadata.hasImagePage = true;
-          DIAG.ok('ocr', `OCR read image ${it.name}`, diag);
+          DIAG.ok('worker', `${wname}: OCR read image ${it.name} in ${((Date.now()-tOcr)/1000).toFixed(1)}s`, { worker:wid });
         } catch(e){
-          done++;
-          DIAG.error('ocr', `image OCR failed: ${it.name}`, { reason: e.message });
+          DIAG.error('worker', `${wname}: image OCR failed: ${it.name}`, { worker:wid, reason: e.message });
           log(`${it.name} — image, OCR failed: ${e.message}`, 'er');
-          continue;
+          return;
         }
       } else if (it.pdf) {
+        const tRead = Date.now();
         view = await pdfToView(it.buf, it.name);
+        stage('read PDF', { worker:wid, ms: Date.now()-tRead });
         if (view.metadata.isScanned && !view._ocrUsed) {
-          scans++; done++;
-          DIAG.error('ocr', `image PDF unreadable: ${it.name}`, { reason:'no text layer and OCR did not recover it' });
+          scans++;
+          DIAG.error('worker', `${wname}: image PDF unreadable: ${it.name}`, { worker:wid, reason:'no text layer and OCR did not recover it' });
           log(`${it.name} — scanned image and OCR could not read it`, 'wn');
-          continue;
+          return;
         }
       } else if (it.csv) {
         view = L.viewFromWorkbook(XLSX.read(new TextDecoder().decode(it.buf), { type: 'string' }), it.name, XLSX);
       } else {
-        // These read options are NOT optional. Without sheetStubs, uncached
-        // formula cells vanish; with it they arrive carrying a fabricated zero.
-        // Both are handled in lumen-core Evaluator.cell().
         view = L.viewFromWorkbook(
           XLSX.read(new Uint8Array(it.buf), { type:'array', cellFormula:true, sheetStubs:true, cellDates:true }),
           it.name, XLSX);
       }
+      const tExtract = Date.now();
       const r = L.processView(view);
+      stage('extract', { worker:wid, ms: Date.now()-tExtract });
       r.hash = hash; r.path = it.path; r.sessionId = session.id;
-      // attach who uploaded and for which location (from the Start popup) so the
-      // Report can filter by uploader/location later
       if (window.__runMeta) { r._uploader = window.__runMeta.uploader; r._uploadLocation = window.__runMeta.location; }
-      r._fromPdf = !!it.pdf;
+      r._fromPdf = !!it.pdf; r._byWorker = wname;
 
-      /* record what was extracted, and WHY anything is missing/zero */
       const iv = r.invoice;
       const missing = [];
       if (!iv.invoice_no) missing.push('invoice_no');
@@ -3267,94 +3293,114 @@ async function ingest(fileList){
       if (iv.taxable_paise == null || iv.taxable_paise === 0) missing.push('taxable');
       const rowCount = ((r.candidates && r.candidates._applicant_rows||[])[0]||{}).normalized?.length || 0;
       if (missing.length) {
-        // explain the likely cause
         let reason = 'fields not found by extractor';
         if (it.pdf && view.metadata && view.metadata.hasImagePage) reason = 'page is an image — needs OCR';
         else if (rowCount === 0) reason = 'no applicant/detail rows read from annexure';
         else if (missing.includes('total')) reason = 'total/amount column not matched in this layout';
-        DIAG.warn('value', `missing/zero fields in ${it.name}: ${missing.join(', ')}`, {
-          reason, invoice_no: iv.invoice_no||null, rows_read: rowCount,
+        DIAG.warn('value', `${wname}: missing/zero fields in ${it.name}: ${missing.join(', ')}`, {
+          worker:wid, reason, invoice_no: iv.invoice_no||null, rows_read: rowCount,
           taxable: iv.taxable_paise, total: iv.total_paise, format: it.pdf?'pdf':'excel' });
       } else {
-        DIAG.ok('extract', `read OK: ${it.name}`, { invoice_no: iv.invoice_no, total: iv.total_paise, rows: rowCount });
+        DIAG.ok('extract', `${wname}: read OK: ${it.name}`, { worker:wid, invoice_no: iv.invoice_no, total: iv.total_paise, rows: rowCount });
       }
 
-      /* If this is an Excel (or other non-PDF), register the bill it covers so a
-         matching PDF later can skip OCR. */
       if (!it.pdf) {
         const k = invNoKey(r.invoice && r.invoice.invoice_no) || invNoFromName(it.name);
         if (k) excelCovered.add(k);
       }
 
       if (view._hasImagePage) {
-        /* SPEED WIN: this PDF has an image page that would need OCR. But if an
-           Excel already covered this same bill, the clean data is already in —
-           so we DON'T OCR. We keep the PDF as a record, marked as covered, and
-           skip the slow path entirely. Match by invoice number from the read
-           data, falling back to the filename. */
         const key = invNoKey(r.invoice && r.invoice.invoice_no) || invNoFromName(it.name);
         if (key && excelCovered.has(key)) {
-          r._ocrCoveredByExcel = true;      // record, but no OCR needed
-          excelPreferred++;
-          DIAG.info('excel', `OCR skipped for ${it.name}`, { reason:'Excel of same invoice already covers it', invoice: key });
+          r._ocrCoveredByExcel = true; excelPreferred++;
+          DIAG.info('excel', `${wname}: OCR skipped for ${it.name}`, { worker:wid, reason:'Excel of same invoice already covers it', invoice: key });
         } else {
-          /* DON'T OCR inline — that was serial and made ingest crawl (one bill at
-             a time, the 4-worker pool idle). Instead: mark this bill as needing
-             OCR and stash its file to Storage (memory-safe), then let the PARALLEL
-             OCR pass read them all at once through the worker crew. Ingest stays
-             fast; OCR runs concurrently afterward with the live worker panel. */
           r._hasImagePage = true; r._needsOcr = true;
           try { r._sourceBlob = new Blob([it.buf], { type:'application/pdf' });
-            const stashed = await Cloud.stashBillFile(r);   // upload to ocr-pending, keep path, drop blob
+            const stashed = await Cloud.stashBillFile(r);
             delete r._sourceBlob;
-            if (!stashed) r._pdfBuf = it.buf.slice(0);        // fallback: keep buffer if stash failed
+            if (!stashed) r._pdfBuf = it.buf.slice(0);
           } catch(_){ try { r._pdfBuf = it.buf.slice(0); } catch(__){} }
           ocrStreamed++;
-          DIAG.info('ocr', `queued for parallel OCR: ${it.name}`, { invoice: r.invoice && r.invoice.invoice_no });
-          // buffer is dropped here — `it.buf` goes out of scope next iteration
+          DIAG.info('ocr', `${wname}: queued for parallel OCR: ${it.name}`, { worker:wid, invoice: r.invoice && r.invoice.invoice_no });
         }
       }
-      if (false) {  // (deferred-image path retired — images OCR inline below)
-        r._hasImagePage = true; r._fromImage = true;
-      } else if (view._ocrUsed || it.image) {
+      if (view._ocrUsed || it.image) {
         r._ocr = true; if (it.image) r._fromImage = true;
-        // record an explicit check so it surfaces in Review as needing verification
         r.checks = r.checks || [];
         r.checks.push({ check_id: 'C16_ocr_source', status: 'FAIL', severity: 'warning',
           detail: 'Some of this bill was read from an image by OCR — the amounts especially need checking.' });
         if (r.verdict === 'PROVEN') r.verdict = 'UNPROVEN';
       }
-      // keep the original bytes for "view the bill" ONLY on small batches
-      // (holding thousands of blobs would exhaust memory)
       if (!BIG_BATCH) { try { r._sourceBlob = new Blob([it.buf], { type: it.pdf ? 'application/pdf' : 'application/octet-stream' }); } catch(_){} }
       DB.docs.push(r); DB.hashes.add(hash); session.count++;
-    } catch (e) { failed++; log(`${it.name} — ${e.message}`, 'er'); }
-    done++;
-    // progress + yield to the browser so the tab never appears frozen
-    if (done % 3 === 0 || done === items.length) {
-      $('#prog').style.width = (done/items.length*100)+'%';
-      updateOcrProgress(done, items.length);
-      await new Promise(r => setTimeout(r));
-    }
-    // BIG BATCH: push this doc to the database as we go, then drop its heavy
-    // fields so memory is released instead of accumulating across thousands.
-    if (BIG_BATCH && DB.docs.length) {
-      const justAdded = DB.docs[DB.docs.length - 1];
-      if (justAdded && !justAdded._pushed) {
-        try { await Cloud.enrichFromMaster(justAdded); await Cloud.pushOne(justAdded); justAdded._pushed = true; pushedCount++;
-          DIAG.info('push', `saved: ${justAdded.filename}`, { invoice: justAdded.invoice.invoice_no }); }
-        catch(e){ DIAG.error('push', `save failed: ${justAdded.filename}`, { reason: e.message });
-          // keep the failed bill (with its original file) for manual fixing
-          try { await Cloud.saveFailedBill(justAdded, e.message); justAdded._savedAsFailed = true; } catch(_){}
-        }
-        // free heavy per-file memory now that it's stored — BUT keep the PDF
-        // buffer for image bills, which the OCR pass needs to read them.
-        if (!justAdded._hasImagePage) { delete justAdded._pdfBuf; }
-        delete justAdded._sourceBlob;
-        if (justAdded.candidates && !justAdded._hasImagePage) justAdded.candidates = {};   // drop bulky candidate trees (keep for image bills)
+
+      // push to the database as we go (every bill — the DB is the backing store).
+      // QA validates before the push happens inside pushWithQA.
+      if (!r._pushed) {
+        const tPush = Date.now();
+        const outcome = await pushWithQA(r, wname, wid);
+        stage(outcome==='pushed'?'QA passed → saved':(outcome==='kicked'?'QA sent back (P1)':'save issue'), { worker:wid, ms: Date.now()-tPush });
       }
+      // free heavy memory now that it's stored (keep buffer for image bills the OCR pass needs)
+      if (!r._hasImagePage) { delete r._pdfBuf; }
+      if (BIG_BATCH) { delete r._sourceBlob; if (r.candidates && !r._hasImagePage) r.candidates = {}; }
+    } catch (e) { failed++; DIAG.error('worker', `${wname}: failed on ${it.name}`, { worker:wid, reason:e.message }); log(`${it.name} — ${e.message}`, 'er'); }
+    finally {
+      DIAG.info('worker', `${wname}: finished ${it.name} in ${((Date.now()-tItem)/1000).toFixed(1)}s`, { worker:wid });
     }
   }
+
+  // QA gate + push, shared by the workers. Validates via the check engine,
+  // auto-fixes provable arithmetic, pushes clean bills, and persists faulty ones
+  // to failed_uploads (so nothing is lost — the integrity guarantee).
+  async function pushWithQA(r, wname, wid){
+    const verdict = (typeof Pipeline!=='undefined') ? Pipeline.qaReview({ doc: r }) : 'push';
+    if (verdict === 'kick') {
+      Pipeline.stats.kicked++;
+      r._p1 = true;
+      try {
+        const reason = 'QA flagged for rectification (P1): ' + (r.checks||[]).filter(c=>c.status==='FAIL').map(c=>c.check_id).join(', ');
+        await Cloud.saveFailedBill(r, reason);
+        DIAG.warn('push', `${wname}: QA sent ${r.filename} back for rectification (P1) — saved to database`, { worker:wid });
+      } catch(e){ DIAG.error('push', `${wname}: QA kick but could NOT save ${r.filename}`, { worker:wid, reason:e.message }); }
+      return 'kicked';
+    }
+    if (typeof Pipeline!=='undefined') Pipeline.stats.pushed++;
+    try { await Cloud.enrichFromMaster(r); await Cloud.pushOne(r); r._pushed = true; pushedCount++;
+      DIAG.info('push', `${wname}: saved ${r.filename}`, { worker:wid, invoice: r.invoice.invoice_no });
+      return 'pushed';
+    } catch(e){
+      DIAG.error('push', `${wname}: save failed ${r.filename}`, { worker:wid, reason:e.message });
+      try { await Cloud.saveFailedBill(r, e.message); r._savedAsFailed = true; } catch(_){}
+      return 'saveissue';
+    }
+  }
+
+  // The crew: CREW workers pull the next item from the shared queue until empty.
+  async function lineWorker(wid){
+    const crew = window.__procCrew;
+    while (cursor < ordered.length){
+      if (crew.offline[wid]) { await new Promise(r=>setTimeout(r,100)); continue; }  // benched: idle
+      const myIndex = cursor++;
+      const it = ordered[myIndex];
+      crew.busy[wid] = true; crew.startedAt[wid] = Date.now(); crew.jobs[wid] = it.name;
+      renderWorkerPanel();
+      await processItem(it, wid);
+      crew.busy[wid] = false; crew.jobs[wid] = null; crew.done++; done++;
+      if (done % 3 === 0 || done === ordered.length) {
+        $('#prog').style.width = (done/ordered.length*100)+'%';
+        updateOcrProgress(done, ordered.length);
+        renderWorkerPanel();
+        await new Promise(r => setTimeout(r));
+      }
+    }
+    crew.busy[wid] = false; crew.jobs[wid] = null; renderWorkerPanel();
+  }
+
+  DIAG.ok('ingest', `starting ${ordered.length} bill(s) across ${CREW} line workers`, { crew: CREW });
+  await Promise.all(Array.from({length: CREW}, (_, wid) => lineWorker(wid)));
+  window.__procCrew = null;   // process crew done; OCR pass (if any) shows its own
   if (typeof updateOcrProgress==='function') updateOcrProgress(0,0);
   session.dupes = dupes; session.failed = failed; session.scans = scans;
   DB.sessions.push(session);
@@ -3498,12 +3544,19 @@ async function runOcrPass(){
       // QA GATE (the 5th worker): validate, auto-fix provable arithmetic, decide.
       const verdict = Pipeline.qaReview({ doc: d });
       if (verdict === 'kick') {
-        // hard problem a person must resolve — mark P1 and keep in Review, don't push
+        // A hard problem a person must resolve. Do NOT push clean data, but the
+        // bill must NOT be lost — persist it to failed_uploads (with its file) so
+        // it survives refresh AND is pulled back into Review from the database.
         Pipeline.stats.kicked++;
         d._p1 = true; d._ocrDone = true;
-        DIAG && DIAG.warn('push', `QA sent ${d.filename} back for rectification (P1)`);
+        try {
+          const reason = 'QA flagged for rectification (P1): ' +
+            (d.checks||[]).filter(c=>c.status==='FAIL').map(c=>c.check_id).join(', ');
+          await Cloud.saveFailedBill(d, reason);
+          DIAG && DIAG.warn('push', `QA sent ${d.filename} back for rectification (P1) — saved to database`);
+        } catch(e){ DIAG && DIAG.error('push', `QA kick but could NOT save ${d.filename}`, { reason:e.message }); }
         delete d._pdfBuf; d._hasImagePage = false;
-        return true;   // counted as processed; it's now waiting in Review
+        return true;   // processed; now persisted and waiting in Review
       }
       Pipeline.stats.pushed++;
       try { await Cloud.enrichFromMaster(d); await Cloud.pushOne(d); d._pushed = true; } catch(_){}
@@ -3549,10 +3602,15 @@ window.runOcrPass = runOcrPass;
 let _workerTick = null;
 function renderWorkerPanel(){
   const el = document.getElementById('workerPanel'); if (!el) return;
-  const pool = (typeof OCR!=='undefined') && OCR._pool;
+  // Prefer the PROCESS crew (full-pipeline workers) while ingest is running;
+  // fall back to the OCR pool when only OCR is active. Both share the same shape.
+  const pool = (typeof window.__procCrew!=='undefined' && window.__procCrew)
+    ? window.__procCrew
+    : ((typeof OCR!=='undefined') && OCR._pool);
   if (!pool) { el.innerHTML = ''; if (_workerTick){ clearInterval(_workerTick); _workerTick=null; } return; }
+  const isProc = pool === window.__procCrew;
   const now = Date.now();
-  const cards = pool.workers.map((_, i) => {
+  const cards = Array.from({length: pool.n}, (_, i) => {
     const offline = pool.offline[i];
     const busy = pool.busy[i] && !offline;
     const secs = busy && pool.startedAt[i] ? ((now - pool.startedAt[i])/1000).toFixed(0) : null;
@@ -3573,7 +3631,8 @@ function renderWorkerPanel(){
   }).join('');
   const online = pool.offline.filter(x=>!x).length;
   const anyBusy = pool.busy.some((b,i)=>b && !pool.offline[i]);
-  const queued = pool.waiting;
+  const queued = pool.waiting || 0;
+  const progress = isProc ? ` · ${pool.done||0} of ${pool.total||0} done` : '';
   // QA card — the 5th worker: validates, auto-fixes, gates the push
   const qs = (typeof Pipeline!=='undefined') ? Pipeline.stats : { pushed:0, kicked:0 };
   const qaCard = `<div class="wcard qa">
@@ -3582,7 +3641,8 @@ function renderWorkerPanel(){
     <div class="wjob">${qs.pushed} passed · ${qs.kicked} sent back</div>
     <div class="wtime">validates &amp; pushes to database</div>
   </div>`;
-  el.innerHTML = `<div class="wtitle">Your OCR crew — ${online} of ${pool.n} online${queued?` · ${queued} bill(s) waiting`:''}
+  const crewLabel = isProc ? 'Your processing crew' : 'Your OCR crew';
+  el.innerHTML = `<div class="wtitle">${crewLabel} — ${online} of ${pool.n} online${progress}${queued?` · ${queued} waiting`:''}
       <span class="dim" style="text-transform:none;font-weight:400"> · Free a stuck one, or bench some to save memory</span></div>
     <div class="wpanel">${cards}${qaCard}</div>`;
   if (anyBusy && !_workerTick) _workerTick = setInterval(renderWorkerPanel, 1000);
