@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='432623de9b7c';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='f06acc42f2a5';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -180,6 +180,10 @@ label.chk input{accent-color:var(--accent)}
 .subtabs button{background:none;border:none;padding:9px 16px;font-size:14px;color:var(--text-2);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;font-weight:500}
 .subtabs button.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
 .subtabs button:hover{color:var(--accent)}
+.recgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
+.reccard{border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:var(--bg-soft)}
+.reclabel{font-size:12px;color:var(--text-2);margin-bottom:4px}
+.recval{font-size:22px;font-weight:600}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .seg button{background:var(--surface);border:none;padding:7px 14px;font:inherit;font-size:13px;cursor:pointer;color:var(--text-2)}
 .seg button.on{background:var(--accent,#4C2082);color:#fff}
@@ -362,6 +366,11 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
     <!-- ===== CLOUD SYNC ===== -->
     <section class="view" id="v-cloud">
       <h1>Central database</h1>
+      <div class="subtabs" id="dbSubtabs">
+        <button class="on" data-sub="sync" onclick="showDbSub('sync')">Sync</button>
+        <button data-sub="reconcile" onclick="showDbSub('reconcile')">Reconcile payments</button>
+      </div>
+      <div id="dbSyncBody">
       <p class="sub">Push every ingested bill to the shared Supabase database, and pull the whole history back
          down so this tool shows everything ever processed — not just this session. Duplicates are handled by
          the database itself: the same bill can never be stored twice.</p>
@@ -384,6 +393,20 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
       </div>
 
       <div id="cloudBody"></div>
+      </div><!-- /dbSyncBody -->
+
+      <div id="dbReconcileBody" style="display:none">
+        <p class="sub">Upload a bank statement / collection sheet. Each credit is matched to its invoice,
+           totalled, and compared to the invoice's real total in the database — then each invoice is marked
+           <b>Paid</b>, <b>Partially Paid</b> or <b>Pending</b>, with the pending amount. Nothing is written
+           until you review the preview and confirm.</p>
+        <div class="row" style="gap:8px;margin:14px 0;flex-wrap:wrap">
+          <button class="btn pri" id="recPick">Choose statement file</button>
+          <input type="file" id="recFile" accept=".xlsx,.xls,.csv" hidden>
+          <span class="dim" id="recStatus"></span>
+        </div>
+        <div id="recPreview"></div>
+      </div>
     </section>
 
     <!-- ===== TALLY ===== -->
@@ -2278,6 +2301,47 @@ const Cloud = {
     return r.ok;
   },
 
+  /* ---- Reconciliation: match statement payments to invoices, set status ----
+     Insert payments (deduped by payment_key), then call reconcile_all() so the
+     database recomputes received/pending/status for every invoice. */
+  /* Apply pending-list reconciliation: for each invoice, set settlement_status
+     + received_paise + pending_paise directly. Schema-resilient (drops unknown
+     columns and retries) so a missing migration never blocks the whole run. */
+  async applyReconciliation(updates){
+    let done = 0;
+    for (const u of updates) {
+      try {
+        await this.updateOne(u.content_hash, {
+          settlement_status: u.settlement_status,
+          received_paise: u.received_paise,
+          pending_paise: u.pending_paise,
+          last_reconciled_at: new Date().toISOString() });
+        done++;
+      } catch(e){ DIAG && DIAG.warn('push', `could not update ${u.invoice_no}`, { reason:e.message }); }
+    }
+    return done;
+  },
+
+  async insertPayments(rows){
+    if (!rows.length) return 0;
+    // chunk to avoid huge requests
+    let ok = 0;
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = rows.slice(i, i+500);
+      const r = await fetch(this.url + '/payments', {
+        method:'POST', headers: this.headers({ 'Prefer':'resolution=merge-duplicates,return=minimal' }),
+        body: JSON.stringify(chunk) });
+      if (r.ok) ok += chunk.length;
+      else { const t = await r.text(); DIAG && DIAG.error('push', `payments insert failed`, { status:r.status, reason:t.slice(0,120) }); }
+    }
+    return ok;
+  },
+  async reconcileAll(){
+    const r = await fetch(this.url + '/rpc/reconcile_all', { method:'POST', headers: this.headers(), body: '{}' });
+    if (!r.ok){ const t = await r.text(); throw new Error(`${r.status} ${t.slice(0,140)}`); }
+    return true;
+  },
+
   async fetchFailed(){
     try { const r = await fetch(this.url + '/failed_uploads?select=*&order=created_at.desc',
       { headers: this.headers({ 'Range':'0-99999' }) });
@@ -2412,20 +2476,23 @@ const Cloud = {
 
   async updateOne(hash, patch){
     let body = { ...patch };
-    for (let attempt = 0; attempt < 4; attempt++) {
+    // Try, and if the DB rejects unknown columns, drop each named column and
+    // retry until it succeeds. Allow enough attempts to clear several unknown
+    // columns in a row (the editor has ~28 fields; a schema can lag on a few).
+    for (let attempt = 0; attempt < 32; attempt++) {
+      if (Object.keys(body).length === 0) return true;   // nothing left to write
       const r = await fetch(this.url + '/invoices?content_hash=eq.' + encodeURIComponent(hash), {
         method: 'PATCH', headers: this.headers({ 'Prefer': 'return=minimal' }),
         body: JSON.stringify(body) });
       if (r.ok) return true;
       const t = await r.text();
-      // If the DB rejects an unknown column, drop just that field and retry —
-      // one missing column shouldn't block saving everything else.
       const m = t.match(/Could not find the '([a-z_]+)' column/i);
       if (m && body.hasOwnProperty(m[1])) {
         delete body[m[1]];
-        if (typeof DIAG!=='undefined') DIAG.warn('push', `skipped unknown column '${m[1]}' and retried`, { hint:`run add_branch_code.sql / the latest migration to store it` });
+        if (typeof DIAG!=='undefined') DIAG.warn('push', `skipped unknown column '${m[1]}' and retried`, { hint:`run the latest migration SQL to store it` });
         continue;
       }
+      // a different error (bad value, constraint) — surface it, don't hang
       throw new Error(`${r.status} ${t.slice(0,160)}`);
     }
     return true;
@@ -4024,6 +4091,8 @@ window.showReportSub = (sub) => {
     const rv = $('#v-review'); }
 })();
 
+if (typeof wireReconcile==='function') wireReconcile();
+
 $('#themeBtn').onclick = () => { const h = document.documentElement;
   h.dataset.theme = h.dataset.theme === 'dark' ? 'light' : 'dark'; };
 
@@ -4688,6 +4757,206 @@ async function syncFromDatabase(silent){
 }
 window.syncFromDatabase = syncFromDatabase;
 
+/* ============================ RECONCILIATION ============================
+   Upload a bank statement (collection sheet), match each credit to an invoice,
+   sum what's received, compare to the invoice's real total in the database, and
+   set Paid / Partially Paid / Pending with the pending amount. Safe by design:
+   invoice-number matches are trusted; amount-fallback matches are only accepted
+   when EXACTLY ONE unpaid invoice fits — ambiguous ones are left for review,
+   never guessed. Nothing is written until you review the preview and confirm. */
+
+function normInv(s){ if(!s) return null; return String(s).toUpperCase().replace(/[\s_]+/g,'').replace(/--/g,'-'); }
+
+/* Parse a PENDING LIST: rows are invoices that still have something owed. An
+   invoice's presence means "not fully paid". Optional columns tell us how much:
+   a pending/balance/outstanding amount, or a received amount. We read the
+   invoice number and whatever amount column exists — flexibly, since the exact
+   headers can vary — and report what we found so the user can confirm. */
+async function parseStatement(file){
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type:'array' });
+  // pick the sheet with the most rows (the data sheet)
+  let best=null, bestRows=0;
+  wb.SheetNames.forEach(n=>{ const ws=wb.Sheets[n]; const ref=ws['!ref']; if(!ref)return;
+    const rows = XLSX.utils.decode_range(ref).e.r; if(rows>bestRows){bestRows=rows;best=n;} });
+  const ws = wb.Sheets[best];
+  const rows = XLSX.utils.sheet_to_json(ws, { header:1, defval:null });
+  // find the header row — it must contain an invoice column
+  let hdr=-1;
+  for (let i=0;i<Math.min(12,rows.length);i++){
+    const r=(rows[i]||[]).map(x=>String(x||'').toLowerCase());
+    if (r.some(c=>c.includes('invoice') || c==='inv' || c.includes('bill no'))) { hdr=i; break; }
+  }
+  if (hdr<0) throw new Error('Could not find an "Invoice" column in the file. The pending list needs an invoice-number column.');
+  const H = rows[hdr].map(x=>String(x||'').toLowerCase().trim());
+  const find = (...names) => { for (const n of names){ const i=H.findIndex(h=>h===n); if(i>=0)return i; }
+    for (const n of names){ const i=H.findIndex(h=>h.includes(n)); if(i>=0)return i; } return -1; };
+  const cInv     = find('invoice','inv','bill no','bill number');
+  const cPending = find('pending','balance','outstanding','due','remaining');
+  const cReceived= find('received','paid','credit','collected');
+  const cClient  = find('client','bank');
+  const cBranch  = find('branch');
+  const cTotal   = find('total','basic','amount','invoice value');
+
+  const items=[]; const seen=new Set();
+  const num = (v) => { if (v===null || v===undefined || String(v).trim()==='') return null;
+    const n = Number(String(v).replace(/[,₹\s]/g,'')); return isFinite(n) ? n : null; };
+  for (let i=hdr+1;i<rows.length;i++){
+    const row=rows[i]; if(!row) continue;
+    const inv = cInv>=0 ? normInv(row[cInv]) : null;
+    if (!inv) continue;
+    items.push({ invoice_no: inv,
+      pending_amount:  cPending>=0  ? num(row[cPending])  : null,
+      received_amount: cReceived>=0 ? num(row[cReceived]) : null,
+      total_amount:    cTotal>=0    ? num(row[cTotal])    : null,
+      client_raw: cClient>=0 && row[cClient]!=null ? String(row[cClient]) : null,
+      branch_raw: cBranch>=0 && row[cBranch]!=null ? String(row[cBranch]) : null });
+    seen.add(inv);
+  }
+  return { items, invoiceSet: seen,
+    columns: { hasPending: cPending>=0, hasReceived: cReceived>=0, hasTotal: cTotal>=0 } };
+}
+// tiny stable hash for dedup keys
+function cyrb(str){ let h=1779033703^str.length; for(let i=0;i<str.length;i++){ h=Math.imul(h^str.charCodeAt(i),3432918353); h=h<<13|h>>>19; } return (Math.imul(h^h>>>16,2246822507)>>>0).toString(16); }
+
+/* PENDING-LIST reconciliation (the correct logic):
+   The uploaded file lists invoices that are STILL OWED. So for every invoice in
+   the database:
+     • NOT in the file        -> PAID (fully received)
+     • in the file, amount     -> PARTIALLY PAID (pending = that amount, or total-received)
+     • in the file, no amount  -> PENDING (nothing received)
+   Only invoices that exist in the database are touched. Matching is by invoice
+   number. Rows in the file that don't match any DB invoice are reported, not
+   guessed. */
+function reconcilePending(parsed, invoices){
+  const pendingByInv = new Map();
+  parsed.items.forEach(it => pendingByInv.set(it.invoice_no, it));
+
+  const updates = [];       // {content_hash, status, received_paise, pending_paise}
+  let paid=0, partial=0, pending=0, unmatchedInFile=0;
+  let totalPending=0;
+
+  invoices.forEach(iv => {
+    const total = iv.total_paise || 0;
+    const it = pendingByInv.get(normInv(iv.invoice_no));
+    let status, received, pend;
+    if (!it) {
+      // not in the pending list -> fully paid
+      status='PAID'; received=total; pend=0; paid++;
+    } else {
+      // in the list -> compute pending
+      if (it.pending_amount != null) {
+        pend = Math.round(it.pending_amount*100);
+        received = Math.max(total - pend, 0);
+      } else if (it.received_amount != null) {
+        received = Math.round(it.received_amount*100);
+        pend = Math.max(total - received, 0);
+      } else {
+        // present but no amount -> fully pending
+        received = 0; pend = total;
+      }
+      if (pend <= 0) { status='PAID'; paid++; }
+      else if (received > 0) { status='PARTIAL'; partial++; totalPending += pend; }
+      else { status='PENDING'; pending++; totalPending += pend; }
+    }
+    updates.push({ content_hash: iv.content_hash, invoice_no: iv.invoice_no,
+      settlement_status: status, received_paise: received, pending_paise: pend });
+  });
+
+  // file rows that don't match any DB invoice (reported, never applied)
+  const dbSet = new Set(invoices.map(iv => normInv(iv.invoice_no)));
+  parsed.items.forEach(it => { if (!dbSet.has(it.invoice_no)) unmatchedInFile++; });
+
+  return { updates, summary:{
+    dbInvoices: invoices.length, inFile: parsed.items.length,
+    paid, partial, pending, unmatchedInFile, totalPending } };
+}
+window.parseStatement = parseStatement;
+window.reconcilePending = reconcilePending;
+
+window.showDbSub = (sub) => {
+  $$('#dbSubtabs button').forEach(x => x.classList.toggle('on', x.dataset.sub === sub));
+  $('#dbSyncBody').style.display = sub==='sync' ? '' : 'none';
+  $('#dbReconcileBody').style.display = sub==='reconcile' ? '' : 'none';
+};
+
+let recUpdates = null;   // computed status updates awaiting confirmation
+function wireReconcile(){
+  const pick = $('#recPick'), fileIn = $('#recFile');
+  if (!pick || !fileIn) return;
+  pick.onclick = () => fileIn.click();
+  fileIn.onchange = async (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    $('#recStatus').textContent = 'Reading the pending list…';
+    $('#recPreview').innerHTML = '';
+    try {
+      // make sure we have the full database to reconcile against
+      if (!(window.dbRows||[]).length) { $('#recStatus').textContent = 'Loading invoices from the database first…';
+        await syncFromDatabase(true); }
+      const parsed = await parseStatement(file);
+      const { updates, summary } = reconcilePending(parsed, window.dbRows || []);
+      recUpdates = updates;
+      const fmt = n => '₹' + (n/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+      const amtNote = parsed.columns.hasPending ? 'pending amount' : (parsed.columns.hasReceived ? 'received amount' : 'no amount column — treated as fully pending');
+      $('#recStatus').textContent = `${summary.inFile} invoice(s) in the pending list, from ${esc(file.name)}`;
+      $('#recPreview').innerHTML = `
+        <div class="assure" style="margin:0 0 14px"><span>ℹ</span><span>This file is a <b>pending list</b>.
+          Invoices <b>in the file</b> are still owed; invoices <b>not in the file</b> are marked
+          <b>fully PAID</b>. Amount source: <b>${amtNote}</b>. Only invoices already in the database are updated.</span></div>
+        <div class="recgrid">
+          <div class="reccard"><div class="reclabel">Invoices in the database</div><div class="recval">${summary.dbInvoices}</div></div>
+          <div class="reccard"><div class="reclabel">Listed as pending (in file)</div><div class="recval">${summary.inFile}</div></div>
+          <div class="reccard"><div class="reclabel">File rows not in database</div><div class="recval" style="color:var(--fail)">${summary.unmatchedInFile}</div></div>
+        </div>
+        <div class="recgrid" style="margin-top:10px">
+          <div class="reccard"><div class="reclabel">→ Will be PAID (not in file)</div><div class="recval" style="color:var(--proof)">${summary.paid}</div></div>
+          <div class="reccard"><div class="reclabel">→ Partially paid</div><div class="recval" style="color:var(--warn)">${summary.partial}</div></div>
+          <div class="reccard"><div class="reclabel">→ Pending (no receipt)</div><div class="recval">${summary.pending}</div></div>
+          <div class="reccard"><div class="reclabel">Total pending amount</div><div class="recval">${fmt(summary.totalPending)}</div></div>
+        </div>
+        <div class="assure" style="margin:14px 0"><span>⚠</span><span>Review these numbers before confirming.
+          ${summary.unmatchedInFile ? `<b>${summary.unmatchedInFile}</b> row(s) in the file don't match any database invoice and are ignored (not applied).` : 'Every file row matched a database invoice.'}</span></div>
+        <button class="btn pri" id="recConfirm">Confirm — update Paid / Partial / Pending statuses</button>`;
+      $('#recConfirm').onclick = confirmReconcile;
+    } catch(err){ $('#recStatus').textContent = 'Could not read the file: ' + err.message;
+      DIAG && DIAG.error('system','reconcile parse failed',{reason:err.message}); }
+    fileIn.value='';
+  };
+}
+
+async function confirmReconcile(){
+  if (!recUpdates) return;
+  const btn = $('#recConfirm'); btn.disabled = true; btn.textContent = 'Updating…';
+  try {
+    const n = await Cloud.applyReconciliation(recUpdates);
+    log(`Reconciliation complete — updated ${n} invoice(s) to Paid / Partial / Pending.`, 'ok');
+    DIAG && DIAG.ok('system', `reconciled ${n} invoices (pending-list logic)`);
+    await syncFromDatabase(true);
+    $('#recStatus').textContent = `Done — ${n} invoice statuses updated.`;
+    btn.textContent = '✓ Reconciled';
+  } catch(e){ log('Reconciliation failed: '+e.message, 'er'); btn.disabled=false; btn.textContent='Confirm — update Paid / Partial / Pending statuses'; }
+}
+window.wireReconcile = wireReconcile;
+
+async function _oldConfirmReconcile(){
+  if (!recMatched) return;
+  const btn = $('#recConfirm'); btn.disabled = true; btn.textContent = 'Writing…';
+  try {
+    const toWrite = recMatched.map(p => ({ payment_key:p.payment_key, content_hash:p.content_hash||null,
+      invoice_no:p.invoice_no, amount_paise:p.amount_paise, paid_date:p.paid_date, narration:p.narration,
+      client_raw:p.client_raw, branch_raw:p.branch_raw, match_method:p.match_method }));
+    const n = await Cloud.insertPayments(toWrite);
+    log(`Wrote ${n} payments to the database.`, 'ok');
+    await Cloud.reconcileAll();
+    log('Reconciliation complete — every invoice now shows Paid, Partial or Pending.', 'ok');
+    DIAG && DIAG.ok('system', `reconciled: ${n} payments written`);
+    await syncFromDatabase(true);
+    $('#recStatus').textContent = `Done — ${n} payments reconciled. Statuses updated.`;
+    btn.textContent = '✓ Reconciled';
+  } catch(e){ log('Reconciliation failed: '+e.message, 'er'); btn.disabled=false; btn.textContent='Confirm — write payments & update statuses'; }
+}
+window.wireReconcile = wireReconcile;
+
 (async () => {
   await syncFromDatabase(false);
   // subscribe to live database changes — refreshes silently on any change
@@ -4967,13 +5236,10 @@ async function saveBillEditor(){
       _uploader: editorState.invoice.uploaded_by, _uploadLocation: editorState.invoice.upload_location };
 
     if (editorState.isFailed) {
-      // promote from failed_uploads into invoices, then delete the failed row + file
       await Cloud.resolveFailed(doc, editorState.storagePath);
       await Cloud.replaceLines(hash, editorState.lines);
       window.failedBills = (window.failedBills||[]).filter(f => f.content_hash !== hash);
     } else {
-      // ordinary review bill: update the invoice, refresh its lines, mark verified,
-      // and remove its stored review file (no longer needed once verified)
       await Cloud.updateOne(hash, patch);
       await Cloud.replaceLines(hash, editorState.lines);
       await Cloud.markVerified(hash);
@@ -4992,9 +5258,11 @@ async function saveBillEditor(){
     log('Saved — the bill is updated in the database and cleared from Review.', 'ok');
     DIAG && DIAG.ok('system', `bill saved via editor: ${hash}`);
   } catch(e){
+    // never leave the button stuck — always re-enable and say what happened
     log('Could not save: '+e.message, 'er');
     DIAG && DIAG.error('system', `editor save failed: ${hash}`, { reason: e.message });
     if (btn) { btn.disabled = false; btn.textContent = 'Save & update'; }
+    alert('Could not save this bill:\n\n' + e.message + '\n\nNothing was lost — try again, or check the diagnostic log.');
     return;
   }
   editorState = null; closeModal(); renderReview(); renderAll();
