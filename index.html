@@ -18,7 +18,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='9ce2dd83ced8';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='d6dbc0071947';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -184,6 +184,23 @@ label.chk input{accent-color:var(--accent)}
 .reccard{border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:var(--bg-soft)}
 .reclabel{font-size:12px;color:var(--text-2);margin-bottom:4px}
 .recval{font-size:22px;font-weight:600}
+.wpanel{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0}
+.wcard{flex:1;min-width:160px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--bg-soft);transition:border-color .2s}
+.wcard.busy{border-color:var(--accent);background:var(--accent-soft)}
+.wcard.offline{opacity:.6;border-style:dashed}
+.wcard .whead{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-2);margin-bottom:4px}
+.wdot{width:8px;height:8px;border-radius:50%;background:var(--line);flex:none}
+.wcard.busy .wdot{background:var(--accent);animation:wpulse 1s ease-in-out infinite}
+.wcard.offline .wdot{background:var(--text-2)}
+@keyframes wpulse{0%,100%{opacity:1}50%{opacity:.4}}
+.wtrait{font-size:11px;color:var(--text-2);font-style:italic;margin-bottom:6px;line-height:1.3}
+.wjob{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wtime{font-size:12px;color:var(--text-2);font-variant-numeric:tabular-nums;margin-top:2px}
+.wctrl{display:flex;gap:6px;margin-top:8px}
+.wbtn{font-size:12px;padding:4px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);cursor:pointer;color:var(--text)}
+.wbtn:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}
+.wbtn:disabled{opacity:.4;cursor:default}
+.wtitle{font-size:12px;color:var(--text-2);text-transform:uppercase;letter-spacing:.04em;margin:8px 0 0}
 .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .seg button{background:var(--surface);border:none;padding:7px 14px;font:inherit;font-size:13px;cursor:pointer;color:var(--text-2)}
 .seg button.on{background:var(--accent,#4C2082);color:#fff}
@@ -288,6 +305,7 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
       </div>
       <div class="grid k4" id="ingestStats" style="margin:14px 0"></div>
       <div id="ocrBanner"></div>
+      <div id="workerPanel"></div>
       <div class="row" style="justify-content:space-between;align-items:center">
         <h2 style="margin:0">Activity</h2>
         <button class="btn sm" id="dlDiag" title="Download a detailed timestamped log of every file, decision and reason — for debugging">↓ Download diagnostic log</button>
@@ -2165,6 +2183,50 @@ const Cloud = {
     return (await r.json());   // 'inserted' | 'updated' | 'unchanged'
   },
 
+  /* SCALE: push many bills per request instead of one at a time. Sends bills in
+     chunks (default 200) through sync_invoices_batch, with a few chunks in flight
+     at once. This is the difference between 10 hours and minutes for a Lakh.
+     onProgress(done,total) is called as chunks complete. Falls back to one-by-one
+     if the batch RPC isn't installed yet (so it works before sync_batch.sql). */
+  _batchOk: null,   // null=unknown, true/false once probed
+  async pushMany(docs, onProgress, chunkSize = 200, concurrency = 3){
+    if (!docs || !docs.length) return { ok:0, fail:0 };
+    const chunks = [];
+    for (let i=0;i<docs.length;i+=chunkSize) chunks.push(docs.slice(i,i+chunkSize));
+    let ok=0, fail=0, done=0;
+    const self = this;
+
+    async function sendChunk(chunk){
+      const items = chunk.map(d => ({ p: self.invoiceRow(d), lines: self.lineRows(d),
+        chk: self.checkRows(d), conf: self.confRows(d) }));
+      // try the batch RPC unless we already learned it's missing
+      if (self._batchOk !== false) {
+        try {
+          const r = await fetch(self.url + '/rpc/sync_invoices_batch', {
+            method:'POST', headers: self.headers(), body: JSON.stringify({ items }) });
+          if (r.ok) { self._batchOk = true; const res = await r.json();
+            chunk.forEach((d,i)=>{ d._pushed = true; if (String(res[i]||'').startsWith('error')) fail++; else ok++; });
+            done += chunk.length; if (onProgress) onProgress(done, docs.length); return; }
+          if (r.status === 404 || r.status === 400) self._batchOk = false;  // function not installed
+          else { const t = await r.text(); throw new Error(`${r.status} ${t.slice(0,120)}`); }
+        } catch(e){ if (self._batchOk !== false) { /* network etc */ throw e; } }
+      }
+      // fallback: one at a time (batch RPC not installed)
+      for (const d of chunk){
+        try { await self.pushOne(d); d._pushed = true; ok++; }
+        catch(_){ fail++; }
+        done++; if (onProgress && done % 10 === 0) onProgress(done, docs.length);
+      }
+      if (onProgress) onProgress(done, docs.length);
+    }
+
+    // run up to `concurrency` chunks at once
+    let next = 0;
+    async function worker(){ while (next < chunks.length){ const c = chunks[next++]; await sendChunk(c); } }
+    await Promise.all(Array.from({length: Math.min(concurrency, chunks.length)}, worker));
+    return { ok, fail };
+  },
+
   async pullAll(){
     const r = await fetch(this.url + '/invoices?select=*&order=invoice_date.desc', {
       headers: this.headers({ 'Range': '0-199999', 'Range-Unit':'items' }) });
@@ -2598,6 +2660,22 @@ const OCR = {
   /* ---- worker pool: parallel OCR sized to the machine ---- */
   _pool: null, _poolLoading: null,
 
+  // The OCR crew — each worker is a named team member with a bit of personality,
+  // so managing them feels like managing people, not slots. Names cycle if the
+  // pool is larger than the roster.
+  _roster: [
+    { name:'Bahadur', trait:'the reliable veteran — never rushes, never misses' },
+    { name:'Chotu',   trait:'quick and eager — grabs the next bill before you ask' },
+    { name:'Lakshmi', trait:'sharp-eyed — catches the faint scans others struggle with' },
+    { name:'Ravi',    trait:'steady all-rounder — happy with whatever lands on the desk' },
+    { name:'Meena',   trait:'the perfectionist — takes her time on the tricky ones' },
+    { name:'Arjun',   trait:'strong hands — powers through the heavy multi-page scans' },
+    { name:'Priya',   trait:'calm under load — unbothered when the queue piles up' },
+    { name:'Deepak',  trait:'the closer — loves clearing the last few in a batch' },
+  ],
+  workerName(i){ return (this._roster[i % this._roster.length] || { name:'Worker '+(i+1) }).name; },
+  workerTrait(i){ return (this._roster[i % this._roster.length] || { trait:'' }).trait; },
+
   poolSize(){
     // hardwareConcurrency = logical cores. Use half (leave room for the UI and
     // PDF rendering), clamped to 2..4. A weak 2-core machine gets 1; a good
@@ -2623,7 +2701,9 @@ const OCR = {
       // busy[i] = false when free; startedAt[i] = when the current bill began;
       // preempt[i] = a flag the running task checks to bail out cooperatively.
       this._pool = { workers, n, busy: new Array(n).fill(false),
-        startedAt: new Array(n).fill(0), preempt: new Array(n).fill(false), waiting: 0 };
+        startedAt: new Array(n).fill(0), preempt: new Array(n).fill(false), waiting: 0,
+        jobs: new Array(n).fill(null), offline: new Array(n).fill(false),
+        freed: new Array(n).fill(0) };   // freed[i]++ = manager freed this worker
       log(`OCR ready with ${n} parallel worker${n>1?'s':''}.`, 'dim');
       setOcrStatus('ready');
       return this._pool;
@@ -2636,7 +2716,7 @@ const OCR = {
      LONGEST-running worker: terminate + replace it, and reject its task (which
      sends that one bill to Review) so the queue keeps moving. A slow bill that
      ISN'T blocking anyone is left alone to finish. */
-  async _lease(fn){
+  async _lease(fn, jobLabel){
     const pool = await this.pool();
     const GRACE_MS = 45000;   // how long a waiting bill tolerates before it preempts the slowest
     pool.waiting++;
@@ -2644,39 +2724,89 @@ const OCR = {
     const waitStart = Date.now();
     try {
       while (idx === -1) {
-        idx = pool.busy.indexOf(false);
+        // pick a worker that's free AND not benched (offline) by the manager
+        idx = pool.busy.findIndex((b,i) => !b && !pool.offline[i]);
         if (idx !== -1) break;
-        // all busy — if we've waited past the grace period, preempt the worker
-        // that has been busy the longest (only if it's meaningfully old)
+        // everyone available is busy — if we've waited past the grace period,
+        // preempt the longest-running (skip offline ones)
         if (Date.now() - waitStart > GRACE_MS) {
           let oldest = -1, oldestT = Infinity;
-          for (let i=0;i<pool.n;i++){ if (pool.busy[i] && pool.startedAt[i] < oldestT && !pool.preempt[i]) { oldestT = pool.startedAt[i]; oldest = i; } }
+          for (let i=0;i<pool.n;i++){ if (pool.busy[i] && !pool.offline[i] && pool.startedAt[i] < oldestT && !pool.preempt[i]) { oldestT = pool.startedAt[i]; oldest = i; } }
           if (oldest !== -1 && (Date.now() - oldestT) > GRACE_MS) {
             pool.preempt[oldest] = true;                 // signal the running task to bail
             try { await pool.workers[oldest].terminate(); } catch(_){}
             try { pool.workers[oldest] = await Tesseract.createWorker('eng', 1, {
               corePath: this.base + '/tesseract-core-lstm.wasm.js', workerPath: this.base + '/worker.min.js',
               langPath: this.base, gzip: false, cacheMethod: 'write' }); } catch(_){}
-            // the preempted slot becomes free once its task settles; loop will pick it up
             DIAG && DIAG.warn('ocr', `preempted a long-running bill to free a worker`, { waitedMs: Date.now()-waitStart });
           }
         }
+        // if EVERYONE is offline, don't spin forever — surface it
+        if (pool.offline.every(Boolean)) { pool.waiting--; throw new Error('All OCR workers are offline — bring at least one online to read image bills.'); }
         await new Promise(r => setTimeout(r, 50));
       }
     } finally { pool.waiting--; }
 
     pool.busy[idx] = true; pool.startedAt[idx] = Date.now(); pool.preempt[idx] = false;
+    pool.jobs[idx] = jobLabel || 'a bill';
     try {
       return await fn(pool.workers[idx]);
     } catch (e) {
-      // task failed or was preempted — make sure this worker is fresh
       if (pool.preempt[idx]) { e._preempted = true; }
       else { try { await pool.workers[idx].terminate(); } catch(_){}
         try { pool.workers[idx] = await Tesseract.createWorker('eng', 1, {
           corePath: this.base + '/tesseract-core-lstm.wasm.js', workerPath: this.base + '/worker.min.js',
           langPath: this.base, gzip: false, cacheMethod: 'write' }); } catch(_){} }
       throw e;
-    } finally { pool.busy[idx] = false; pool.preempt[idx] = false; }
+    } finally { pool.busy[idx] = false; pool.preempt[idx] = false; pool.jobs[idx] = null; }
+  },
+
+  /* ---- Workforce controls (manager actions from the Ingest panel) ---- */
+
+  // Free a worker from its CURRENT bill right now. The bill it drops is sent to
+  // Review (not lost); the worker is replaced with a fresh one and picks up the
+  // next bill. This is the manual version of the automatic preemption — for when
+  // you can see one is stuck and want to unstick it yourself.
+  async freeWorker(i){
+    const pool = this._pool; if (!pool || i<0 || i>=pool.n) return false;
+    if (!pool.busy[i]) return false;   // already idle, nothing to free
+    pool.preempt[i] = true;            // its running task will bail with _preempted
+    pool.freed[i] = (pool.freed[i]||0) + 1;
+    try { await pool.workers[i].terminate(); } catch(_){}
+    try { pool.workers[i] = await Tesseract.createWorker('eng', 1, {
+      corePath: this.base + '/tesseract-core-lstm.wasm.js', workerPath: this.base + '/worker.min.js',
+      langPath: this.base, gzip: false, cacheMethod: 'write' }); } catch(_){}
+    DIAG && DIAG.warn('ocr', `${this.workerName(i)} was freed by the manager`, { worker:i });
+    if (typeof renderWorkerPanel==='function') renderWorkerPanel();
+    return true;
+  },
+
+  // Bench a worker (take offline) to free system memory. If it's mid-bill, that
+  // bill is dropped to Review first, then the worker is terminated so it stops
+  // using RAM/CPU. No new work goes to a benched worker.
+  async benchWorker(i){
+    const pool = this._pool; if (!pool || i<0 || i>=pool.n) return false;
+    pool.offline[i] = true;
+    if (pool.busy[i]) { pool.preempt[i] = true; }
+    try { await pool.workers[i].terminate(); } catch(_){}
+    pool.workers[i] = null;   // released — frees its memory
+    DIAG && DIAG.info('ocr', `${this.workerName(i)} sent offline by the manager`, { worker:i });
+    if (typeof renderWorkerPanel==='function') renderWorkerPanel();
+    return true;
+  },
+
+  // Bring a benched worker back online (re-hire). Spins up a fresh worker in its
+  // slot, ready to take bills again.
+  async hireWorker(i){
+    const pool = this._pool; if (!pool || i<0 || i>=pool.n) return false;
+    if (!pool.offline[i] && pool.workers[i]) return false;   // already online
+    try { pool.workers[i] = await Tesseract.createWorker('eng', 1, {
+      corePath: this.base + '/tesseract-core-lstm.wasm.js', workerPath: this.base + '/worker.min.js',
+      langPath: this.base, gzip: false, cacheMethod: 'write' }); } catch(_){ return false; }
+    pool.offline[i] = false; pool.busy[i] = false;
+    DIAG && DIAG.ok('ocr', `${this.workerName(i)} brought back online`, { worker:i });
+    if (typeof renderWorkerPanel==='function') renderWorkerPanel();
+    return true;
   },
 
   async terminatePool(){
@@ -2746,7 +2876,7 @@ const OCR = {
     return items;
   },
 
-  async ocrPage(pdfPage, onDiag){
+  async ocrPage(pdfPage, onDiag, jobLabel){
     const scale = 2;
     const vp = pdfPage.getViewport({ scale });
     const canvas = document.createElement('canvas');
@@ -2769,7 +2899,7 @@ const OCR = {
       data = await this._lease(async (worker) => {
         const r = await worker.recognize(canvas);
         return r.data;
-      });
+      }, jobLabel);
     } catch (e) {
       canvas.width = canvas.height = 0;   // free the canvas memory
       DIAG && DIAG.warn('ocr', `OCR set a bill aside`, { reason: e.message });
@@ -3260,6 +3390,7 @@ async function runOcrPass(){
   try {
     const p = await OCR.pool(); poolN = p.n;
     log(`  OCR engine ready in ${((Date.now()-tWarm)/1000).toFixed(1)}s — ${poolN} parallel worker${poolN>1?'s':''}.`, 'dim');
+    renderWorkerPanel();   // show the live worker visual
   } catch(e){
     ocrPassRunning = false; setOcrStatus('error');
     log(`  OCR engine failed to load: ${e.message}. Check the OCR bucket is public and reachable.`, 'er');
@@ -3348,6 +3479,45 @@ function renderOcrBanner(){
     </span></div>`;
 }
 window.runOcrPass = runOcrPass;
+
+/* Live worker panel on Ingest: shows each OCR worker — idle or busy, what it's
+   reading, and a running timer. Ticks every second while OCR is active. */
+let _workerTick = null;
+function renderWorkerPanel(){
+  const el = document.getElementById('workerPanel'); if (!el) return;
+  const pool = (typeof OCR!=='undefined') && OCR._pool;
+  if (!pool) { el.innerHTML = ''; if (_workerTick){ clearInterval(_workerTick); _workerTick=null; } return; }
+  const now = Date.now();
+  const cards = pool.workers.map((_, i) => {
+    const offline = pool.offline[i];
+    const busy = pool.busy[i] && !offline;
+    const secs = busy && pool.startedAt[i] ? ((now - pool.startedAt[i])/1000).toFixed(0) : null;
+    const name = OCR.workerName(i), trait = OCR.workerTrait(i);
+    const state = offline ? 'offline' : (busy ? 'working' : 'idle');
+    const job = busy ? (pool.jobs[i] || 'a bill') : (offline ? 'benched — saving memory' : 'ready for the next bill');
+    const controls = offline
+      ? `<button class="wbtn" onclick="OCR.hireWorker(${i})">Bring online</button>`
+      : `<button class="wbtn" onclick="OCR.freeWorker(${i})" ${busy?'':'disabled'}>Free</button>
+         <button class="wbtn" onclick="OCR.benchWorker(${i})">Bench</button>`;
+    return `<div class="wcard ${busy?'busy':''} ${offline?'offline':''}">
+      <div class="whead"><span class="wdot"></span><b>${esc(name)}</b> · ${state}</div>
+      <div class="wtrait">${esc(trait)}</div>
+      <div class="wjob" title="${esc(job)}">${esc(job)}</div>
+      <div class="wtime">${busy ? `running ${secs}s` : (offline ? '—' : 'waiting')}${pool.freed[i]?` · freed ${pool.freed[i]}×`:''}</div>
+      <div class="wctrl">${controls}</div>
+    </div>`;
+  }).join('');
+  const online = pool.offline.filter(x=>!x).length;
+  const anyBusy = pool.busy.some((b,i)=>b && !pool.offline[i]);
+  const queued = pool.waiting;
+  el.innerHTML = `<div class="wtitle">Your OCR crew — ${online} of ${pool.n} online${queued?` · ${queued} bill(s) waiting`:''}
+      <span class="dim" style="text-transform:none;font-weight:400"> · Free a stuck one, or bench some to save memory</span></div>
+    <div class="wpanel">${cards}</div>`;
+  if (anyBusy && !_workerTick) _workerTick = setInterval(renderWorkerPanel, 1000);
+  if (!anyBusy && _workerTick) { clearInterval(_workerTick); _workerTick = null; }
+}
+window.renderWorkerPanel = renderWorkerPanel;
+window.OCR = OCR;   // so the worker-panel control buttons (Free/Bench/Hire) work
 function updateOcrProgress(cur, total){
   const el = document.getElementById('ocrProgress'); if(!el) return;
   el.textContent = total ? `OCR: ${cur} of ${total}…` : '';
@@ -3367,7 +3537,7 @@ async function pdfToViewWithOcr(buf, filename, onDiag){
     if (items.filter(i=>i.str&&i.str.trim()).length < 5){
       // OCR this image page. Let a failure THROW so the pass records it loudly,
       // rather than silently producing an empty page (which looked like success).
-      const ocrItems = await OCR.ocrPage(page, onDiag);
+      const ocrItems = await OCR.ocrPage(page, onDiag, filename);
       if (ocrItems.length) items = items.concat(ocrItems);
     }
     pages.push({ items }); page.cleanup();
@@ -3383,26 +3553,22 @@ async function autoSync(docs){
   const toPush = docs.filter(d => !d._pushed);
   if (!toPush.length) { setCloud(`All saved to the database`, 'ok'); renderReview(); return; }
   setCloud(`Saving ${toPush.length} to database…`, 'dim');
-  let ok=0, fail=0; const fails=[];
-  for (const d of toPush){
-    try { await Cloud.enrichFromMaster(d); const res = await Cloud.pushOne(d); d._pushed = true; ok++; }
-    catch(e){
-      // "Failed to fetch" is usually a transient network blip — retry once
-      // before giving up, so a momentary hiccup doesn't lose a bill.
-      let saved = false;
-      try { await new Promise(r=>setTimeout(r,800)); await Cloud.pushOne(d); d._pushed = true; ok++; saved = true; }
-      catch(_){}
-      if (!saved) {
-        fail++; fails.push([d.filename, e.message]);
-        // keep the bill so it isn't lost — store it (with its file) for manual
-        // fixing in Review, exactly like an OCR/upload failure.
-        try { if (d._pdfBuf || d._sourceBlob) { await Cloud.saveFailedBill(d, 'Push failed: '+e.message); }
-          else { await Cloud.saveFailedBill(d, 'Push failed (no file): '+e.message); } } catch(_){}
-      }
-    }
+  // enrich from master (fills gaps) before pushing
+  for (const d of toPush){ try { await Cloud.enrichFromMaster(d); } catch(_){} }
+  // BATCHED push — 200 bills per request, a few requests in flight. Scales to
+  // Lakhs. Falls back to one-by-one automatically if the batch RPC isn't
+  // installed yet.
+  const { ok, fail } = await Cloud.pushMany(toPush, (done,total)=>{
+    setCloud(`Saving ${done} of ${total} to database…`, 'dim');
+  });
+  // any that failed even after batching: keep them for Review, don't lose them
+  const failedDocs = toPush.filter(d => !d._pushed);
+  for (const d of failedDocs){
+    try { if (d._pdfBuf || d._sourceBlob) await Cloud.saveFailedBill(d, 'Push failed during batch save');
+      else await Cloud.saveFailedBill(d, 'Push failed during batch save (no file)'); } catch(_){}
   }
-  if (fail) { setCloud(`Saved ${ok}, ${fail} failed to save`, 'er'); log(`${fail} document(s) could not be saved to the database — kept in Review to retry:`, 'er');
-    fails.forEach(([f,m])=>log(`   ${f} — ${m}`, 'dim'));
+  if (fail || failedDocs.length) { setCloud(`Saved ${ok}, ${fail} failed`, 'er');
+    log(`${fail} document(s) could not be saved — kept in Review to retry.`, 'er');
     try { window.failedBills = await Cloud.fetchFailed(); renderReview(); } catch(_){} }
   else setCloud(`All ${ok} saved to the database`, 'ok');
   // refresh the MIS pull so Report/Review reflect the new data immediately
