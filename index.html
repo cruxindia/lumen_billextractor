@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='d6e7249bc8b6';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='d98c60494d78';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -408,6 +408,7 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
         <button class="btn" id="cloudPush">Re-save this session</button>
         <button class="btn" id="cloudPull">Reload from database</button>
         <button class="btn" id="cloudClearFiles" title="Delete all stored bill files from the bills bucket — use with reset_data.sql for a clean slate">Clear stored files</button>
+        <button class="btn" id="cloudSelfTest" title="Push 3 distinct test bills and read back exactly what landed in each table — reveals where data is being lost">◇ Test database write</button>
         <span class="pill" id="cloudStatus"><i class="dot"></i> Ready</span>
       </div>
 
@@ -2665,14 +2666,26 @@ const OCR = {
   // so managing them feels like managing people, not slots. Names cycle if the
   // pool is larger than the roster.
   _roster: [
-    { name:'Bahadur', trait:'the reliable veteran — never rushes, never misses' },
-    { name:'Chotu',   trait:'quick and eager — grabs the next bill before you ask' },
-    { name:'Lakshmi', trait:'sharp-eyed — catches the faint scans others struggle with' },
-    { name:'Ravi',    trait:'steady all-rounder — happy with whatever lands on the desk' },
-    { name:'Meena',   trait:'the perfectionist — takes her time on the tricky ones' },
-    { name:'Arjun',   trait:'strong hands — powers through the heavy multi-page scans' },
-    { name:'Priya',   trait:'calm under load — unbothered when the queue piles up' },
-    { name:'Deepak',  trait:'the closer — loves clearing the last few in a batch' },
+    { name:'Aarav',   trait:'senior processor — steady and accurate' },
+    { name:'Kavya',   trait:'fast on clean bills, careful on the rest' },
+    { name:'Rohan',   trait:'handles the heavy multi-page scans' },
+    { name:'Ananya',  trait:'sharp on faint and low-quality scans' },
+    { name:'Vikram',  trait:'reliable through long batches' },
+    { name:'Diya',    trait:'methodical — rarely needs a second pass' },
+    { name:'Arjun',   trait:'calm under a heavy queue' },
+    { name:'Isha',    trait:'thorough on annexure detail' },
+    { name:'Karan',   trait:'quick to clear the tail of a batch' },
+    { name:'Neha',    trait:'consistent and precise' },
+    { name:'Aditya',  trait:'strong on large workbooks' },
+    { name:'Sara',    trait:'detail-focused on totals' },
+    { name:'Manav',   trait:'dependable all-rounder' },
+    { name:'Riya',    trait:'efficient on repetitive formats' },
+    { name:'Dev',     trait:'handles edge-case layouts well' },
+    { name:'Tara',    trait:'accurate on tax breakdowns' },
+    { name:'Nikhil',  trait:'steady pace, low error rate' },
+    { name:'Pooja',   trait:'careful with mandatory fields' },
+    { name:'Rahul',   trait:'fast reader, clean output' },
+    { name:'Meera',   trait:'reliable on the final checks' },
   ],
   workerName(i){ return (this._roster[i % this._roster.length] || { name:'Worker '+(i+1) }).name; },
   workerTrait(i){ return (this._roster[i % this._roster.length] || { trait:'' }).trait; },
@@ -2953,7 +2966,7 @@ const Pipeline = {
   avgMs: 6000,         // rolling average bill time (seeds at 6s, adapts)
   _samples: [],
   running: false,
-  stats: { done:0, pushed:0, kicked:0, dropped:0, total:0 },
+  stats: { done:0, pushed:0, kicked:0, dropped:0, autofixed:0, saveFailed:0, total:0 },
 
   recordTime(ms){
     this._samples.push(ms); if (this._samples.length>50) this._samples.shift();
@@ -2979,7 +2992,7 @@ const Pipeline = {
         if (lineSum > 0 && inv.total_paise && Math.abs(lineSum - inv.total_paise) >= 100) {
           const taxable = inv.taxable_paise||0, tax = inv.tax_total_paise||0;
           if (taxable && Math.abs((taxable+tax) - lineSum) <= 100) {
-            inv.total_paise = lineSum; c.status='FIXED'; c._autofixed = 'total recomputed from itemised lines';
+            inv.total_paise = lineSum; c.status='FIXED'; c._autofixed = 'total recomputed from itemised lines'; this.stats.autofixed++;
           }
         }
       }
@@ -3239,13 +3252,20 @@ async function ingest(fileList){
     const wname = OCR.workerName(wid);
     const tItem = Date.now();
     const stage = (name, extra) => { if (typeof DIAG!=='undefined') DIAG.info('worker', `${wname}: ${name} — ${it.name}`, extra||{}); };
+    let hash = null;
     try {
       const tHash = Date.now();
-      const hash = await sha256(it.buf);
+      hash = await sha256(it.buf);
       DIAG.info('ingest', `${wname} processing: ${it.name}`, { worker:wid, type: it.image?'image':(it.pdf?'pdf':(it.csv?'csv':'excel')), bytes: it.buf.byteLength });
-      if (DB.hashes.has(hash)) { dupes++; 
+      // Reserve the hash ATOMICALLY the moment we see it. Because workers run
+      // concurrently, checking-then-adding-later left a race where two workers
+      // could both process the same file. add() right after the has() check
+      // closes that window (JS is single-threaded between awaits, so this pair
+      // is atomic).
+      if (DB.hashes.has(hash)) { dupes++;
         DIAG.info('skip', `${wname}: duplicate skipped: ${it.name}`, { reason:'content hash already ingested', hash: hash.slice(0,16) });
         return; }
+      DB.hashes.add(hash);   // claim it now, before any await, so no other worker double-processes
       let view;
       if (it.image) {
         if (!ocrReady) { try { await OCR.pool(); ocrReady = true; ocrWarmed = true; } catch(_){} }
@@ -3333,7 +3353,7 @@ async function ingest(fileList){
         if (r.verdict === 'PROVEN') r.verdict = 'UNPROVEN';
       }
       if (!BIG_BATCH) { try { r._sourceBlob = new Blob([it.buf], { type: it.pdf ? 'application/pdf' : 'application/octet-stream' }); } catch(_){} }
-      DB.docs.push(r); DB.hashes.add(hash); session.count++;
+      DB.docs.push(r); session.count++;   // hash already reserved above
 
       // push to the database as we go (every bill — the DB is the backing store).
       // QA validates before the push happens inside pushWithQA.
@@ -3345,7 +3365,7 @@ async function ingest(fileList){
       // free heavy memory now that it's stored (keep buffer for image bills the OCR pass needs)
       if (!r._hasImagePage) { delete r._pdfBuf; }
       if (BIG_BATCH) { delete r._sourceBlob; if (r.candidates && !r._hasImagePage) r.candidates = {}; }
-    } catch (e) { failed++; DIAG.error('worker', `${wname}: failed on ${it.name}`, { worker:wid, reason:e.message }); log(`${it.name} — ${e.message}`, 'er'); }
+    } catch (e) { failed++; if (hash) DB.hashes.delete(hash); DIAG.error('worker', `${wname}: failed on ${it.name}`, { worker:wid, reason:e.message }); log(`${it.name} — ${e.message}`, 'er'); }
     finally {
       DIAG.info('worker', `${wname}: finished ${it.name} in ${((Date.now()-tItem)/1000).toFixed(1)}s`, { worker:wid });
     }
@@ -3366,13 +3386,21 @@ async function ingest(fileList){
       } catch(e){ DIAG.error('push', `${wname}: QA kick but could NOT save ${r.filename}`, { worker:wid, reason:e.message }); }
       return 'kicked';
     }
-    if (typeof Pipeline!=='undefined') Pipeline.stats.pushed++;
-    try { await Cloud.enrichFromMaster(r); await Cloud.pushOne(r); r._pushed = true; pushedCount++;
+    // Attempt the push. IMPORTANT: only count as 'passed' after the database
+    // CONFIRMS the write — never on the mere decision to push (that was giving a
+    // false 'passed' count while the DB stayed empty).
+    try {
+      await Cloud.enrichFromMaster(r);
+      await Cloud.pushOne(r);
+      r._pushed = true; pushedCount++;
+      if (typeof Pipeline!=='undefined') Pipeline.stats.pushed++;   // confirmed
       DIAG.info('push', `${wname}: saved ${r.filename}`, { worker:wid, invoice: r.invoice.invoice_no });
       return 'pushed';
     } catch(e){
-      DIAG.error('push', `${wname}: save failed ${r.filename}`, { worker:wid, reason:e.message });
-      try { await Cloud.saveFailedBill(r, e.message); r._savedAsFailed = true; } catch(_){}
+      if (typeof Pipeline!=='undefined') Pipeline.stats.saveFailed = (Pipeline.stats.saveFailed||0) + 1;
+      DIAG.error('push', `${wname}: save FAILED ${r.filename}`, { worker:wid, reason:e.message });
+      try { await Cloud.saveFailedBill(r, 'Push failed: '+e.message); r._savedAsFailed = true; }
+      catch(e2){ DIAG.error('push', `${wname}: AND failed_uploads save failed for ${r.filename}`, { worker:wid, reason:e2.message }); }
       return 'saveissue';
     }
   }
@@ -3558,8 +3586,13 @@ async function runOcrPass(){
         delete d._pdfBuf; d._hasImagePage = false;
         return true;   // processed; now persisted and waiting in Review
       }
-      Pipeline.stats.pushed++;
-      try { await Cloud.enrichFromMaster(d); await Cloud.pushOne(d); d._pushed = true; } catch(_){}
+      try { await Cloud.enrichFromMaster(d); await Cloud.pushOne(d); d._pushed = true;
+        Pipeline.stats.pushed++;   // confirmed only
+      } catch(e){
+        Pipeline.stats.saveFailed = (Pipeline.stats.saveFailed||0)+1;
+        DIAG && DIAG.error('push', `OCR bill save FAILED: ${d.filename}`, { reason:e.message });
+        try { await Cloud.saveFailedBill(d, 'Push failed (OCR): '+e.message); } catch(_){}
+      }
       delete d._pdfBuf; d._hasImagePage = false;
       if (d._stashPath) { try { await fetch(`${Cloud.storageUrl}/object/bills/${d._stashPath}`,
         { method:'DELETE', headers:{ 'apikey':Cloud.key, 'Authorization':'Bearer '+Cloud.key } }); } catch(_){} d._stashPath = null; }
@@ -3634,12 +3667,14 @@ function renderWorkerPanel(){
   const queued = pool.waiting || 0;
   const progress = isProc ? ` · ${pool.done||0} of ${pool.total||0} done` : '';
   // QA card — the 5th worker: validates, auto-fixes, gates the push
-  const qs = (typeof Pipeline!=='undefined') ? Pipeline.stats : { pushed:0, kicked:0 };
+  const qs = (typeof Pipeline!=='undefined') ? Pipeline.stats : { pushed:0, kicked:0, saveFailed:0, autofixed:0 };
+  const failNote = qs.saveFailed ? ` · <b style="color:var(--fail)">${qs.saveFailed} failed to save</b>` : '';
+  const fixNote  = qs.autofixed ? ` · ${qs.autofixed} auto-fixed` : '';
   const qaCard = `<div class="wcard qa">
-    <div class="whead"><span class="wdot"></span><b>Anjali</b> · QA &amp; analyst</div>
-    <div class="wtrait">the gatekeeper — checks every bill, fixes the simple slips, kicks back the rest</div>
-    <div class="wjob">${qs.pushed} passed · ${qs.kicked} sent back</div>
-    <div class="wtime">validates &amp; pushes to database</div>
+    <div class="whead"><span class="wdot"></span><b>QA Lead</b> · quality &amp; analyst</div>
+    <div class="wtrait">checks every bill, fixes provable arithmetic, routes the rest</div>
+    <div class="wjob">${qs.pushed} passed → invoices${fixNote}</div>
+    <div class="wtime">${qs.kicked} sent back → failed_uploads (P1 for review)${failNote}</div>
   </div>`;
   const crewLabel = isProc ? 'Your processing crew' : 'Your OCR crew';
   el.innerHTML = `<div class="wtitle">${crewLabel} — ${online} of ${pool.n} online${progress}${queued?` · ${queued} waiting`:''}
@@ -5354,6 +5389,71 @@ $('#cloudClearFiles') && ($('#cloudClearFiles').onclick = async () => {
     DIAG && DIAG.ok('system', `cleared ${total} stored bill files`);
   } catch(e){ log('Could not clear stored files: '+e.message, 'er'); }
   btn.disabled = false; btn.textContent = 'Clear stored files';
+});
+
+$('#cloudSelfTest') && ($('#cloudSelfTest').onclick = async () => {
+  const btn=$('#cloudSelfTest'); btn.disabled=true; btn.textContent='Testing…';
+  const body = $('#cloudBody');
+  const stamp = Date.now();
+  // three DISTINCT bills with unique content hashes
+  const mk = (n) => ({
+    hash: `selftest-${stamp}-${n}`, filename: `selftest-${n}.pdf`,
+    invoice: { invoice_no: `SELFTEST-${stamp}-${n}`, content_hash: `selftest-${stamp}-${n}`,
+      total_paise: 1000*n, taxable_paise: 847*n, tax_total_paise: 153*n,
+      client_raw:'SELF TEST', branch_raw:'Diagnostic' },
+    applicants: [{ applicant_name:'Test Applicant', taxable_paise: 847*n, total_paise: 1000*n }],
+    candidates: { _applicant_rows:[{ normalized:[{ serial:'1', applicant_name:'Test Applicant', amount_paise:847*n, tax_paise:153*n }] }] },
+    checks: [{ check_id:'SELFTEST', status:'PASS', severity:'info', detail:'self-test row' }],
+    confidences: { invoice_no: 0.99 }, agreement: { invoice_no: 1 },
+    verdict: 'PROVEN', verification: 'self-test'
+  });
+  const bills = [mk(1), mk(2), mk(3)];
+  const lines = [];
+  try {
+    lines.push('Pushing 3 distinct test bills…');
+    let pushOk = 0;
+    for (const b of bills){ try { await Cloud.pushOne(b); pushOk++; } catch(e){ lines.push(`  push failed: ${e.message}`); } }
+    lines.push(`Pushed ${pushOk}/3 without error.`);
+    // read back each table filtered to our test hashes
+    const hashes = bills.map(b=>b.hash);
+    const inList = '(' + hashes.map(h=>`"${h}"`).join(',') + ')';
+    async function countIn(table, col){
+      try {
+        const r = await fetch(`${Cloud.url}/${table}?select=${col}&${col}=in.${inList}`, { headers: Cloud.headers({ 'Prefer':'count=exact','Range':'0-999' }) });
+        if (!r.ok) return `HTTP ${r.status}`;
+        const rows = await r.json(); return rows.length;
+      } catch(e){ return 'error: '+e.message; }
+    }
+    const invN  = await countIn('invoices','content_hash');
+    const lineN = await countIn('applicant_lines','content_hash');
+    const chkN  = await countIn('checks','content_hash');
+    const confN = await countIn('field_confidence','content_hash');
+    lines.push('');
+    lines.push('READ BACK (of the 3 test bills just pushed):');
+    lines.push(`  invoices:          ${invN} ${invN===3?'✓':'✗ EXPECTED 3'}`);
+    lines.push(`  applicant_lines:   ${lineN} ${lineN===3?'✓':'✗ EXPECTED 3'}`);
+    lines.push(`  checks:            ${chkN} ${chkN===3?'✓':'✗ EXPECTED 3'}`);
+    lines.push(`  field_confidence:  ${confN} ${confN===3?'✓':'✗ EXPECTED 3'}`);
+    lines.push('');
+    // interpret
+    if (invN === 3 && lineN===3 && chkN===3 && confN===3) {
+      lines.push('✓ ALL TABLES WROTE CORRECTLY. Your push path and SQL are healthy.');
+      lines.push('  If a real run showed 1 row, the cause is upstream (hashing or');
+      lines.push('  the bills not reaching push) — download the diagnostic log after a');
+      lines.push('  real run and share it.');
+    } else if (invN < 3) {
+      lines.push('✗ Even invoices did not get 3 rows. Either the sync function is');
+      lines.push('  collapsing rows (same content_hash) or RLS is blocking inserts.');
+      lines.push('  → Run sync_v7_definer.sql (SECURITY DEFINER) and re-test.');
+    } else if (lineN<3 || chkN<3 || confN<3) {
+      lines.push('✗ invoices wrote but a CHILD table did not — this is the RLS');
+      lines.push('  problem. → Run sync_v7_definer.sql AND extend_schema.sql, re-test.');
+    }
+    // clean up the test rows
+    try { await fetch(`${Cloud.url}/invoices?content_hash=in.${inList}`, { method:'DELETE', headers: Cloud.headers() }); lines.push(''); lines.push('(test rows cleaned up)'); } catch(_){}
+  } catch(e){ lines.push('Self-test error: '+e.message); }
+  if (body) body.innerHTML = `<pre style="white-space:pre-wrap;font-size:13px;line-height:1.5;background:var(--bg-soft);padding:14px;border-radius:8px;border:1px solid var(--line)">${lines.join('\n').replace(/</g,'&lt;')}</pre>`;
+  btn.disabled=false; btn.textContent='◇ Test database write';
 });
 
 $('#cloudPull') && ($('#cloudPull').onclick = async () => {
