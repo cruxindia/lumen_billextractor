@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='c237b423eea6';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='ff8dae55a63b';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -353,26 +353,32 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
     <!-- ===== LEDGER ===== -->
     <section class="view" id="v-analytics">
       <h1>Analytics</h1>
-      <p class="sub">Live from the database — pendency, days-past-due, and throughput. Filter, then act with write-offs (individual or bulk).</p>
-      <div class="row" style="margin-bottom:12px;gap:8px;flex-wrap:wrap">
+      <p class="sub">Live receivables view — outstanding, ageing, and risk. One filter bar drives every panel.</p>
+      <div class="row" style="margin-bottom:14px;gap:8px;flex-wrap:wrap">
         <select id="anDistrict"><option value="">All districts</option></select>
         <select id="anClient"><option value="">All clients</option></select>
-        <select id="anStatus"><option value="">All statuses</option><option value="__PENDING">Pending / Partial</option><option value="PAID">Paid</option><option value="WRITTEN_OFF">Written off</option></select>
+        <select id="anStatus"><option value="__PENDING">Outstanding (pending/partial)</option><option value="">All statuses</option><option value="PAID">Paid</option><option value="WRITTEN_OFF">Written off</option></select>
         <select id="anAge"><option value="">Any age</option><option value="30">0–30 days</option><option value="60">31–60 days</option><option value="90">61–90 days</option><option value="9999">90+ days</option></select>
         <span class="spacer"></span>
         <span class="mono dim" id="anCount"></span>
       </div>
-      <div id="anKpis" class="wpanel" style="margin-bottom:14px"></div>
-      <h2 style="margin:6px 0">Pendency by district</h2>
-      <div id="anByDistrict" class="tblwrap"></div>
-      <h2 style="margin:16px 0 6px">Days past due (DPD) buckets</h2>
-      <div id="anDpd" class="tblwrap"></div>
-      <h2 style="margin:16px 0 6px">Entries <span class="dim" style="font-size:12px;font-weight:400">— tick rows for bulk write-off, or write off one at a time</span></h2>
+      <div id="anKpis" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:18px"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start" id="anMidGrid">
+        <div>
+          <h2 style="margin:0 0 8px">Ageing by district</h2>
+          <div id="anAging" class="tblwrap" style="overflow-x:auto"></div>
+        </div>
+        <div>
+          <h2 style="margin:0 0 8px">Outstanding by age</h2>
+          <div id="anChart"></div>
+        </div>
+      </div>
+      <h2 style="margin:20px 0 8px">Priority accounts <span class="dim" style="font-size:12px;font-weight:400">— highest value × oldest, act first</span></h2>
       <div class="row" style="gap:8px;margin-bottom:8px">
         <button class="btn danger" id="anBulkWriteoff" title="Write off all ticked entries (password-protected)">Write off selected…</button>
         <span class="mono dim" id="anSelCount"></span>
       </div>
-      <div id="anTable" class="tblwrap"></div>
+      <div id="anTable" class="tblwrap" style="overflow-x:auto"></div>
     </section>
 
     <section class="view" id="v-ledger" style="display:none">
@@ -4042,11 +4048,13 @@ window.recruitWorker = function(){
   window.__desiredCrew = want;
   // grow the active crew if one is running; otherwise it takes effect next run
   if (window.__procCrew) {
-    const c = window.__procCrew; const i = c.n;
+    const c = window.__procCrew; const newIndex = c.n;   // the new worker's own index
     c.n = want; c.busy.push(false); c.startedAt.push(0); c.jobs.push(null);
     c.offline.push(false); c.freed.push(0);
-    // spawn a new line worker if the ingest loop exposed a spawner
-    if (typeof window.__spawnLineWorker === 'function') window.__spawnLineWorker(i);
+    // spawn a new line worker AT ITS OWN INDEX (not the old count) so recruiting
+    // several in a row never collides on the same slot — this is what made
+    // recruiting appear to stop after a dozen.
+    if (typeof window.__spawnLineWorker === 'function') window.__spawnLineWorker(newIndex);
   }
   DIAG && DIAG.info('system', `manager recruited worker #${want}`, { level:a.level, cores:a.cores });
   renderWorkerPanel();
@@ -6451,7 +6459,6 @@ function anFilteredRows(){
 function renderAnalytics(){
   const host = $('#anTable'); if (!host) return;
   const rows = window.dbRows || [];
-  // populate filter dropdowns once
   const fillSel = (sel, vals) => { const el=$(sel); if(!el) return; const cur=el.value;
     const opts = [...new Set(vals.filter(Boolean))].sort();
     if (el.options.length <= 1 + opts.length){ const first=el.options[0].outerHTML;
@@ -6461,50 +6468,76 @@ function renderAnalytics(){
 
   const list = anFilteredRows();
   if ($('#anCount')) $('#anCount').textContent = `${list.length} of ${rows.length}`;
-  const money = p => '₹'+((p||0)/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const money = p => '₹'+((p||0)/100).toLocaleString('en-IN',{minimumFractionDigits:0,maximumFractionDigits:0});
+  const moneyF = p => '₹'+((p||0)/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
   const isPend = s => /PENDING|PARTIAL/i.test(s||'');
+  const isWo = r => /WRITTEN_OFF/i.test(r.settlement_status||'')||r.written_off;
 
-  // KPIs
+  // ---- headline KPIs (with meaning) ----
+  const outList = list.filter(({r})=>isPend(r.settlement_status));
+  const outstanding = outList.reduce((a,{r})=>a+(r.total_paise||0),0);
   const billed = list.reduce((a,{r})=>a+(r.total_paise||0),0);
-  const pend = list.filter(({r})=>isPend(r.settlement_status));
-  const pendAmt = pend.reduce((a,{r})=>a+(r.total_paise||0),0);
-  const woff = list.filter(({r})=>/WRITTEN_OFF/i.test(r.settlement_status||'')||r.written_off).length;
-  const kpi = (label,val,color) => `<div class="wcard"><div class="wtrait">${label}</div><div style="font-size:22px;font-weight:600;${color?`color:${color}`:''}">${val}</div></div>`;
-  $('#anKpis').innerHTML = kpi('Entries', list.length) + kpi('Total billed', money(billed))
-    + kpi('Pending', money(pendAmt), 'var(--warn)') + kpi('Pending count', pend.length, 'var(--warn)')
-    + kpi('Written off', woff, 'var(--fail)');
+  const collected = list.filter(({r})=>/PAID/i.test(r.settlement_status||'')&&!isPend(r.settlement_status)).reduce((a,{r})=>a+(r.total_paise||0),0);
+  const pctColl = billed ? Math.round(collected/billed*100) : 0;
+  // amount-weighted average DPD across outstanding
+  let wSum=0,wAmt=0; outList.forEach(({r,dpd})=>{ if(dpd!=null){ wSum+=dpd*(r.total_paise||0); wAmt+=(r.total_paise||0);} });
+  const avgDpd = wAmt ? Math.round(wSum/wAmt) : 0;
+  const over90 = outList.filter(({dpd})=>dpd!=null&&dpd>90);
+  const over90Amt = over90.reduce((a,{r})=>a+(r.total_paise||0),0);
+  const woAmt = list.filter(({r})=>isWo(r)).reduce((a,{r})=>a+(r.total_paise||0),0);
+  const kpi = (label,val,sub,color) => `<div class="wcard" style="padding:12px 14px">
+    <div class="wtrait" style="font-size:11px">${label}</div>
+    <div style="font-size:24px;font-weight:700;line-height:1.1;margin:2px 0;${color?`color:${color}`:''}">${val}</div>
+    <div class="dim" style="font-size:10.5px">${sub}</div></div>`;
+  $('#anKpis').innerHTML =
+      kpi('Outstanding', money(outstanding), `${outList.length} bill(s) still owed`, 'var(--warn)')
+    + kpi('Collected', pctColl+'%', `${money(collected)} of ${money(billed)}`, 'var(--proof)')
+    + kpi('Avg age (weighted)', avgDpd+' d', 'by ₹ outstanding', avgDpd>60?'var(--fail)':'')
+    + kpi('Over 90 days', money(over90Amt), `${over90.length} bill(s) — highest risk`, 'var(--fail)')
+    + kpi('Written off', money(woAmt), `${list.filter(({r})=>isWo(r)).length} bill(s)`, 'var(--text-3)');
 
-  // Pendency by district
-  const byD = {};
-  list.forEach(({r,district})=>{ const k=district||'(unknown)'; (byD[k]=byD[k]||{n:0,amt:0,pend:0,pendAmt:0});
-    byD[k].n++; byD[k].amt+=(r.total_paise||0); if(isPend(r.settlement_status)){byD[k].pend++; byD[k].pendAmt+=(r.total_paise||0);} });
-  const dRows = Object.entries(byD).sort((a,b)=>b[1].pendAmt-a[1].pendAmt).map(([d,v])=>
-    `<tr><td>${esc(d)}</td><td style="text-align:right" class="mono">${v.n}</td><td style="text-align:right" class="mono">${money(v.amt)}</td><td style="text-align:right" class="mono">${v.pend}</td><td style="text-align:right;color:var(--warn)" class="mono">${money(v.pendAmt)}</td></tr>`).join('');
-  $('#anByDistrict').innerHTML = `<table class="grid"><thead><tr><th>District</th><th style="text-align:right">Entries</th><th style="text-align:right">Billed</th><th style="text-align:right">Pending #</th><th style="text-align:right">Pending ₹</th></tr></thead><tbody>${dRows||'<tr><td colspan=5 class=dim>No data</td></tr>'}</tbody></table>`;
+  // ---- ageing matrix: district × DPD bucket (₹ outstanding) ----
+  const BK = ['0–30','31–60','61–90','90+','no date'];
+  const bucketOf = dpd => dpd==null?'no date':(dpd<=30?'0–30':dpd<=60?'31–60':dpd<=90?'61–90':'90+');
+  const grid = {}; const colTot = {}; BK.forEach(b=>colTot[b]=0); let grand=0;
+  outList.forEach(({r,district,dpd})=>{ const d=district||'(unknown)'; const b=bucketOf(dpd);
+    grid[d]=grid[d]||{}; grid[d][b]=(grid[d][b]||0)+(r.total_paise||0); colTot[b]+=(r.total_paise||0); grand+=(r.total_paise||0); });
+  const distsByTot = Object.keys(grid).sort((a,b)=>{ const sa=BK.reduce((x,k)=>x+(grid[a][k]||0),0), sb=BK.reduce((x,k)=>x+(grid[b][k]||0),0); return sb-sa; });
+  const cell = (v,b) => { const c = b==='90+'?'color:var(--fail)':b==='61–90'?'color:var(--warn)':''; return `<td style="text-align:right;${c}" class="mono">${v?money(v):'·'}</td>`; };
+  const agRows = distsByTot.slice(0,25).map(d=>{ const rowTot=BK.reduce((x,k)=>x+(grid[d][k]||0),0);
+    return `<tr><td>${esc(d)}</td>${BK.map(b=>cell(grid[d][b]||0,b)).join('')}<td style="text-align:right;font-weight:700" class="mono">${money(rowTot)}</td></tr>`; }).join('');
+  const totRow = `<tr style="font-weight:700;border-top:2px solid var(--line)"><td>Total</td>${BK.map(b=>`<td style="text-align:right" class="mono">${money(colTot[b])}</td>`).join('')}<td style="text-align:right" class="mono">${money(grand)}</td></tr>`;
+  $('#anAging').innerHTML = `<table class="grid" style="font-size:11.5px"><thead><tr><th>District</th>${BK.map(b=>`<th style="text-align:right">${b}</th>`).join('')}<th style="text-align:right">Total</th></tr></thead><tbody>${agRows||'<tr><td colspan=7 class=dim>No outstanding bills</td></tr>'}${agRows?totRow:''}</tbody></table>${distsByTot.length>25?`<p class="sub">Top 25 of ${distsByTot.length} districts.</p>`:''}`;
 
-  // DPD buckets (pending only)
-  const buckets = {'0–30':0,'31–60':0,'61–90':0,'90+':0,'no date':0};
-  const bAmt = {'0–30':0,'31–60':0,'61–90':0,'90+':0,'no date':0};
-  pend.forEach(({r,dpd})=>{ let k; if(dpd==null)k='no date'; else if(dpd<=30)k='0–30'; else if(dpd<=60)k='31–60'; else if(dpd<=90)k='61–90'; else k='90+';
-    buckets[k]++; bAmt[k]+=(r.total_paise||0); });
-  const dpdRows = Object.keys(buckets).map(k=>`<tr><td>${k}${k!=='no date'?' days':''}</td><td style="text-align:right" class="mono">${buckets[k]}</td><td style="text-align:right" class="mono">${money(bAmt[k])}</td></tr>`).join('');
-  $('#anDpd').innerHTML = `<table class="grid"><thead><tr><th>Days past due</th><th style="text-align:right">Pending #</th><th style="text-align:right">Pending ₹</th></tr></thead><tbody>${dpdRows}</tbody></table>`;
+  // ---- inline SVG chart: outstanding ₹ by age bucket ----
+  const chartBk = ['0–30','31–60','61–90','90+'];
+  const vals = chartBk.map(b=>colTot[b]||0); const maxV = Math.max(1,...vals);
+  const W=320,H=200,pad=34,bw=(W-pad*2)/chartBk.length*0.62,gap=(W-pad*2)/chartBk.length;
+  const colFor = b => b==='90+'?'#B3261E':b==='61–90'?'#B37400':b==='31–60'?'#6A15C4':'#4C2082';
+  const bars = chartBk.map((b,i)=>{ const h=Math.round((vals[i]/maxV)*(H-pad*2)); const x=pad+i*gap+(gap-bw)/2; const y=H-pad-h;
+    return `<rect x="${x}" y="${y}" width="${bw}" height="${h}" rx="3" fill="${colFor(b)}"></rect>
+      <text x="${x+bw/2}" y="${H-pad+14}" font-size="10" text-anchor="middle" fill="var(--text-2)">${b}</text>
+      <text x="${x+bw/2}" y="${y-5}" font-size="9.5" text-anchor="middle" fill="var(--text-2)">${vals[i]?money(vals[i]):''}</text>`; }).join('');
+  $('#anChart').innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;height:auto">
+    <line x1="${pad}" y1="${H-pad}" x2="${W-pad}" y2="${H-pad}" stroke="var(--line)"></line>${bars}</svg>
+    <p class="dim" style="font-size:10.5px;margin:4px 0 0">Outstanding rupees grouped by how overdue they are. Red is the money most at risk.</p>`;
 
-  // Entries table with checkboxes + individual write-off
-  const body = list.slice(0,600).map(({r,district,dpd})=>{
-    const wo = /WRITTEN_OFF/i.test(r.settlement_status||'')||r.written_off;
+  // ---- priority accounts: highest value × oldest first ----
+  const scored = outList.map(o=>({...o, score:(o.r.total_paise||0)*(1+(o.dpd||0)/30)})).sort((a,b)=>b.score-a.score);
+  const body = scored.slice(0,300).map(({r,district,dpd})=>{
+    const wo = isWo(r);
     return `<tr${wo?' style="opacity:.55"':''}>
       <td><input type="checkbox" data-anh="${esc(r.content_hash)}" ${window.__anSelected[r.content_hash]?'checked':''} ${wo?'disabled':''}></td>
       <td class="mono">${esc(r.invoice_no||'')}</td>
       <td>${esc(r.client_raw||'')}</td>
       <td>${esc(district)}</td>
-      <td style="text-align:right" class="mono">${money(r.total_paise)}</td>
-      <td style="text-align:right" class="mono">${dpd==null?'—':dpd}</td>
+      <td style="text-align:right" class="mono">${moneyF(r.total_paise)}</td>
+      <td style="text-align:right;${dpd>90?'color:var(--fail);font-weight:600':''}" class="mono">${dpd==null?'—':dpd}</td>
       <td>${esc(r.settlement_status||'')}</td>
       <td>${wo?'<span class="dim">written off</span>':`<button class="btn sm" onclick="writeOffOne('${esc(r.content_hash)}')">Write off</button>`}</td>
     </tr>`;
   }).join('');
-  host.innerHTML = `<table class="grid"><thead><tr><th></th><th>Invoice</th><th>Client</th><th>District</th><th style="text-align:right">Total</th><th style="text-align:right">DPD</th><th>Status</th><th></th></tr></thead><tbody>${body||'<tr><td colspan=8 class=dim>No entries match.</td></tr>'}</tbody></table>${list.length>600?'<p class="sub">Showing first 600. Filter to narrow.</p>':''}`;
+  host.innerHTML = `<table class="grid"><thead><tr><th></th><th>Invoice</th><th>Client</th><th>District</th><th style="text-align:right">Total</th><th style="text-align:right">DPD</th><th>Status</th><th></th></tr></thead><tbody>${body||'<tr><td colspan=8 class=dim>No outstanding accounts match.</td></tr>'}</tbody></table>${scored.length>300?`<p class="sub">Top 300 of ${scored.length} by priority.</p>`:''}`;
   updateAnSelCount();
 }
 function updateAnSelCount(){ const n=Object.values(window.__anSelected).filter(Boolean).length; if($('#anSelCount')) $('#anSelCount').textContent = n?`${n} selected`:''; }
