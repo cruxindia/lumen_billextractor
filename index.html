@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='2cd2bff91ceb';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='9bdbe966db63';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -56,6 +56,16 @@ button{cursor:pointer;background:none;border:none}
 .app{display:grid;grid-template-columns:186px 1fr;grid-template-rows:46px 1fr;height:100%}
 .topbar{grid-column:1/-1;display:flex;align-items:center;gap:14px;padding:0 16px;background:var(--surface);border-bottom:1px solid var(--line)}
 .mark{font-family:var(--serif);font-size:19px;letter-spacing:.02em;font-weight:600}
+.brandwrap{display:flex;align-items:center;gap:12px}
+.cruxlogo{height:34px;width:auto;display:block;object-fit:contain}
+.cruxmark{font-weight:800;letter-spacing:.14em;font-size:20px;color:#fff;background:linear-gradient(135deg,#4C2082,#6A15C4);padding:7px 12px;border-radius:7px;line-height:1;box-shadow:0 1px 3px rgba(76,32,130,.35)}
+.brandtext .tagline{font-size:11px}
+.btn.danger{border-color:var(--fail);color:var(--fail)}
+.btn.danger:hover{background:color-mix(in srgb,var(--fail) 10%,transparent)}
+.chip.drag{cursor:grab;user-select:none}
+.chip.drag .draghandle{opacity:.5;font-size:13px;letter-spacing:-2px;margin-right:2px}
+.chip.dragging{opacity:.45}
+.chip.dropbefore{box-shadow:-3px 0 0 0 var(--accent)}
 .mark span{color:var(--accent)}
 .tagline{font-size:11px;color:var(--text-3);border-left:1px solid var(--line);padding-left:14px;letter-spacing:.03em}
 .spacer{flex:1}
@@ -201,6 +211,13 @@ label.chk input{accent-color:var(--accent)}
 .dashk{font-size:11px;color:var(--text-2);text-transform:uppercase;letter-spacing:.04em}
 .dashv{font-size:26px;font-weight:600;line-height:1.1;margin-top:2px;font-variant-numeric:tabular-nums}
 .dashsub{font-size:11px;color:var(--text-2);margin-top:2px}
+.fsum{display:grid;grid-template-columns:repeat(7,1fr);gap:10px;margin:14px 0;padding:14px;border:1px solid var(--line);border-radius:10px;background:var(--bg-soft)}
+@media(max-width:1100px){.fsum{grid-template-columns:repeat(4,1fr)}}
+@media(max-width:700px){.fsum{grid-template-columns:repeat(2,1fr)}}
+.fsumcard{text-align:left}
+.fsk{font-size:11px;color:var(--text-2);text-transform:uppercase;letter-spacing:.03em}
+.fsv{font-size:20px;font-weight:600;font-variant-numeric:tabular-nums;margin-top:2px}
+th.sortable:hover{color:var(--accent)}
 .wcard.qa .wdot{background:var(--proof)}
 .wcard .whead{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-2);margin-bottom:4px}
 .wdot{width:8px;height:8px;border-radius:50%;background:var(--line);flex:none}
@@ -260,8 +277,14 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
 <body>
 <div class="app">
   <header class="topbar">
-    <div class="mark">Lumen<span>.</span></div>
-    <div class="tagline">Every figure proved, or explained</div>
+    <div class="brandwrap">
+      <img src="logo.png" alt="Crux" class="cruxlogo" onerror="this.style.display='none';document.getElementById('cruxWordmark').style.display='inline-block'">
+      <div class="cruxmark" id="cruxWordmark" aria-label="Crux Risk Management" style="display:none">CRUX</div>
+      <div class="brandtext">
+        <div class="mark">Lumen<span>.</span></div>
+        <div class="tagline">Crux Risk Management Pvt. Ltd. · Every figure proved, or explained</div>
+      </div>
+    </div>
     <div class="spacer"></div>
     <span class="pill" id="enginePill"><i class="dot"></i> Standalone</span>
     <span class="pill" id="libPill"><i class="dot"></i> Readers</span>
@@ -279,8 +302,6 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
     <div class="rail-head">DATABASE</div>
     <button data-v="cloud">⛁ <span class="t">Database</span><span class="num" id="nCloud"></span></button>
     <div class="rail-head">WORKSPACE</div>
-    <button id="saveWs">↓ <span class="t">Save</span></button>
-    <button id="openWs">↑ <span class="t">Open</span></button>
     <button id="clearWs">✕ <span class="t">Clear</span></button>
   </nav>
 
@@ -378,19 +399,21 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
         <span class="dim" id="misStatus" style="font-size:12px"></span>
       </div>
       <div class="filterbar" id="misFilters"></div>
-      <h2>Columns in the report — drag order with the arrows</h2>
+      <h2>Columns in the report — drag to reorder</h2>
       <div class="row" id="colChosen" style="gap:6px"></div>
+      <div id="misSummary"></div>
       <h2>Add a column</h2>
       <div class="row" id="colAvail" style="gap:6px"></div>
-      <div class="row" style="margin:13px 0">
-        <select id="preset"></select>
+      <div class="row" style="margin:13px 0;align-items:center">
+        <label class="dim" style="font-size:12px;display:flex;align-items:center;gap:6px">Load a ready-made layout:
+          <select id="preset" title="Pick a ready-made column layout for a common report. This replaces the current columns — you can still add or remove columns after."></select>
+        </label>
         <span class="mono dim" id="colCount"></span>
         <span class="spacer"></span>
         <button class="btn" id="expCsv">Export CSV</button>
         <button class="btn" id="expXlsx">Export Excel</button>
         <button class="btn" id="expNeedsAttention" title="Export every bill that is unproven, has missing values, or needs OCR — with the reason for each, so they can be reviewed and fixed">⚠ Export bills needing attention</button>
         <label class="chk" title="Group rows by applicant and add a Sub total line after each"><input type="checkbox" id="optSubtotal"> Group with sub-totals</label>
-        <button class="btn" id="expDef">Export definition</button>
       </div>
       <div class="tblwrap" style="max-height:calc(100vh - 330px)"><table id="report"><thead></thead><tbody></tbody></table></div>
       </div><!-- /reportSubBody -->
@@ -404,6 +427,15 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
         <button data-sub="reconcile" onclick="showDbSub('reconcile')">Reconcile payments</button>
       </div>
       <div id="dbSyncBody">
+      <div class="findbox">
+        <h2 style="margin:0 0 8px">Find & fix any bill</h2>
+        <p class="sub" style="margin:0 0 10px">Spotted a mistake in an entry that isn't flagged in Review? Search it by invoice number, client, or branch and correct it directly — the fix saves to the database.</p>
+        <div class="row" style="gap:8px">
+          <input type="text" id="findInvoice" placeholder="Invoice number, client, or branch…" style="flex:1;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text)">
+          <button class="btn pri" id="findGo">Search</button>
+        </div>
+        <div id="findResults" style="margin-top:12px"></div>
+      </div>
       <p class="sub">Push every ingested bill to the shared Supabase database, and pull the whole history back
          down so this tool shows everything ever processed — not just this session. Duplicates are handled by
          the database itself: the same bill can never be stored twice.</p>
@@ -419,10 +451,7 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
       <div class="row" style="margin:14px 0;flex-wrap:wrap">
         <button class="btn" id="cloudBranches">View branches learned</button>
         <button class="btn" id="cloudClients">View clients</button>
-        <button class="btn" id="cloudPush">Re-save this session</button>
-        <button class="btn" id="cloudPull">Reload from database</button>
-        <button class="btn" id="cloudClearFiles" title="Delete all stored bill files from the bills bucket — use with reset_data.sql for a clean slate">Clear stored files</button>
-        <button class="btn" id="cloudSelfTest" title="Push 3 distinct test bills and read back exactly what landed in each table — reveals where data is being lost">◇ Test database write</button>
+        <button class="btn danger" id="cloudDanger" title="Password-protected destructive actions: clear stored files or wipe the whole database">⚠ Danger zone…</button>
         <span class="pill" id="cloudStatus"><i class="dot"></i> Ready</span>
       </div>
 
@@ -2385,18 +2414,33 @@ const Cloud = {
   /* Apply pending-list reconciliation: for each invoice, set settlement_status
      + received_paise + pending_paise directly. Schema-resilient (drops unknown
      columns and retries) so a missing migration never blocks the whole run. */
-  async applyReconciliation(updates){
-    let done = 0;
-    for (const u of updates) {
-      try {
-        await this.updateOne(u.content_hash, {
+  async applyReconciliation(updates, onProgress){
+    // Write in parallel (a few PATCHes in flight) instead of one-at-a-time —
+    // reconciliation is network-bound, so concurrency is the real speed-up
+    // (the same lesson as the push: CPU workers don't help network waits).
+    let done = 0, failed = 0;
+    const CONC = 5;   // patches in flight at once
+    let cursor = 0;
+    const self = this;
+    async function worker(){
+      while (cursor < updates.length){
+        const u = updates[cursor++];
+        const patch = {
           settlement_status: u.settlement_status,
           received_paise: u.received_paise,
           pending_paise: u.pending_paise,
-          last_reconciled_at: new Date().toISOString() });
-        done++;
-      } catch(e){ DIAG && DIAG.warn('push', `could not update ${u.invoice_no}`, { reason:e.message }); }
+          last_reconciled_at: new Date().toISOString() };
+        // include any gap-fills reconciliation found (only set columns that exist)
+        if (u.client_raw)  patch.client_raw  = u.client_raw;
+        if (u.branch_raw)  patch.branch_raw  = u.branch_raw;
+        if (u.branch_code) patch.branch_code = u.branch_code;
+        try { await self.updateOne(u.content_hash, patch); done++; }
+        catch(e){ failed++; DIAG && DIAG.warn('push', `could not update ${u.invoice_no}`, { reason:e.message }); }
+        if (onProgress && (done+failed) % 20 === 0) onProgress(done+failed, updates.length);
+      }
     }
+    await Promise.all(Array.from({length: Math.min(CONC, updates.length)}, worker));
+    if (onProgress) onProgress(updates.length, updates.length);
     return done;
   },
 
@@ -3984,15 +4028,73 @@ function filtered(){
 }
 
 function renderLedger(){
-  const rows = filtered();
+  let rows = filtered();
   const total = (DB.docs&&DB.docs.length) ? DB.docs.length : ((window.misRows||window.reviewPulled||[]).length || rows.length);
   $('#ledgerCount').textContent = `${rows.length} of ${total}`;
   const t = $('#ledger');
-  t.tHead.innerHTML = '<tr>' + LEDGER_COLS.map(c => `<th>${c[0]}</th>`).join('') + '</tr>';
+  // sortable headers — click to sort, click again to reverse
+  const srt = window.__ledgerSort || { col:-1, dir:1 };
+  if (srt.col >= 0) {
+    const cellFn = LEDGER_COLS[srt.col][2];
+    rows = rows.slice().sort((a,b)=>{
+      let va = sortKey(cellFn, a), vb = sortKey(cellFn, b);
+      if (va < vb) return -1*srt.dir; if (va > vb) return 1*srt.dir; return 0;
+    });
+  }
+  t.tHead.innerHTML = '<tr>' + LEDGER_COLS.map((c,i) => {
+    const arrow = srt.col===i ? (srt.dir===1?' ▲':' ▼') : '';
+    return `<th class="sortable" onclick="sortLedger(${i})" style="cursor:pointer;user-select:none">${c[0]}${arrow}</th>`;
+  }).join('') + '</tr>';
   if (!rows.length) { t.tBodies[0].innerHTML = `<tr><td colspan="${LEDGER_COLS.length}"><div class="empty"><h3>Nothing here yet</h3><p>Ingest documents to build the ledger.</p></div></td></tr>`; return; }
   t.tBodies[0].innerHTML = rows.slice(0, 500).map(r =>
     `<tr data-id="${r.id}">` + LEDGER_COLS.map(c => `<td class="${c[1]}">${c[2](r)}</td>`).join('') + '</tr>').join('');
 }
+// derive a sortable value from a column's render function: numbers sort numeric,
+// everything else sorts as lowercased text with tags/HTML stripped.
+function sortKey(cellFn, row){
+  let v = cellFn(row);
+  if (typeof v === 'number') return v;
+  const s = String(v==null?'':v).replace(/<[^>]*>/g,'').trim();
+  const num = parseFloat(s.replace(/[₹,]/g,''));
+  return (s && !isNaN(num) && /^[₹\d,.\s-]+$/.test(s)) ? num : s.toLowerCase();
+}
+window.sortLedger = (col) => {
+  const s = window.__ledgerSort || { col:-1, dir:1 };
+  window.__ledgerSort = (s.col===col) ? { col, dir: -s.dir } : { col, dir:1 };
+  renderLedger();
+};
+window.sortReport = (col) => {
+  const s = window.__reportSort || { col:-1, dir:1 };
+  window.__reportSort = (s.col===col) ? { col, dir: -s.dir } : { col, dir:1 };
+  renderReport();
+};
+
+/* Financial summary strip for the MIS report — respects the current filters, so
+   you can see the money picture for All, or just Pending, or just Paid, etc. */
+function renderMisSummary(){
+  const el = $('#misSummary'); if (!el) return;
+  const rows = misFiltered();
+  let total=0, taxable=0, tax=0, received=0, pending=0, paidN=0, partialN=0, pendingN=0;
+  rows.forEach(r => {
+    const i = r.invoice;
+    total += i.total_paise||0; taxable += i.taxable_paise||0; tax += i.tax_total_paise||0;
+    received += i.received_paise||0; pending += i.pending_paise||0;
+    const s = i.settlement_status;
+    if (s==='PAID') paidN++; else if (s==='PARTIAL') partialN++; else if (s==='PENDING') pendingN++;
+  });
+  const money = p => '₹' + (p/100).toLocaleString('en-IN',{maximumFractionDigits:0});
+  el.innerHTML = `
+    <div class="fsum">
+      <div class="fsumcard"><div class="fsk">Invoices</div><div class="fsv">${rows.length.toLocaleString('en-IN')}</div></div>
+      <div class="fsumcard"><div class="fsk">Billed total</div><div class="fsv">${money(total)}</div></div>
+      <div class="fsumcard"><div class="fsk">Taxable</div><div class="fsv">${money(taxable)}</div></div>
+      <div class="fsumcard"><div class="fsk">Tax</div><div class="fsv">${money(tax)}</div></div>
+      <div class="fsumcard"><div class="fsk">Received</div><div class="fsv" style="color:var(--proof)">${money(received)}</div></div>
+      <div class="fsumcard"><div class="fsk">Outstanding</div><div class="fsv" style="color:var(--warn)">${money(pending)}</div></div>
+      <div class="fsumcard"><div class="fsk">Paid / Partial / Pending</div><div class="fsv" style="font-size:16px">${paidN} / ${partialN} / ${pendingN}</div></div>
+    </div>`;
+}
+window.renderMisSummary = renderMisSummary;
 
 /* ---- plain-language layer: turn check_id + detail into words a person reads,
    and name which invoice fields the fix involves. ---- */
@@ -4091,9 +4193,18 @@ function renderReview(){
   const base = (window.reviewPulled && window.reviewPulled.length) ? window.reviewPulled : DB.docs;
   const source = [...failed, ...base];
 
-  const rows = source.filter(r => flaggedOnly
+  let rows = source.filter(r => flaggedOnly
     ? r.checks && r.checks.some(c => c.status === 'FAIL')
     : true);
+
+  // 6-WAY SPLIT: so 5-6 people can each take a fixed slice without two people
+  // opening the same bill. The slice is deterministic (by content hash), so
+  // "Part 3 of 6" always means the same bills for everyone — assign one part per
+  // person. Part 0 = the whole list (no split).
+  const part = window.__reviewPart || 0;
+  if (part > 0) {
+    rows = rows.filter(r => (hashBucket(r.hash||r.content_hash||r.invoice.invoice_no||'') % 6) === (part-1));
+  }
 
   // sort: problems first, by value at risk
   rows.sort((a,b) => {
@@ -4113,8 +4224,12 @@ function renderReview(){
       <button class="${flaggedOnly?'on':''}" onclick="setReviewMode('flagged')">Needs fixing (${flaggedCount})</button>
       <button class="${!flaggedOnly?'on':''}" onclick="setReviewMode('all')">All bills (${source.length})</button>
     </div>
-    <span class="dim" style="font-size:12px">${window.reviewPulled&&window.reviewPulled.length?'showing pulled database records':'showing this session'}</span>
-    <button class="btn" id="reviewPullBtn">Pull from database</button>`;
+    <label class="dim" style="font-size:12px;display:flex;align-items:center;gap:6px">Assign part
+      <select onchange="setReviewPart(this.value)" style="padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--text)">
+        <option value="0" ${part===0?'selected':''}>Everyone (all)</option>
+        ${[1,2,3,4,5,6].map(p=>`<option value="${p}" ${part===p?'selected':''}>Part ${p} of 6</option>`).join('')}
+      </select></label>
+    <span class="dim" style="font-size:12px">${window.reviewPulled&&window.reviewPulled.length?'● live from database':'showing this session'}${part>0?` · showing your ${rows.length} of ${flaggedOnly?flaggedCount:source.length}`:''}</span>`;
 
   t.tHead.innerHTML = '<tr><th></th><th>Invoice</th><th>Client · Branch</th><th>What needs checking</th><th></th></tr>';
   t.tBodies[0].innerHTML = rows.length ? rows.slice(0,400).map(r => {
@@ -4134,6 +4249,14 @@ function renderReview(){
 }
 
 window.setReviewMode = m => { window.__reviewMode = m; renderReview(); };
+window.setReviewPart = p => { window.__reviewPart = parseInt(p,10)||0; renderReview(); };
+// deterministic bucket 0..(n-1) from a string — same bill always lands in the
+// same part, so the 6-way split is stable across people and refreshes.
+function hashBucket(str){
+  let h = 0; str = String(str);
+  for (let i=0;i<str.length;i++){ h = ((h<<5)-h + str.charCodeAt(i))|0; }
+  return Math.abs(h);
+}
 
 /* open a single bill for correction — plain language, every relevant field editable */
 window.openReview = (key) => {
@@ -4376,7 +4499,13 @@ function buildMisFilters(){
     <label>From <input type="date" value="${misFilter.from}" onchange="setMisFilter('from',this.value)"></label>
     <label>To <input type="date" value="${misFilter.to}" onchange="setMisFilter('to',this.value)"></label>
     <label>Verdict <select onchange="setMisFilter('verdict',this.value)">${opt(verdicts, misFilter.verdict)}</select></label>
-    <label>Payment <select onchange="setMisFilter('settlement',this.value)">${opt(settlements, misFilter.settlement)}</select></label>
+    <label>Payment <select onchange="setMisFilter('settlement',this.value)">
+      <option value="" ${!misFilter.settlement?'selected':''}>All</option>
+      <option value="__OUTSTANDING" ${misFilter.settlement==='__OUTSTANDING'?'selected':''}>Pending (incl. partial)</option>
+      <option value="PENDING" ${misFilter.settlement==='PENDING'?'selected':''}>Pending only</option>
+      <option value="PARTIAL" ${misFilter.settlement==='PARTIAL'?'selected':''}>Partial only</option>
+      <option value="PAID" ${misFilter.settlement==='PAID'?'selected':''}>Paid</option>
+    </select></label>
     ${Object.values(misFilter).some(Boolean)?`<button class="btn sm" onclick="clearMisFilters()">Clear filters</button>`:''}`;
 }
 window.setMisFilter = (k,v) => { window.misFilter[k]=v; renderReport(); buildMisFilters(); };
@@ -4390,7 +4519,8 @@ function misFiltered(){
     if (f.client && i.client_raw !== f.client) return false;
     if (f.branch && i.branch_raw !== f.branch) return false;
     if (f.verdict && r.verdict !== f.verdict) return false;
-    if (f.settlement && i.settlement_status !== f.settlement) return false;
+    if (f.settlement === '__OUTSTANDING') { if (i.settlement_status !== 'PENDING' && i.settlement_status !== 'PARTIAL') return false; }
+    else if (f.settlement && i.settlement_status !== f.settlement) return false;
     if (f.from && (!i.invoice_date || i.invoice_date < f.from)) return false;
     if (f.to && (!i.invoice_date || i.invoice_date > f.to)) return false;
     return true;
@@ -4399,19 +4529,33 @@ function misFiltered(){
 
 function renderReport(){
   $('#colChosen').innerHTML = reportCols.map((k,i) =>
-    `<span class="chip${flashCol===k?' flash':''}">
-       <button data-mv="${i},-1" title="Move left" ${i===0?'disabled':''}>◀</button>
+    `<span class="chip drag${flashCol===k?' flash':''}" draggable="true" data-idx="${i}" data-key="${k}" title="Drag to reorder">
+       <span class="draghandle">⠿</span>
        <b>${colLabel(k)}</b>
-       <button data-mv="${i},1" title="Move right" ${i===reportCols.length-1?'disabled':''}>▶</button>
        <button data-rm="${k}" title="Remove">✕</button>
      </span>`).join('') || '<span class="dim">No columns selected — add some below.</span>';
   const avail = Object.keys(FIELD_MAP).filter(k => !reportCols.includes(k));
   $('#colAvail').innerHTML = avail.map(k => `<button class="chip add" data-add="${k}">+ ${colLabel(k)}</button>`).join('')
     || '<span class="dim">Every available column is already in the report.</span>';
   $('#colCount').textContent = `${reportCols.length} column(s) · ${reportRows().length} row(s)`;
-  const sel = $('#preset'); if (!sel.options.length) sel.innerHTML = Object.keys(PRESETS).map(p=>`<option>${p}</option>`).join('');
-  const rows = reportRows(), t = $('#report');
-  t.tHead.innerHTML = '<tr>' + reportCols.map(k=>`<th>${colLabel(k)}</th>`).join('') + '</tr>';
+  renderMisSummary();
+  const sel = $('#preset'); if (!sel.options.length) sel.innerHTML = '<option value="">— choose a layout —</option>' + Object.keys(PRESETS).map(p=>`<option>${p}</option>`).join('');
+  let rows = reportRows(); const t = $('#report');
+  const rsrt = window.__reportSort || { col:-1, dir:1 };
+  if (rsrt.col >= 0 && rsrt.col < reportCols.length) {
+    rows = rows.slice().sort((a,b)=>{
+      let va = a[rsrt.col], vb = b[rsrt.col];
+      const na = parseFloat(String(va).replace(/[₹,]/g,'')), nb = parseFloat(String(vb).replace(/[₹,]/g,''));
+      const bothNum = !isNaN(na)&&!isNaN(nb)&&/[\d]/.test(String(va))&&/[\d]/.test(String(vb));
+      if (bothNum) return (na-nb)*rsrt.dir;
+      va=String(va==null?'':va).toLowerCase(); vb=String(vb==null?'':vb).toLowerCase();
+      if (va<vb) return -1*rsrt.dir; if (va>vb) return 1*rsrt.dir; return 0;
+    });
+  }
+  t.tHead.innerHTML = '<tr>' + reportCols.map((k,i)=>{
+    const arrow = rsrt.col===i ? (rsrt.dir===1?' ▲':' ▼') : '';
+    return `<th class="sortable" onclick="sortReport(${i})" style="cursor:pointer;user-select:none">${colLabel(k)}${arrow}</th>`;
+  }).join('') + '</tr>';
   t.tBodies[0].innerHTML = rows.length ? rows.slice(0,300).map(r=>'<tr>'+r.map((v,i)=>
     `<td class="${FIELD_MAP[reportCols[i]].n?'num':''}"${String(v).includes('RECHECK')?' style="color:var(--fail);font-weight:600"':''}>${FIELD_MAP[reportCols[i]].n && typeof v==='number' ? v.toLocaleString('en-IN',{minimumFractionDigits:2}) : esc(v)}</td>`).join('')+'</tr>').join('')
     : `<tr><td colspan="${reportCols.length}"><div class="empty"><h3>No rows</h3><p>Ingest documents first.</p></div></td></tr>`;
@@ -4848,12 +4992,41 @@ $('#colAvail').onclick = e => { const b = e.target.closest('[data-add]'); if(!b)
 $('#colChosen').onclick = e => {
   const rm = e.target.closest('[data-rm]');
   if (rm) { reportCols = reportCols.filter(x => x !== rm.dataset.rm); renderReport(); return; }
-  const mv = e.target.closest('[data-mv]');
-  if (mv) { const [i, d] = mv.dataset.mv.split(',').map(Number); const j = i + d;
-    if (j < 0 || j >= reportCols.length) return;
-    const c = reportCols.slice(); [c[i], c[j]] = [c[j], c[i]];
-    reportCols = c; flashCol = reportCols[j]; renderReport(); } };
-$('#preset').onchange = e => { reportCols = PRESETS[e.target.value].slice(); renderReport(); };
+};
+/* Drag-and-drop column reordering. dragstart records the picked column; dragover
+   allows dropping; drop moves the picked column to the target's position. */
+let __dragKey = null;
+$('#colChosen').addEventListener('dragstart', e => {
+  const chip = e.target.closest('.chip.drag'); if (!chip) return;
+  __dragKey = chip.dataset.key; chip.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+  try { e.dataTransfer.setData('text/plain', __dragKey); } catch(_){}
+});
+$('#colChosen').addEventListener('dragend', e => {
+  const chip = e.target.closest('.chip.drag'); if (chip) chip.classList.remove('dragging');
+  $$('#colChosen .chip.drag').forEach(c => c.classList.remove('dropbefore'));
+});
+$('#colChosen').addEventListener('dragover', e => {
+  e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+  const over = e.target.closest('.chip.drag');
+  $$('#colChosen .chip.drag').forEach(c => c.classList.remove('dropbefore'));
+  if (over && over.dataset.key !== __dragKey) over.classList.add('dropbefore');
+});
+$('#colChosen').addEventListener('drop', e => {
+  e.preventDefault();
+  const over = e.target.closest('.chip.drag');
+  $$('#colChosen .chip.drag').forEach(c => c.classList.remove('dropbefore'));
+  if (!__dragKey) return;
+  const from = reportCols.indexOf(__dragKey);
+  let to = over ? reportCols.indexOf(over.dataset.key) : reportCols.length - 1;
+  if (from < 0 || to < 0 || from === to) { __dragKey = null; return; }
+  const c = reportCols.slice();
+  c.splice(from, 1);
+  c.splice(to, 0, __dragKey);
+  reportCols = c; flashCol = __dragKey; __dragKey = null;
+  renderReport();
+});
+$('#preset').onchange = e => { if(!e.target.value) return; reportCols = PRESETS[e.target.value].slice(); renderReport(); };
 $('#expCsv').onclick = () => { const h = reportCols.map(colLabel);
   download('lumen-report.csv', new Blob([toCsv(h, reportRows())], {type:'text/csv'})); };
 /* One workbook, four sheets. The raw applicant rows are what you reconcile
@@ -5234,16 +5407,6 @@ $('#expNeedsAttention').onclick = async () => {
   DIAG.info('system', `exported ${problems.length} bills needing attention`);
 };
 
-$('#expDef').onclick = () => download('report-definition.json', new Blob([JSON.stringify(
-  { id:'rpt_custom', columns: reportCols.map((k,i)=>({key:k, label:colLabel(k), order:i})) }, null, 1)], {type:'application/json'}));
-
-$('#saveWs').onclick = () => download('lumen-workspace.json',
-  new Blob([JSON.stringify({ docs: DB.docs, sessions: DB.sessions, savedAt: new Date().toISOString() })], {type:'application/json'}));
-$('#openWs').onclick = () => { const i = document.createElement('input'); i.type = 'file'; i.accept = '.json';
-  i.onchange = async () => { try { const d = JSON.parse(await i.files[0].text());
-    DB.docs = d.docs || []; DB.sessions = d.sessions || []; DB.hashes = new Set(DB.docs.map(x=>x.hash));
-    renderAll(); persist(); log(`Workspace opened — ${DB.docs.length} document(s)`, 'ok');
-  } catch(e){ log('Could not read that workspace file', 'er'); } }; i.click(); };
 $('#clearWs').onclick = () => { if (!confirm('Clear all ingested documents from this workspace?')) return;
   DB.docs = []; DB.hashes = new Set(); DB.sessions = []; renderAll(); persist(); log('Workspace cleared', 'wn'); };
 
@@ -5417,19 +5580,20 @@ function reconcilePending(parsed, invoices){
   const pendingByInv = new Map();
   parsed.items.forEach(it => pendingByInv.set(it.invoice_no, it));
 
-  const updates = [];       // {content_hash, status, received_paise, pending_paise}
+  const updates = [];       // {content_hash, status, received_paise, pending_paise, ...enrichment}
   let paid=0, partial=0, pending=0, unmatchedInFile=0;
   let totalPending=0;
+  const flags = [];         // entries where reconciliation found a problem worth review
+  let enriched=0, checked=0;
 
   invoices.forEach(iv => {
+    checked++;
     const total = iv.total_paise || 0;
     const it = pendingByInv.get(normInv(iv.invoice_no));
     let status, received, pend;
     if (!it) {
-      // not in the pending list -> fully paid
       status='PAID'; received=total; pend=0; paid++;
     } else {
-      // in the list -> compute pending
       if (it.pending_amount != null) {
         pend = Math.round(it.pending_amount*100);
         received = Math.max(total - pend, 0);
@@ -5437,24 +5601,42 @@ function reconcilePending(parsed, invoices){
         received = Math.round(it.received_amount*100);
         pend = Math.max(total - received, 0);
       } else {
-        // present but no amount -> fully pending
         received = 0; pend = total;
       }
       if (pend <= 0) { status='PAID'; paid++; }
       else if (received > 0) { status='PARTIAL'; partial++; totalPending += pend; }
       else { status='PENDING'; pending++; totalPending += pend; }
     }
-    updates.push({ content_hash: iv.content_hash, invoice_no: iv.invoice_no,
-      settlement_status: status, received_paise: received, pending_paise: pend });
+
+    const upd = { content_hash: iv.content_hash, invoice_no: iv.invoice_no,
+      settlement_status: status, received_paise: received, pending_paise: pend };
+
+    // CHECK EVERY ENTRY as we reconcile. Two useful things:
+    // 1) If the DB row is missing a field the pending-list file HAS, fill it in.
+    // 2) If the entry has a data problem (no total, received > total, etc.), flag it.
+    if (it) {
+      // enrich: file has a value the DB row lacks
+      const fillable = ['client','branch','branch_code'];
+      fillable.forEach(f => {
+        const fileVal = it[f]; const dbCol = f==='client'?'client_raw':(f==='branch'?'branch_raw':'branch_code');
+        if (fileVal && !iv[dbCol]) { upd[dbCol] = fileVal; enriched++; }
+      });
+    }
+    // validate the entry
+    if (total <= 0) { flags.push({ invoice_no: iv.invoice_no, reason: 'no total on the invoice — cannot reconcile the amount' }); }
+    else if (it && received > total + 100) { flags.push({ invoice_no: iv.invoice_no, reason: `received (${(received/100).toFixed(0)}) exceeds the invoice total (${(total/100).toFixed(0)})` }); }
+    if (!iv.invoice_no) { flags.push({ invoice_no: '(blank)', reason: 'invoice has no number' }); }
+
+    updates.push(upd);
   });
 
-  // file rows that don't match any DB invoice (reported, never applied)
   const dbSet = new Set(invoices.map(iv => normInv(iv.invoice_no)));
   parsed.items.forEach(it => { if (!dbSet.has(it.invoice_no)) unmatchedInFile++; });
 
   return { updates, summary:{
     dbInvoices: invoices.length, inFile: parsed.items.length,
-    paid, partial, pending, unmatchedInFile, totalPending } };
+    paid, partial, pending, unmatchedInFile, totalPending,
+    checked, enriched, flagged: flags.length }, flags };
 }
 window.parseStatement = parseStatement;
 window.reconcilePending = reconcilePending;
@@ -5479,7 +5661,8 @@ function wireReconcile(){
       if (!(window.dbRows||[]).length) { $('#recStatus').textContent = 'Loading invoices from the database first…';
         await syncFromDatabase(true); }
       const parsed = await parseStatement(file);
-      const { updates, summary } = reconcilePending(parsed, window.dbRows || []);
+      const recResult = reconcilePending(parsed, window.dbRows || []);
+      const { updates, summary } = recResult;
       recUpdates = updates;
       const fmt = n => '₹' + (n/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
       const amtNote = parsed.columns.hasPending ? 'pending amount' : (parsed.columns.hasReceived ? 'received amount' : 'no amount column — treated as fully pending');
@@ -5499,9 +5682,16 @@ function wireReconcile(){
           <div class="reccard"><div class="reclabel">→ Pending (no receipt)</div><div class="recval">${summary.pending}</div></div>
           <div class="reccard"><div class="reclabel">Total pending amount</div><div class="recval">${fmt(summary.totalPending)}</div></div>
         </div>
+        <div class="recgrid" style="margin-top:10px">
+          <div class="reccard"><div class="reclabel">Entries checked</div><div class="recval">${summary.checked}</div></div>
+          <div class="reccard"><div class="reclabel">Gaps filled from file</div><div class="recval" style="color:${summary.enriched?'var(--proof)':'inherit'}">${summary.enriched}</div></div>
+          <div class="reccard"><div class="reclabel">Flagged for review</div><div class="recval" style="color:${summary.flagged?'var(--warn)':'inherit'}">${summary.flagged}</div></div>
+        </div>
+        ${(recResult.flags && recResult.flags.length) ? `<div class="assure" style="margin:12px 0;border-color:var(--warn)"><span>⚑</span><span><b>${recResult.flags.length} entr${recResult.flags.length===1?'y':'ies'} flagged during reconciliation:</b><br>${recResult.flags.slice(0,6).map(f=>`&nbsp;&nbsp;• ${esc(f.invoice_no)} — ${esc(f.reason)}`).join('<br>')}${recResult.flags.length>6?`<br>&nbsp;&nbsp;…and ${recResult.flags.length-6} more`:''}</span></div>` : ''}
         <div class="assure" style="margin:14px 0"><span>⚠</span><span>Review these numbers before confirming.
-          ${summary.unmatchedInFile ? `<b>${summary.unmatchedInFile}</b> row(s) in the file don't match any database invoice and are ignored (not applied).` : 'Every file row matched a database invoice.'}</span></div>
-        <button class="btn pri" id="recConfirm">Confirm — update Paid / Partial / Pending statuses</button>`;
+          ${summary.unmatchedInFile ? `<b>${summary.unmatchedInFile}</b> row(s) in the file don't match any database invoice and are ignored (not applied).` : 'Every file row matched a database invoice.'}
+          ${summary.enriched?`<b>${summary.enriched}</b> missing field(s) will be filled from the file.`:''}</span></div>
+        <button class="btn pri" id="recConfirm">Confirm — update statuses${summary.enriched?' &amp; fill gaps':''}</button>`;
       $('#recConfirm').onclick = confirmReconcile;
     } catch(err){ $('#recStatus').textContent = 'Could not read the file: ' + err.message;
       DIAG && DIAG.error('system','reconcile parse failed',{reason:err.message}); }
@@ -5549,33 +5739,72 @@ window.wireReconcile = wireReconcile;
   // INCLUDING runs happening on other machines/locations. The dashboard meter
   // updates live from those too.
   if (typeof Cloud !== 'undefined' && Cloud.subscribeRealtime) {
-    Cloud.subscribeRealtime(() => { syncFromDatabase(true); refreshDashboard(); });
+    Cloud.subscribeRealtime(() => { syncFromDatabase(true).then(()=>{ renderReview(); if(typeof renderLedger==='function') renderLedger(); }); refreshDashboard(); });
   }
   // periodic safety refresh (every 20s) in case a realtime event is missed, so
   // the meter never goes stale even if the websocket drops.
   setInterval(() => { if (document.getElementById('liveDash')) refreshDashboard(); }, 20000);
 })();
 
-$('#cloudClearFiles') && ($('#cloudClearFiles').onclick = async () => {
-  if (!confirm('Delete ALL stored bill files from the database?\n\nThis clears the original PDFs/images kept for viewing failed and review bills. Use this together with reset_data.sql for a clean slate. The bills themselves in the database are NOT affected by this button.')) return;
-  const btn = $('#cloudClearFiles'); btn.disabled = true; btn.textContent = 'Clearing…';
+/* Danger zone — password-protected. Opens a dialog with two destructive options:
+   (1) clear only the stored bill FILES (PDFs/images), or (2) wipe the WHOLE
+   database (the reset). Both require the password before anything happens. */
+const DANGER_PW = 'Shan@4612';
+async function clearStoredFiles(){
   const B = Cloud.storageUrl, H = { apikey: Cloud.key, Authorization: 'Bearer '+Cloud.key, 'Content-Type':'application/json' };
   let total = 0;
-  try {
-    for (const prefix of ['', 'review', 'ocr-pending']) {
-      const r = await fetch(`${B}/object/list/bills`, { method:'POST', headers:H,
-        body: JSON.stringify({ prefix, limit: 100000 }) });
-      const items = await r.json();
-      const names = (items||[]).map(o => prefix ? `${prefix}/${o.name}` : o.name).filter(n => !n.endsWith('/'));
-      if (names.length) {
-        await fetch(`${B}/object/bills`, { method:'DELETE', headers:H, body: JSON.stringify({ prefixes: names }) });
-        total += names.length;
-      }
+  for (const prefix of ['', 'review', 'ocr-pending']) {
+    const r = await fetch(`${B}/object/list/bills`, { method:'POST', headers:H, body: JSON.stringify({ prefix, limit: 100000 }) });
+    const items = await r.json();
+    const names = (items||[]).map(o => prefix ? `${prefix}/${o.name}` : o.name).filter(n => !n.endsWith('/'));
+    if (names.length) {
+      await fetch(`${B}/object/bills`, { method:'DELETE', headers:H, body: JSON.stringify({ prefixes: names }) });
+      total += names.length;
     }
-    log(`Cleared ${total} stored bill file(s) from the database.`, 'ok');
-    DIAG && DIAG.ok('system', `cleared ${total} stored bill files`);
-  } catch(e){ log('Could not clear stored files: '+e.message, 'er'); }
-  btn.disabled = false; btn.textContent = 'Clear stored files';
+  }
+  return total;
+}
+async function wipeDatabase(){
+  const r = await fetch(Cloud.url + '/rpc/reset_data', { method:'POST', headers: Cloud.headers(), body: '{}' });
+  if (!r.ok) { const t = await r.text(); throw new Error(`reset_data failed (${r.status}): ${t.slice(0,140)}`); }
+  return true;
+}
+$('#cloudDanger') && ($('#cloudDanger').onclick = () => {
+  const pw = prompt('\u26a0 DANGER ZONE \u2014 password required\n\nThese actions permanently delete data. Enter the password to continue:');
+  if (pw === null) return;
+  if (pw !== DANGER_PW) { alert('Incorrect password. No changes made.'); return; }
+  const choice = prompt(
+    '\u2713 Password accepted. Choose an action by typing its number:\n\n' +
+    '  1  \u2014 Clear stored FILES only (PDFs/images in the bills bucket).\n' +
+    '        The bill records in the database are kept.\n\n' +
+    '  2  \u2014 WIPE THE WHOLE DATABASE (runs the reset). This deletes ALL\n' +
+    '        bills, lines, checks, payments and logs. Cannot be undone.\n\n' +
+    'Type 1 or 2 (or Cancel):');
+  if (choice === null) return;
+  const btn = $('#cloudDanger');
+  if (choice.trim() === '1') {
+    if (!confirm('Clear all stored bill FILES?\n\nThis removes the original PDFs/images kept for viewing. The bill records themselves stay in the database. Continue?')) return;
+    btn.disabled = true; btn.textContent = 'Clearing files\u2026';
+    clearStoredFiles().then(n => { log(`Cleared ${n} stored bill file(s).`, 'ok'); DIAG && DIAG.ok('system', `cleared ${n} stored bill files`); })
+      .catch(e => log('Could not clear stored files: '+e.message, 'er'))
+      .finally(() => { btn.disabled = false; btn.textContent = '\u26a0 Danger zone\u2026'; });
+  } else if (choice.trim() === '2') {
+    if (!confirm('\u26a0 WIPE THE ENTIRE DATABASE?\n\nThis permanently deletes ALL bills, applicant lines, checks, payments and logs from Supabase. This CANNOT be undone.\n\nAre you absolutely sure?')) return;
+    if (!confirm('Final check: proceed to wipe the database? There is no undo.')) return;
+    btn.disabled = true; btn.textContent = 'Wiping database\u2026';
+    (async () => {
+      let files = 0;
+      try { files = await clearStoredFiles(); } catch(_){}
+      await wipeDatabase();
+      log(`Database wiped. Also cleared ${files} stored file(s). Reload to see the empty state.`, 'ok');
+      DIAG && DIAG.ok('system', 'database wiped via danger zone');
+      if (typeof syncFromDatabase === 'function') await syncFromDatabase(true);
+      if (typeof refreshDashboard === 'function') refreshDashboard();
+    })().catch(e => log('Could not wipe database: '+e.message+' (is reset_data.sql installed?)', 'er'))
+      .finally(() => { btn.disabled = false; btn.textContent = '\u26a0 Danger zone\u2026'; });
+  } else {
+    alert('No valid option chosen. No changes made.');
+  }
 });
 
 $('#cloudSelfTest') && ($('#cloudSelfTest').onclick = async () => {
@@ -5836,6 +6065,29 @@ function renderEditorLines(){
 }
 
 window.openBillEditor = openBillEditor;
+
+/* Find & fix any bill — search the database by invoice/client/branch, open the
+   editor on any match to correct it. This covers mistakes that Review didn't
+   flag: a wrong amount or client on a bill that otherwise passed every check. */
+function runFindBill(){
+  const q = ($('#findInvoice').value||'').trim().toLowerCase();
+  const out = $('#findResults'); if (!out) return;
+  if (!q) { out.innerHTML = '<span class="dim">Type an invoice number, client, or branch to search.</span>'; return; }
+  const pool = (window.reviewPulled && window.reviewPulled.length) ? window.reviewPulled
+    : ((window.misRows && window.misRows.length) ? window.misRows : DB.docs);
+  const matches = pool.filter(r => {
+    const i = r.invoice || {};
+    return [i.invoice_no, i.client_raw, i.branch_raw, r.filename].some(x => String(x||'').toLowerCase().includes(q));
+  }).slice(0, 50);
+  if (!matches.length) { out.innerHTML = `<span class="dim">No bill found matching “${esc(q)}”. It may not be in the database yet.</span>`; return; }
+  out.innerHTML = `<div class="tblwrap"><table><thead><tr><th>Invoice</th><th>Client</th><th>Branch</th><th class="num">Total</th><th>Status</th><th></th></tr></thead><tbody>${
+    matches.map(r => { const i=r.invoice||{}; const h=r.hash||r.content_hash;
+      return `<tr><td class="mono">${esc(i.invoice_no)}</td><td>${esc(i.client_raw)}</td><td>${esc(i.branch_raw)}</td><td class="num">${money(i.total_paise)}</td><td>${esc(i.settlement_status||'—')}</td><td><button class="btn sm" onclick="openBillEditor('${esc(h)}')">Open & fix</button></td></tr>`;
+    }).join('')}</tbody></table></div>
+    <div class="dim" style="margin-top:8px;font-size:12px">${matches.length} match${matches.length===1?'':'es'}${matches.length===50?' (showing first 50)':''}. Open a bill to correct any field — the change saves to the database.</div>`;
+}
+$('#findGo') && ($('#findGo').onclick = runFindBill);
+$('#findInvoice') && ($('#findInvoice').onkeydown = (e) => { if (e.key==='Enter') runFindBill(); });
 window.addEditorLine = () => { editorState.lines.push({applicant_name:'',amount_paise:null,tax_paise:null,gross_paise:null,service_type:''}); syncEditorLinesFromDom(); document.getElementById('editorLines').innerHTML = renderEditorLines(); };
 window.removeEditorLine = (i) => { syncEditorLinesFromDom(); editorState.lines.splice(i,1); document.getElementById('editorLines').innerHTML = renderEditorLines(); };
 
