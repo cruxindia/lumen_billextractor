@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='039436a9400d';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='c237b423eea6';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -392,11 +392,6 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
     <!-- ===== REPORT ===== -->
     <section class="view" id="v-report">
       <h1>Report &amp; MIS</h1>
-      <div class="subtabs" id="reportSubtabs">
-        <button class="on" data-sub="report" onclick="showReportSub('report')">MIS Report</button>
-        <button data-sub="ledger" onclick="showReportSub('ledger')">Ledger</button>
-        <button data-sub="tally" onclick="showReportSub('tally')">Tally</button>
-      </div>
       <div id="reportSubBody">
       <p class="sub">Build a report from this session, or pull the whole database for a full MIS. Filter by client,
          branch, date, verdict or payment status — the report and every export respect the filters.</p>
@@ -467,8 +462,11 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
       <div id="cloudBody"></div>
       <h2 style="margin:20px 0 6px">All entries in the database</h2>
       <p class="sub" style="margin:0 0 10px">Everything stored, drawn live. Search to narrow it, and use Fix to correct any entry in place.</p>
-      <div class="row" style="gap:8px;margin-bottom:10px">
-        <input type="text" id="dbSearch" placeholder="Filter by invoice, client, branch or district…" style="flex:1;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text)">
+      <div class="row" style="gap:8px;margin-bottom:10px;flex-wrap:wrap">
+        <input type="text" id="dbSearch" placeholder="Search invoice, client, branch, district…" style="flex:1;min-width:220px;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text)">
+        <select id="dbfStatus"><option value="">All statuses</option><option value="__PENDING">Pending / Partial</option><option value="PAID">Paid</option><option value="WRITTEN_OFF">Written off</option></select>
+        <select id="dbfDistrict"><option value="">All districts</option></select>
+        <select id="dbfVerdict"><option value="">All verdicts</option></select>
         <span class="pill" id="dbCount"></span>
       </div>
       <div id="dbListBody"></div>
@@ -488,11 +486,8 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
       </div>
     </section>
 
-    <!-- ===== TALLY ===== -->
-    <section class="view" id="v-tally">
-      <h1>Tally</h1>
-      <p class="sub">Every document from input to output, and every rupee from invoice to applicant row.
-         This page exists to make loss visible: if something did not survive the pipeline, it is counted here.</p>
+    <!-- ===== TALLY (retired — replaced by Analytics) ===== -->
+    <section class="view" id="v-tally" style="display:none">
       <div id="tallyBody"></div>
     </section>
 
@@ -1989,8 +1984,17 @@ const DISTRICT_MAP = {
 // nothing is lost or mislabelled. New codes can be added here safely.
 function districtFromInvoice(inv){
   if (!inv) return null;
-  const key = String(inv).trim().toUpperCase().slice(0,3);
-  return DISTRICT_MAP[key] || null;
+  const s = String(inv).trim().toUpperCase();
+  // 1. Fast path: the first 3 characters (works for invoice numbers like
+  //    PUN-2026-001 and filenames that start with the code, e.g. PUN_bill.pdf).
+  const head = s.slice(0,3);
+  if (DISTRICT_MAP[head]) return DISTRICT_MAP[head];
+  // 2. Filename fallback: the code may sit between separators anywhere in the
+  //    name (e.g. bill_PUN_2026.pdf, 2026-DEL-retail.xlsx). Scan each 3-letter
+  //    token and return the first that is a known district code.
+  const tokens = s.split(/[^A-Z]+/).filter(t => t.length === 3);
+  for (const t of tokens) if (DISTRICT_MAP[t]) return DISTRICT_MAP[t];
+  return null;
 }
 
 return { newId, paise, rupees, fmt, rc, cref, colLetter, Evaluator, UNRESOLVED,
@@ -3632,6 +3636,15 @@ async function ingest(fileList){
       await Cloud.pushOne(r);
       r._pushed = true; pushedCount++;
       if (typeof Pipeline!=='undefined') Pipeline.stats.pushed++;   // confirmed
+      // Store the ORIGINAL file so it can be viewed when someone opens this bill
+      // to fix it. Previously only image/OCR bills were stored, so most bills had
+      // no viewable file in the editor. Now every bill keeps its source. Best-
+      // effort: a storage failure never blocks the (already-succeeded) data push.
+      try {
+        if ((r._sourceBlob || r._pdfBuf) && !r.invoice.review_file_path) {
+          await Cloud.stashReviewFile(r);
+        }
+      } catch(_){}
       DIAG.info('push', `${wname}: saved ${r.filename}`, { worker:wid, invoice: r.invoice.invoice_no });
       return 'pushed';
     } catch(e){
@@ -5030,13 +5043,12 @@ $('#rail').addEventListener('click', e => { const b = e.target.closest('button[d
    rooms. The Ledger and Tally view sections still exist in the DOM — we just show
    the right one inside Report and hide the others. */
 window.showReportSub = (sub) => {
-  $$('#reportSubtabs button').forEach(x => x.classList.toggle('on', x.dataset.sub === sub));
+  // Ledger/Tally retired (replaced by Analytics). Only the MIS Report remains,
+  // so this always shows the report body and keeps the old sections hidden.
   const rb = $('#reportSubBody'), ledger = $('#v-ledger'), tally = $('#v-tally');
-  rb.style.display = sub==='report' ? '' : 'none';
-  if (ledger) { ledger.style.display = sub==='ledger'?'':'none'; }
-  if (tally)  { tally.style.display  = sub==='tally' ?'':'none'; }
-  if (sub==='ledger' && typeof renderLedger==='function') renderLedger();
-  if (sub==='tally' && typeof renderTally==='function') renderTally();
+  if (rb) rb.style.display = '';
+  if (ledger) ledger.style.display = 'none';
+  if (tally)  tally.style.display  = 'none';
 };
 
 /* Relocate the Ledger and Tally view sections INSIDE the Report view, so the
@@ -6304,40 +6316,111 @@ window.openBillEditor = openBillEditor;
 /* Database tab — list every stored entry, drawn live from window.dbRows.
    Searchable; each row has a Fix button that opens the same editor used in
    Review, so a mistake can be corrected in place without hunting for it. */
+/* Shared district decoder. Tries the invoice number first, then the source
+   filename — because the 3-letter district code appears in whichever the
+   branch used. Returns {d:district, s:state} or {d:'',s:''} when unknown. */
+function districtObjOf(r){
+  try {
+    const fn = (window.LumenCore && window.LumenCore.districtFromInvoice) ? window.LumenCore.districtFromInvoice : null;
+    if (!fn) return {d:'',s:''};
+    const inv = r && (r.invoice_no || (r.invoice && r.invoice.invoice_no));
+    const file = r && (r.source_file || r.filename || (r.invoice && r.invoice.source_file));
+    return fn(inv) || fn(file) || {d:'',s:''};
+  } catch(_){ return {d:'',s:''}; }
+}
+window.districtObjOf = districtObjOf;
+
+/* Database list columns: key, header, width(px), align, type(text|money|date|num).
+   Fixed widths give stable headers and prevent the ragged sizing. */
+const DB_COLS = [
+  ['invoice_no','Invoice',150,'left','text'],
+  ['invoice_date','Date',96,'left','date'],
+  ['client_raw','Client',150,'left','text'],
+  ['branch_raw','Branch',150,'left','text'],
+  ['district','District',120,'left','text'],
+  ['state','State',120,'left','text'],
+  ['taxable_paise','Taxable',110,'right','money'],
+  ['tax_total_paise','Tax',100,'right','money'],
+  ['total_paise','Total',120,'right','money'],
+  ['settlement_status','Status',110,'left','status'],
+  ['verdict','Verdict',100,'left','text'],
+  ['dpd','DPD',70,'right','num'],
+];
+window.__dbSort = window.__dbSort || { key:'invoice_no', dir:1 };
+window.sortDb = (key) => {
+  const s = window.__dbSort;
+  s.dir = (s.key===key) ? -s.dir : 1; s.key = key;
+  renderDbList();
+};
 function renderDbList(){
   const host = $('#dbListBody'); if (!host) return;
   const rows = window.dbRows || [];
   const q = ($('#dbSearch') && $('#dbSearch').value || '').trim().toLowerCase();
-  const dist = (inv) => {
-    try { const d = (typeof window.LumenCore!=='undefined' && window.LumenCore.districtFromInvoice) ? window.LumenCore.districtFromInvoice(inv) : null; return d ? d.d : ''; } catch(_){ return ''; }
-  };
-  let list = rows.map(r => ({ r, district: dist(r.invoice_no) }));
-  if (q) list = list.filter(({r,district}) =>
-    [r.invoice_no, r.client_raw, r.branch_raw, district].some(v => String(v||'').toLowerCase().includes(q)));
+  const fStatus = $('#dbfStatus') && $('#dbfStatus').value;
+  const fDistrict = $('#dbfDistrict') && $('#dbfDistrict').value;
+  const fVerdict = $('#dbfVerdict') && $('#dbfVerdict').value;
+  const today = new Date().toISOString().slice(0,10);
+  const daysBetween = (a,b)=>{ if(!a||!b) return null; const d=(new Date(b)-new Date(a))/86400000; return isFinite(d)?Math.floor(d):null; };
+
+  // enrich each row with derived district/state/dpd
+  let list = rows.map(r => { const d = districtObjOf(r);
+    return { r, district:d.d, state:d.s, dpd: daysBetween(r.invoice_date, today) }; });
+
+  // populate filter dropdowns once
+  const fill = (sel, vals) => { const el=$(sel); if(!el) return; const cur=el.value;
+    const opts=[...new Set(vals.filter(Boolean))].sort();
+    if (el.dataset.filled!=='1' || el.options.length!==opts.length+1){
+      el.innerHTML = el.options[0].outerHTML + opts.map(v=>`<option${v===cur?' selected':''}>${esc(v)}</option>`).join(''); el.dataset.filled='1'; } };
+  fill('#dbfDistrict', list.map(x=>x.district));
+  fill('#dbfVerdict', list.map(x=>x.r.verdict));
+
+  // filters
+  if (q) list = list.filter(({r,district,state}) =>
+    [r.invoice_no,r.client_raw,r.branch_raw,district,state].some(v=>String(v||'').toLowerCase().includes(q)));
+  if (fStatus==='__PENDING') list = list.filter(({r})=>/PENDING|PARTIAL/i.test(r.settlement_status||''));
+  else if (fStatus) list = list.filter(({r})=>(r.settlement_status||'')===fStatus);
+  if (fDistrict) list = list.filter(({district})=>district===fDistrict);
+  if (fVerdict) list = list.filter(({r})=>(r.verdict||'')===fVerdict);
+
+  // sort
+  const s = window.__dbSort;
+  const valOf = (row, key) => { if(key==='district')return row.district; if(key==='state')return row.state; if(key==='dpd')return row.dpd; return row.r[key]; };
+  list.sort((a,b)=>{ let va=valOf(a,s.key), vb=valOf(b,s.key);
+    const na=parseFloat(va), nb=parseFloat(vb);
+    const bothNum = typeof va==='number' && typeof vb==='number' || (!isNaN(na)&&!isNaN(nb)&&/paise|dpd/.test(s.key));
+    if (bothNum) return ((va||0)-(vb||0))*s.dir;
+    va=String(va==null?'':va).toLowerCase(); vb=String(vb==null?'':vb).toLowerCase();
+    return (va<vb?-1:va>vb?1:0)*s.dir; });
+
   if ($('#dbCount')) $('#dbCount').textContent = `${list.length} of ${rows.length}`;
-  if (!rows.length){ host.innerHTML = '<div class="empty"><h3>Nothing stored yet</h3><p>Ingest bills to populate the database.</p></div>'; return; }
-  if (!list.length){ host.innerHTML = '<div class="empty"><p>No entries match your search.</p></div>'; return; }
-  const money = p => p==null ? '' : '₹'+(p/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
-  const statusPill = s => { const v=(s||'').toUpperCase();
-    const c = v.includes('PAID')&&!v.includes('PART') ? 'var(--proof)' : v.includes('PART') ? 'var(--warn)' : 'var(--text-3)';
-    return `<span style="color:${c}">${esc(s||'—')}</span>`; };
-  const head = `<tr><th>Invoice</th><th>Client</th><th>Branch</th><th>District</th><th style="text-align:right">Total</th><th>Status</th><th>Verdict</th><th></th></tr>`;
-  const body = list.slice(0, 800).map(({r,district}) =>
-    `<tr>
-      <td class="mono">${esc(r.invoice_no||'')}</td>
-      <td>${esc(r.client_raw||'')}</td>
-      <td>${esc(r.branch_raw||'')}</td>
-      <td>${esc(district)}</td>
-      <td style="text-align:right" class="mono">${money(r.total_paise)}</td>
-      <td>${statusPill(r.settlement_status)}</td>
-      <td>${esc(r.verdict||'')}</td>
-      <td><button class="btn sm" onclick="openBillEditor('${esc(r.content_hash)}')">Fix</button></td>
-    </tr>`).join('');
-  const more = list.length > 800 ? `<p class="sub" style="margin:8px 0 0">Showing first 800 of ${list.length}. Search to narrow.</p>` : '';
-  host.innerHTML = `<div class="tablewrap"><table class="grid"><thead>${head}</thead><tbody>${body}</tbody></table></div>${more}`;
+  if (!rows.length){ host.innerHTML='<div class="empty"><h3>Nothing stored yet</h3><p>Ingest bills to populate the database.</p></div>'; return; }
+  if (!list.length){ host.innerHTML='<div class="empty"><p>No entries match the filters.</p></div>'; return; }
+
+  const money = p => p==null||p==='' ? '' : '₹'+(p/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const statusPill = s2 => { const v=(s2||'').toUpperCase();
+    const c = /WRITTEN/.test(v)?'var(--fail)':(v.includes('PAID')&&!v.includes('PART')?'var(--proof)':(v.includes('PART')?'var(--warn)':'var(--text-3)'));
+    return `<span style="color:${c}">${esc(s2||'—')}</span>`; };
+  const cellVal = (row, c) => { const [key,,,,type]=c;
+    let v = valOf(row, key);
+    if (type==='money') return money(v);
+    if (type==='status') return statusPill(v);
+    if (type==='num') return v==null?'—':v;
+    return esc(v||'');
+  };
+  const colgroup = `<colgroup>${DB_COLS.map(c=>`<col style="width:${c[2]}px">`).join('')}<col style="width:70px"></colgroup>`;
+  const head = `<tr>${DB_COLS.map(c=>{
+    const arrow = s.key===c[0] ? (s.dir===1?' ▲':' ▼') : '';
+    return `<th style="text-align:${c[3]};cursor:pointer;user-select:none;white-space:nowrap" onclick="sortDb('${c[0]}')">${c[1]}${arrow}</th>`;
+  }).join('')}<th></th></tr>`;
+  const body = list.slice(0,800).map(row =>
+    `<tr>${DB_COLS.map(c=>`<td style="text-align:${c[3]}${c[4]==='money'||c[0]==='invoice_no'?';font-family:var(--mono)':''};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:${c[2]}px">${cellVal(row,c)}</td>`).join('')}
+      <td><button class="btn sm" onclick="openBillEditor('${esc(row.r.content_hash)}')">Fix</button></td></tr>`).join('');
+  const more = list.length>800 ? `<p class="sub" style="margin:8px 0 0">Showing first 800 of ${list.length}. Filter to narrow.</p>` : '';
+  host.innerHTML = `<div class="tablewrap" style="overflow-x:auto"><table class="grid" style="table-layout:fixed;min-width:1200px">${colgroup}<thead>${head}</thead><tbody>${body}</tbody></table></div>${more}`;
 }
 window.renderDbList = renderDbList;
 $('#dbSearch') && ($('#dbSearch').oninput = () => renderDbList());
+['#dbfStatus','#dbfDistrict','#dbfVerdict'].forEach(sel=>{ const el=$(sel); if(el) el.onchange=()=>renderDbList(); });
 
 /* ===================== ANALYTICS DASHBOARD ==========================
    Live pendency / DPD / throughput from window.dbRows, with district
@@ -6345,13 +6428,13 @@ $('#dbSearch') && ($('#dbSearch').oninput = () => renderDbList());
    for the write-off actions, which are password-gated for bulk. */
 window.__anSelected = window.__anSelected || {};   // {hash:true}
 function daysBetween(a,b){ if(!a||!b) return null; const d=(new Date(b)-new Date(a))/86400000; return isFinite(d)?Math.floor(d):null; }
-function anDistrictOf(inv){ try{ const d=(window.LumenCore&&window.LumenCore.districtFromInvoice)?window.LumenCore.districtFromInvoice(inv):null; return d?d.d:''; }catch(_){return '';} }
+function anDistrictOf(r){ const d = districtObjOf(r); return d.d; }
 function anFilteredRows(){
   const rows = window.dbRows || [];
   const fD=$('#anDistrict')&&$('#anDistrict').value, fC=$('#anClient')&&$('#anClient').value,
         fS=$('#anStatus')&&$('#anStatus').value, fA=$('#anAge')&&$('#anAge').value;
   const today = new Date().toISOString().slice(0,10);
-  return rows.map(r => ({ r, district: anDistrictOf(r.invoice_no), dpd: daysBetween(r.invoice_date, today) }))
+  return rows.map(r => ({ r, district: anDistrictOf(r), dpd: daysBetween(r.invoice_date, today) }))
     .filter(({r,district,dpd}) => {
       if (fD && district!==fD) return false;
       if (fC && (r.client_raw||'')!==fC) return false;
@@ -6373,7 +6456,7 @@ function renderAnalytics(){
     const opts = [...new Set(vals.filter(Boolean))].sort();
     if (el.options.length <= 1 + opts.length){ const first=el.options[0].outerHTML;
       el.innerHTML = first + opts.map(v=>`<option${v===cur?' selected':''}>${esc(v)}</option>`).join(''); } };
-  fillSel('#anDistrict', rows.map(r=>anDistrictOf(r.invoice_no)));
+  fillSel('#anDistrict', rows.map(r=>anDistrictOf(r)));
   fillSel('#anClient', rows.map(r=>r.client_raw));
 
   const list = anFilteredRows();
