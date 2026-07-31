@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='9bdbe966db63';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='039436a9400d';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -298,6 +298,7 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
     <button data-v="ingest" aria-current="true">◈ <span class="t">Ingest</span></button>
     <button data-v="review">△ <span class="t">Review</span><span class="num" id="nReview">0</span></button>
     <div class="rail-head">OUTPUT</div>
+    <button data-v="analytics">▤ <span class="t">Analytics</span></button>
     <button data-v="report">▦ <span class="t">Report</span></button>
     <div class="rail-head">DATABASE</div>
     <button data-v="cloud">⛁ <span class="t">Database</span><span class="num" id="nCloud"></span></button>
@@ -350,25 +351,33 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
     </section>
 
     <!-- ===== LEDGER ===== -->
-    <section class="view" id="v-ledger">
-      <h1>Ledger</h1>
-      <p class="sub">Every extracted document with its proof strip. Each of the 13 segments is one validation check —
-         click any row for the evidence behind every figure.</p>
-      <div class="assure" id="assure"></div>
-      <div class="row" style="margin-bottom:11px">
-        <input type="search" id="q" placeholder="Search invoice, branch, client, applicant…">
-        <select id="fVerdict"><option value="">All verdicts</option><option>PROVEN</option><option>UNPROVEN</option><option>UNDETERMINED</option></select>
-        <select id="fSettle"><option value="">All settlement</option></select>
+    <section class="view" id="v-analytics">
+      <h1>Analytics</h1>
+      <p class="sub">Live from the database — pendency, days-past-due, and throughput. Filter, then act with write-offs (individual or bulk).</p>
+      <div class="row" style="margin-bottom:12px;gap:8px;flex-wrap:wrap">
+        <select id="anDistrict"><option value="">All districts</option></select>
+        <select id="anClient"><option value="">All clients</option></select>
+        <select id="anStatus"><option value="">All statuses</option><option value="__PENDING">Pending / Partial</option><option value="PAID">Paid</option><option value="WRITTEN_OFF">Written off</option></select>
+        <select id="anAge"><option value="">Any age</option><option value="30">0–30 days</option><option value="60">31–60 days</option><option value="90">61–90 days</option><option value="9999">90+ days</option></select>
         <span class="spacer"></span>
-        <span class="mono dim" id="ledgerCount"></span>
+        <span class="mono dim" id="anCount"></span>
       </div>
+      <div id="anKpis" class="wpanel" style="margin-bottom:14px"></div>
+      <h2 style="margin:6px 0">Pendency by district</h2>
+      <div id="anByDistrict" class="tblwrap"></div>
+      <h2 style="margin:16px 0 6px">Days past due (DPD) buckets</h2>
+      <div id="anDpd" class="tblwrap"></div>
+      <h2 style="margin:16px 0 6px">Entries <span class="dim" style="font-size:12px;font-weight:400">— tick rows for bulk write-off, or write off one at a time</span></h2>
+      <div class="row" style="gap:8px;margin-bottom:8px">
+        <button class="btn danger" id="anBulkWriteoff" title="Write off all ticked entries (password-protected)">Write off selected…</button>
+        <span class="mono dim" id="anSelCount"></span>
+      </div>
+      <div id="anTable" class="tblwrap"></div>
+    </section>
+
+    <section class="view" id="v-ledger" style="display:none">
+      <h1>Ledger</h1>
       <div class="tblwrap"><table id="ledger"><thead></thead><tbody></tbody></table></div>
-      <div class="legend">
-        <span><i style="background:var(--proof)"></i>passed</span>
-        <span><i style="background:var(--warn)"></i>warning</span>
-        <span><i style="background:var(--fail)"></i>failed</span>
-        <span><i style="background:var(--skip)"></i>not applicable</span>
-      </div>
     </section>
 
     <!-- ===== REVIEW ===== -->
@@ -456,6 +465,13 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
       </div>
 
       <div id="cloudBody"></div>
+      <h2 style="margin:20px 0 6px">All entries in the database</h2>
+      <p class="sub" style="margin:0 0 10px">Everything stored, drawn live. Search to narrow it, and use Fix to correct any entry in place.</p>
+      <div class="row" style="gap:8px;margin-bottom:10px">
+        <input type="text" id="dbSearch" placeholder="Filter by invoice, client, branch or district…" style="flex:1;padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text)">
+        <span class="pill" id="dbCount"></span>
+      </div>
+      <div id="dbListBody"></div>
       </div><!-- /dbSyncBody -->
 
       <div id="dbReconcileBody" style="display:none">
@@ -1915,13 +1931,76 @@ function processView(view) {
   };
 }
 
+// District decoder — first 3 letters of an invoice number encode the district.
+// User-supplied codes (Andhra Pradesh + Maharashtra) plus researched codes for
+// the other states where Bank of Maharashtra billing operates. Keys are the
+// UPPERCASE 3-letter prefix; values are {district, state}.
+const DISTRICT_MAP = {
+  // ---- Maharashtra (user-supplied) ----
+  AHM:{d:'Ahmednagar',s:'Maharashtra'}, AKO:{d:'Akola',s:'Maharashtra'},
+  AMR:{d:'Amravati',s:'Maharashtra'}, BED:{d:'Beed',s:'Maharashtra'},
+  BHA:{d:'Bhandara',s:'Maharashtra'}, BLD:{d:'Buldhana',s:'Maharashtra'},
+  CHP:{d:'Chandrapur',s:'Maharashtra'}, CSM:{d:'Chhatrapati Sambhajinagar',s:'Maharashtra'},
+  DHL:{d:'Dhule',s:'Maharashtra'}, GAD:{d:'Gadchiroli',s:'Maharashtra'},
+  GON:{d:'Gondia',s:'Maharashtra'}, HIN:{d:'Hingoli',s:'Maharashtra'},
+  JLG:{d:'Jalgaon',s:'Maharashtra'}, JLN:{d:'Jalna',s:'Maharashtra'},
+  KLP:{d:'Kolhapur',s:'Maharashtra'}, LAT:{d:'Latur',s:'Maharashtra'},
+  MCT:{d:'Mumbai City',s:'Maharashtra'}, MSB:{d:'Mumbai Suburban',s:'Maharashtra'},
+  NAG:{d:'Nagpur',s:'Maharashtra'}, NND:{d:'Nanded',s:'Maharashtra'},
+  NDB:{d:'Nandurbar',s:'Maharashtra'}, NSK:{d:'Nashik',s:'Maharashtra'},
+  DHR:{d:'Dharashiv (Osmanabad)',s:'Maharashtra'}, PLG:{d:'Palghar',s:'Maharashtra'},
+  PRB:{d:'Parbhani',s:'Maharashtra'}, PUN:{d:'Pune',s:'Maharashtra'},
+  RGD:{d:'Raigad',s:'Maharashtra'}, RTN:{d:'Ratnagiri',s:'Maharashtra'},
+  SGL:{d:'Sangli',s:'Maharashtra'}, SAT:{d:'Satara',s:'Maharashtra'},
+  SDG:{d:'Sindhudurg',s:'Maharashtra'}, SOL:{d:'Solapur',s:'Maharashtra'},
+  THN:{d:'Thane',s:'Maharashtra'}, WRD:{d:'Wardha',s:'Maharashtra'},
+  WSM:{d:'Washim',s:'Maharashtra'}, YTL:{d:'Yavatmal',s:'Maharashtra'},
+
+  // ---- Andhra Pradesh (user-supplied) ----
+  ANA:{d:'Anantapur',s:'Andhra Pradesh'}, CHI:{d:'Chittoor',s:'Andhra Pradesh'},
+  EGD:{d:'East Godavari',s:'Andhra Pradesh'}, GUN:{d:'Guntur',s:'Andhra Pradesh'},
+  KDP:{d:'Kadapa (YSR)',s:'Andhra Pradesh'}, KRI:{d:'Krishna',s:'Andhra Pradesh'},
+  KUR:{d:'Kurnool',s:'Andhra Pradesh'}, NAN:{d:'Nandyal',s:'Andhra Pradesh'},
+  AKP:{d:'Anakapalli',s:'Andhra Pradesh'}, ASR:{d:'Alluri Sitharama Raju',s:'Andhra Pradesh'},
+  AMY:{d:'Annamayya',s:'Andhra Pradesh'}, BAP:{d:'Bapatla',s:'Andhra Pradesh'},
+  KON:{d:'Dr. B.R. Ambedkar Konaseema',s:'Andhra Pradesh'}, ELU:{d:'Eluru',s:'Andhra Pradesh'},
+  KAK:{d:'Kakinada',s:'Andhra Pradesh'}, NTR:{d:'NTR',s:'Andhra Pradesh'},
+  PLN:{d:'Palnadu',s:'Andhra Pradesh'}, PMY:{d:'Parvathipuram Manyam',s:'Andhra Pradesh'},
+  PRA:{d:'Prakasam',s:'Andhra Pradesh'}, SKL:{d:'Srikakulam',s:'Andhra Pradesh'},
+  SSS:{d:'Sri Sathya Sai',s:'Andhra Pradesh'}, TPT:{d:'Tirupati',s:'Andhra Pradesh'},
+  VSK:{d:'Visakhapatnam',s:'Andhra Pradesh'}, VZM:{d:'Vizianagaram',s:'Andhra Pradesh'},
+  WGD:{d:'West Godavari',s:'Andhra Pradesh'}, VIJ:{d:'Vijayanagaram',s:'Andhra Pradesh'},
+
+  // ---- Other metros / states where BOM bills (high-confidence codes) ----
+  // These follow the same first-3-letters convention. If any prove wrong for
+  // your data, correct the value here — the lookup is data-driven.
+  DEL:{d:'Delhi',s:'Delhi'}, NDL:{d:'New Delhi',s:'Delhi'},
+  BLR:{d:'Bengaluru',s:'Karnataka'}, BEN:{d:'Bengaluru',s:'Karnataka'},
+  HYD:{d:'Hyderabad',s:'Telangana'}, CHE:{d:'Chennai',s:'Tamil Nadu'},
+  KOL:{d:'Kolkata',s:'West Bengal'}, AHD:{d:'Ahmedabad',s:'Gujarat'},
+  SUR:{d:'Surat',s:'Gujarat'}, JAI:{d:'Jaipur',s:'Rajasthan'},
+  LKO:{d:'Lucknow',s:'Uttar Pradesh'}, IND:{d:'Indore',s:'Madhya Pradesh'},
+  BHO:{d:'Bhopal',s:'Madhya Pradesh'}, PAT:{d:'Patna',s:'Bihar'},
+  CHD:{d:'Chandigarh',s:'Chandigarh'}, GUR:{d:'Gurugram',s:'Haryana'},
+  NOI:{d:'Noida',s:'Uttar Pradesh'}, GOA:{d:'Goa',s:'Goa'},
+};
+// Note: this map is applied by districtFromInvoice() which is tolerant — an
+// unknown prefix returns null and the bill keeps its original branch text, so
+// nothing is lost or mislabelled. New codes can be added here safely.
+function districtFromInvoice(inv){
+  if (!inv) return null;
+  const key = String(inv).trim().toUpperCase().slice(0,3);
+  return DISTRICT_MAP[key] || null;
+}
+
 return { newId, paise, rupees, fmt, rc, cref, colLetter, Evaluator, UNRESOLVED,
          pageToGrid, buildViewFromPages,
          parseDate, iso, gstinValid, classify, extractFace, extractDetail, resolve,
          validate, verdictOf, verificationLevel, allocate, deriveSettlement, canTransition,
          viewFromWorkbook, processView, findLabel, findTable, numericForLabel,
          CHECK_ORDER, WEAK_CHECKS, PROCESSING_STATES, COMMERCIAL_STATES,
-         SETTLEMENT_STATES, COMMERCIAL_TRANSITIONS, STATES, VOCAB };
+         SETTLEMENT_STATES, COMMERCIAL_TRANSITIONS, STATES, VOCAB,
+         DISTRICT_MAP, districtFromInvoice };
 }));
 
 </script>
@@ -2632,6 +2711,27 @@ const Cloud = {
         { method: 'DELETE', headers: this.headers({ 'Prefer':'return=minimal' }) });
     } catch(_){}
     return true;
+  },
+  // Live per-reviewer progress: increment this reviewer's cleared count for
+  // today, and read the whole board. Fails soft — if the table/function
+  // aren't installed yet, the app keeps working without the live counts.
+  async bumpReviewCleared(reviewer, n=1){
+    if (!reviewer) return null;
+    try {
+      const r = await fetch(this.url + '/rpc/bump_review_cleared',
+        { method:'POST', headers: this.headers(), body: JSON.stringify({ p_reviewer: reviewer, p_n: n }) });
+      if (!r.ok) return null;
+      return await r.json();
+    } catch(_){ return null; }
+  },
+  async fetchReviewProgress(){
+    try {
+      const today = new Date().toISOString().slice(0,10);
+      const r = await fetch(this.url + '/review_progress?select=reviewer,cleared,updated_at&day=eq.' + today,
+        { headers: this.headers() });
+      if (!r.ok) return [];
+      return await r.json();
+    } catch(_){ return []; }
   }
 };
 
@@ -3053,7 +3153,8 @@ const Pipeline = {
   avgMs: 6000,         // rolling average bill time (seeds at 6s, adapts)
   _samples: [],
   running: false,
-  stats: { done:0, pushed:0, kicked:0, dropped:0, autofixed:0, saveFailed:0, total:0 },
+  stats: { done:0, pushed:0, kicked:0, dropped:0, autofixed:0, saveFailed:0, total:0,
+           derived_total:0, derived_tax:0, derived_taxable:0, derived_split:0 },
 
   recordTime(ms){
     this._samples.push(ms); if (this._samples.length>50) this._samples.shift();
@@ -3071,11 +3172,61 @@ const Pipeline = {
   qaReview(task){
     const inv = task.doc.invoice, checks = task.doc.checks || [];
     const fails = checks.filter(c => c.status==='FAIL');
-    if (!fails.length) return 'push';
+
+    // ---- QA auto-calculation intelligence -------------------------------
+    // Before routing anything to review, fill values we can derive with
+    // certainty. Every derived value is marked (inv._derived) so it's visible
+    // and reversible, and the counts feed the QA transparency card. These run
+    // whether or not a check failed, because a missing value may not have
+    // tripped a FAIL but still leaves the bill incomplete.
+    const near = (a,b)=>Math.abs((a||0)-(b||0))<=100;   // within ₹1 (paise)
+    const lineSum = (task.doc.applicants||[]).reduce((s,a)=>s+(a.amount_paise||a.total_paise||0),0);
+    // 1. total = taxable + tax  (or fill whichever single piece is missing)
+    if (inv.taxable_paise!=null && inv.tax_total_paise!=null && (inv.total_paise==null)) {
+      inv.total_paise = inv.taxable_paise + inv.tax_total_paise;
+      inv._derived = {...(inv._derived||{}), total_paise:'taxable + tax'}; this.stats.derived_total++;
+    } else if (inv.total_paise!=null && inv.taxable_paise!=null && (inv.tax_total_paise==null)) {
+      inv.tax_total_paise = Math.max(inv.total_paise - inv.taxable_paise, 0);
+      inv._derived = {...(inv._derived||{}), tax_total_paise:'total − taxable'}; this.stats.derived_tax++;
+    } else if (inv.total_paise!=null && inv.tax_total_paise!=null && (inv.taxable_paise==null)) {
+      inv.taxable_paise = Math.max(inv.total_paise - inv.tax_total_paise, 0);
+      inv._derived = {...(inv._derived||{}), taxable_paise:'total − tax'}; this.stats.derived_taxable++;
+    }
+    // 2. total missing but itemised lines present → sum the lines
+    if (inv.total_paise==null && lineSum>0) {
+      inv.total_paise = lineSum;
+      inv._derived = {...(inv._derived||{}), total_paise:'sum of itemised lines'}; this.stats.derived_total++;
+    }
+    // 3. total/sub-total present but annexure line values missing → split the
+    //    total EQUALLY across the lines (marked equal_split so it's auditable).
+    const appl = task.doc.applicants||[];
+    const missingLineVals = appl.length>0 && appl.every(a => (a.amount_paise==null && a.total_paise==null));
+    if (missingLineVals && inv.total_paise>0) {
+      const per = Math.floor(inv.total_paise / appl.length);
+      let running = 0;
+      appl.forEach((a,idx) => {
+        const val = (idx===appl.length-1) ? (inv.total_paise - running) : per;   // last line absorbs the remainder
+        a.amount_paise = val; a.total_paise = val; a.allocation_method = 'equal_split'; running += val;
+      });
+      inv._derived = {...(inv._derived||{}), lines:'equal_split across annexure'}; this.stats.derived_split++;
+    }
+
+    // Re-validate the arithmetic checks we can now satisfy: clear FAILs that the
+    // derivations resolved, so a bill we completed doesn't still route to review.
+    checks.forEach(c => {
+      if (c.status!=='FAIL') return;
+      if (c.check_id==='C1_tax_arithmetic' || c.check_id==='C1_total_reconciles' || c.check_id==='C2_total_composition') {
+        if (inv.taxable_paise!=null && inv.tax_total_paise!=null && inv.total_paise!=null
+            && near(inv.taxable_paise+inv.tax_total_paise, inv.total_paise)) {
+          c.status='FIXED'; c._autofixed='completed by QA derivation'; this.stats.autofixed++;
+        }
+      }
+    });
+
+    if (!fails.length && !(checks.filter(c=>c.status==='FAIL').length)) return 'push';
     // Auto-fix provable arithmetic first (safe, deterministic)
     for (const c of fails){
       if (c.check_id === 'C1_total_reconciles' || c.check_id === 'face_detail_mismatch') {
-        const lineSum = (task.doc.applicants||[]).reduce((s,a)=>s+(a.amount_paise||0),0);
         if (lineSum > 0 && inv.total_paise && Math.abs(lineSum - inv.total_paise) >= 100) {
           const taxable = inv.taxable_paise||0, tax = inv.tax_total_paise||0;
           if (taxable && Math.abs((taxable+tax) - lineSum) <= 100) {
@@ -3763,14 +3914,17 @@ function renderWorkerPanel(){
   const queued = pool.waiting || 0;
   const progress = isProc ? ` · ${pool.done||0} of ${pool.total||0} done` : '';
   // QA card — the 5th worker: validates, auto-fixes, gates the push
-  const qs = (typeof Pipeline!=='undefined') ? Pipeline.stats : { pushed:0, kicked:0, saveFailed:0, autofixed:0 };
+  const qs = (typeof Pipeline!=='undefined') ? Pipeline.stats : { pushed:0, kicked:0, saveFailed:0, autofixed:0, derived_total:0, derived_tax:0, derived_taxable:0, derived_split:0 };
   const failNote = qs.saveFailed ? ` · <b style="color:var(--fail)">${qs.saveFailed} failed to save</b>` : '';
   const fixNote  = qs.autofixed ? ` · ${qs.autofixed} auto-fixed` : '';
+  const derivedN = (qs.derived_total||0)+(qs.derived_tax||0)+(qs.derived_taxable||0)+(qs.derived_split||0);
+  const derivedNote = derivedN ? `<div class="wtime" style="color:var(--proof)">${derivedN} value(s) auto-calculated by QA · ${qs.derived_total||0} totals, ${qs.derived_tax||0} tax, ${qs.derived_taxable||0} taxable, ${qs.derived_split||0} annexure splits — kept out of Review</div>` : '';
   const qaCard = `<div class="wcard qa">
     <div class="whead"><span class="wdot"></span><b>QA Lead</b> · quality &amp; analyst</div>
     <div class="wtrait">checks every bill, fixes provable arithmetic, routes the rest</div>
     <div class="wjob">${qs.pushed} passed → invoices${fixNote}</div>
     <div class="wtime">${qs.kicked} sent back → failed_uploads (P1 for review)${failNote}</div>
+    ${derivedNote}
   </div>`;
   const crewLabel = isProc ? 'Your processing crew' : 'Your OCR crew';
   // Structure: one QA + one TL for every 4 workers. Show how many teams there are.
@@ -4010,7 +4164,7 @@ const LEDGER_COLS = [
 ];
 
 function filtered(){
-  const q = $('#q').value.trim().toLowerCase(), v = $('#fVerdict').value, st = $('#fSettle').value;
+  const q = ($('#q')?$('#q').value:'').trim().toLowerCase(), v = $('#fVerdict')?$('#fVerdict').value:'', st = $('#fSettle')?$('#fSettle').value:'';
   // Read from the session if it has docs; otherwise fall back to what was pulled
   // from the database, so the Ledger/Tally aren't blank after a fresh reload when
   // the data lives only in Supabase.
@@ -4028,10 +4182,11 @@ function filtered(){
 }
 
 function renderLedger(){
+  const t = $('#ledger');
+  if (!t) return;   // Ledger view retired in favour of Analytics; render nothing if absent
   let rows = filtered();
   const total = (DB.docs&&DB.docs.length) ? DB.docs.length : ((window.misRows||window.reviewPulled||[]).length || rows.length);
-  $('#ledgerCount').textContent = `${rows.length} of ${total}`;
-  const t = $('#ledger');
+  if ($('#ledgerCount')) $('#ledgerCount').textContent = `${rows.length} of ${total}`;
   // sortable headers — click to sort, click again to reverse
   const srt = window.__ledgerSort || { col:-1, dir:1 };
   if (srt.col >= 0) {
@@ -4219,17 +4374,20 @@ function renderReview(){
 
   // toolbar: toggle + push
   const bar = $('#reviewBar');
+  const REVIEWERS = ['A','B','C','D','E','F'];
   if (bar) bar.innerHTML = `
     <div class="seg">
       <button class="${flaggedOnly?'on':''}" onclick="setReviewMode('flagged')">Needs fixing (${flaggedCount})</button>
       <button class="${!flaggedOnly?'on':''}" onclick="setReviewMode('all')">All bills (${source.length})</button>
     </div>
-    <label class="dim" style="font-size:12px;display:flex;align-items:center;gap:6px">Assign part
+    <label class="dim" style="font-size:12px;display:flex;align-items:center;gap:6px">This PC is
       <select onchange="setReviewPart(this.value)" style="padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--text)">
-        <option value="0" ${part===0?'selected':''}>Everyone (all)</option>
-        ${[1,2,3,4,5,6].map(p=>`<option value="${p}" ${part===p?'selected':''}>Part ${p} of 6</option>`).join('')}
+        <option value="0" ${part===0?'selected':''}>Everyone (all bills)</option>
+        ${REVIEWERS.map((L,idx)=>`<option value="${idx+1}" ${part===idx+1?'selected':''}>Reviewer ${L}</option>`).join('')}
       </select></label>
-    <span class="dim" style="font-size:12px">${window.reviewPulled&&window.reviewPulled.length?'● live from database':'showing this session'}${part>0?` · showing your ${rows.length} of ${flaggedOnly?flaggedCount:source.length}`:''}</span>`;
+    <span class="dim" style="font-size:12px">${window.reviewPulled&&window.reviewPulled.length?'● live from database':'showing this session'}${part>0?` · you have ${rows.length} of ${flaggedOnly?flaggedCount:source.length} to clear`:''}</span>
+    <div id="reviewProgress" style="width:100%;margin-top:8px"></div>`;
+  if (typeof renderReviewProgress==='function') renderReviewProgress();
 
   t.tHead.innerHTML = '<tr><th></th><th>Invoice</th><th>Client · Branch</th><th>What needs checking</th><th></th></tr>';
   t.tBodies[0].innerHTML = rows.length ? rows.slice(0,400).map(r => {
@@ -4249,7 +4407,66 @@ function renderReview(){
 }
 
 window.setReviewMode = m => { window.__reviewMode = m; renderReview(); };
-window.setReviewPart = p => { window.__reviewPart = parseInt(p,10)||0; renderReview(); };
+window.setReviewPart = p => {
+  window.__reviewPart = parseInt(p,10)||0;
+  try { localStorage.setItem('lumen_reviewer', String(window.__reviewPart)); } catch(_){}
+  renderReview();
+  renderReviewProgress();
+};
+// Restore this PC's reviewer choice on load (each of the 6 PCs remembers who it is).
+try { const saved = localStorage.getItem('lumen_reviewer'); if (saved!=null) window.__reviewPart = parseInt(saved,10)||0; } catch(_){}
+const REVIEWER_LETTERS = ['A','B','C','D','E','F'];
+function myReviewerLetter(){ const p = window.__reviewPart||0; return p>=1&&p<=6 ? REVIEWER_LETTERS[p-1] : null; }
+
+// How many bills belong to each reviewer's bucket (the deterministic split),
+// counted from the current flagged review set — this is "assigned".
+function assignedCounts(){
+  const failed = (window.failedBills||[]).map(f=>({hash:f.content_hash, checks:[{status:'FAIL'}]}));
+  const base = (window.reviewPulled && window.reviewPulled.length) ? window.reviewPulled : DB.docs;
+  const source = [...failed, ...base];
+  const flagged = source.filter(r => r.checks && r.checks.some(c=>c.status==='FAIL'));
+  const counts = [0,0,0,0,0,0];
+  flagged.forEach(r => { const b = hashBucket(r.hash||r.content_hash||(r.invoice&&r.invoice.invoice_no)||'')%6; counts[b]++; });
+  return counts;   // index 0 = Reviewer A
+}
+
+// The live board: Reviewer A–F, Assigned / Cleared / Remaining. Cleared comes
+// from the database (all PCs), Assigned+Remaining are computed locally.
+window.__reviewCleared = window.__reviewCleared || {};   // {A: n, ...}
+function renderReviewProgress(){
+  const host = $('#reviewProgress'); if (!host) return;
+  const assigned = assignedCounts();
+  const mine = myReviewerLetter();
+  const rowsHtml = REVIEWER_LETTERS.map((L,i) => {
+    const asg = assigned[i];
+    const clr = window.__reviewCleared[L] || 0;
+    const rem = Math.max(asg, 0);   // remaining = still-flagged in this bucket right now
+    const isMe = L===mine;
+    return `<tr style="${isMe?'font-weight:600;background:var(--accent-soft)':''}">
+      <td>Reviewer ${L}${isMe?' (this PC)':''}</td>
+      <td style="text-align:right" class="mono">${clr}</td>
+      <td style="text-align:right" class="mono">${rem}</td>
+    </tr>`;
+  }).join('');
+  host.innerHTML = `
+    <div class="tablewrap" style="max-width:420px">
+      <table class="grid"><thead>
+        <tr><th>Reviewer</th><th style="text-align:right">Cleared today</th><th style="text-align:right">Still to clear</th></tr>
+      </thead><tbody>${rowsHtml}</tbody></table>
+    </div>
+    <p class="sub" style="margin:6px 0 0;font-size:11px">Cleared counts are live across all 6 PCs. "Still to clear" is what remains flagged in each reviewer's share right now.</p>`;
+}
+window.renderReviewProgress = renderReviewProgress;
+
+// Pull the live cleared board from the database and re-render.
+async function refreshReviewProgress(){
+  if (typeof Cloud==='undefined' || !Cloud.fetchReviewProgress) return;
+  const board = await Cloud.fetchReviewProgress();
+  const map = {}; (board||[]).forEach(r => { map[r.reviewer] = r.cleared; });
+  window.__reviewCleared = map;
+  renderReviewProgress();
+}
+window.refreshReviewProgress = refreshReviewProgress;
 // deterministic bucket 0..(n-1) from a string — same bill always lands in the
 // same part, so the 6-way split is stable across people and refreshes.
 function hashBucket(str){
@@ -4320,6 +4537,9 @@ window.markVerified = async (key) => {
     r._hasImagePage = false; delete r._pdfBuf; delete r._sourceBlob;
     log('Bill marked verified — removed from the review list.', 'ok');
     DIAG && DIAG.info('system', `bill marked verified: ${r.filename||hash}`);
+    // Count this toward the reviewer's live cleared tally (if a reviewer is set).
+    const me = (typeof myReviewerLetter==='function') ? myReviewerLetter() : null;
+    if (me && Cloud.bumpReviewCleared) { Cloud.bumpReviewCleared(me, 1).then(res => { if(res){ window.__reviewCleared[me]=res.cleared; renderReviewProgress(); } }); }
   } catch(e){ log('Could not mark verified: '+e.message, 'er'); }
   closeModal(); renderReview(); renderOcrBanner(); renderAll();
 };
@@ -4448,7 +4668,7 @@ function reportRows(){
                    igst_paise:r.invoice.tax_total_paise||0, total_paise:r.invoice.total_paise||0,
                    allocation_method:'—'};
     const rows = perApplicant ? (r.applicants.length ? r.applicants : [blank]) : [blank];
-    rows.forEach(a => out.push(reportCols.map(k => FIELD_MAP[k].g(r,a) ?? '')));
+    rows.forEach(a => { const row = reportCols.map(k => FIELD_MAP[k].g(r,a) ?? ''); row.__hash = r.hash || r.content_hash || (r.invoice && r.invoice.content_hash); out.push(row); });
   });
   return out;
 }
@@ -4555,10 +4775,12 @@ function renderReport(){
   t.tHead.innerHTML = '<tr>' + reportCols.map((k,i)=>{
     const arrow = rsrt.col===i ? (rsrt.dir===1?' ▲':' ▼') : '';
     return `<th class="sortable" onclick="sortReport(${i})" style="cursor:pointer;user-select:none">${colLabel(k)}${arrow}</th>`;
-  }).join('') + '</tr>';
+  }).join('') + '<th></th></tr>';
   t.tBodies[0].innerHTML = rows.length ? rows.slice(0,300).map(r=>'<tr>'+r.map((v,i)=>
-    `<td class="${FIELD_MAP[reportCols[i]].n?'num':''}"${String(v).includes('RECHECK')?' style="color:var(--fail);font-weight:600"':''}>${FIELD_MAP[reportCols[i]].n && typeof v==='number' ? v.toLocaleString('en-IN',{minimumFractionDigits:2}) : esc(v)}</td>`).join('')+'</tr>').join('')
-    : `<tr><td colspan="${reportCols.length}"><div class="empty"><h3>No rows</h3><p>Ingest documents first.</p></div></td></tr>`;
+    `<td class="${FIELD_MAP[reportCols[i]].n?'num':''}"${String(v).includes('RECHECK')?' style="color:var(--fail);font-weight:600"':''}>${FIELD_MAP[reportCols[i]].n && typeof v==='number' ? v.toLocaleString('en-IN',{minimumFractionDigits:2}) : esc(v)}</td>`).join('')
+    + (r.__hash ? `<td><button class="btn sm" onclick="openBillEditor('${esc(r.__hash)}')" title="Open this bill and correct it in place">Fix</button></td>` : '<td></td>')
+    +'</tr>').join('')
+    : `<tr><td colspan="${reportCols.length+1}"><div class="empty"><h3>No rows</h3><p>Ingest documents first.</p></div></td></tr>`;
   if (flashCol) {
     const i = reportCols.indexOf(flashCol);
     const th = t.tHead.querySelectorAll('th')[i];
@@ -4677,12 +4899,12 @@ function renderAll(){
   const s0 = stats();
   /* Stated plainly and permanently: a verdict is a judgement about evidence,
      never a filter. Nothing is ever withheld from the database or the reports. */
-  $('#assure').innerHTML = !s0.n ? '' :
+  if ($('#assure')) $('#assure').innerHTML = !s0.n ? '' :
     `<span>✓</span><span><b>All ${s0.n} document(s) are in the database</b> and appear in every report.
      A verdict describes how well a document proved itself — it never removes a bill.
      ${s0.unproven + s0.undet ? `${s0.unproven + s0.undet} need${s0.unproven + s0.undet === 1 ? 's' : ''} a look, but ${s0.unproven + s0.undet === 1 ? 'it is' : 'they are'} stored and reported like everything else.` : ''}</span>`;
   const set = new Set(DB.docs.map(d=>d.invoice.settlement_status));
-  $('#fSettle').innerHTML = '<option value="">All settlement</option>' + [...set].map(s=>`<option>${s}</option>`).join('');
+  if ($('#fSettle')) $('#fSettle').innerHTML = '<option value="">All settlement</option>' + [...set].map(s=>`<option>${s}</option>`).join('');
   renderIngestStats(); renderLedger(); renderReview(); if(typeof buildMisFilters==='function')buildMisFilters(); renderReport(); renderAudit(); renderTally();
   if(typeof setCloud==='function') setCloud('Ready');
 }
@@ -4791,7 +5013,17 @@ function persist(){
 /* ================= wiring ================= */
 $('#rail').addEventListener('click', e => { const b = e.target.closest('button[data-v]'); if(!b) return;
   $$('#rail button[data-v]').forEach(x => x.setAttribute('aria-current', String(x === b)));
-  $$('.view').forEach(v => v.classList.toggle('on', v.id === 'v-' + b.dataset.v)); });
+  $$('.view').forEach(v => v.classList.toggle('on', v.id === 'v-' + b.dataset.v));
+  // Re-render the view we just switched to, so it always shows current data
+  // (fixes tabs appearing blank because a render was never triggered on switch).
+  const v = b.dataset.v;
+  try {
+    if (v === 'review') { renderReview(); }
+    else if (v === 'report') { if (typeof buildMisFilters==='function') buildMisFilters(); renderReport(); }
+    else if (v === 'cloud') { if (typeof renderDbList==='function') renderDbList(); }
+    else if (v === 'analytics') { if (typeof renderAnalytics==='function') renderAnalytics(); }
+  } catch(err){ DIAG && DIAG.warn && DIAG.warn('system','view render failed',{view:v,reason:err.message}); }
+});
 
 /* Report now hosts three sub-views: MIS Report, Ledger, Tally. They used to be
    separate top-level tabs; consolidating them here means fewer doors to similar
@@ -4981,8 +5213,8 @@ async function runSelfTests(){
 $('#fileIn').onchange = e => { stageFiles([...e.target.files]); e.target.value=''; };
 $('#folderIn').onchange = e => { stageFiles([...e.target.files]); e.target.value=''; };
 
-$('#q').oninput = renderLedger; $('#fVerdict').onchange = renderLedger; $('#fSettle').onchange = renderLedger;
-$('#ledger').onclick = e => { const tr = e.target.closest('tr[data-id]'); if (tr) openDoc(tr.dataset.id); };
+$('#q') && ($('#q').oninput = renderLedger); $('#fVerdict') && ($('#fVerdict').onchange = renderLedger); $('#fSettle') && ($('#fSettle').onchange = renderLedger);
+$('#ledger') && ($('#ledger').onclick = e => { const tr = e.target.closest('tr[data-id]'); if (tr) openDoc(tr.dataset.id); });
 $('#review').onclick = e => { const tr = e.target.closest('tr[data-id]'); if (tr) openDoc(tr.dataset.id); };
 $('#dClose').onclick = closeDoc; $('#scrim').onclick = closeDoc;
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDoc(); });
@@ -5500,6 +5732,8 @@ async function syncFromDatabase(silent){
     window.__reviewMode = 'flagged';
     if (typeof buildMisFilters==='function') buildMisFilters();
     renderReview(); renderReport();
+    if (typeof renderDbList==='function') renderDbList();
+    if (typeof renderAnalytics==='function') renderAnalytics();
     if (!silent) DIAG && DIAG.ok('system', `synced ${rows.length} bills from database`, { needs_attention: needs });
   } catch(e){ if(!silent) setCloud('Database offline — working locally','wn'); DIAG && DIAG.warn('system','db sync failed',{reason:e.message}); }
 }
@@ -5734,12 +5968,13 @@ window.wireReconcile = wireReconcile;
 
 (async () => {
   await syncFromDatabase(false);
+  if (typeof refreshReviewProgress==='function') refreshReviewProgress();
   refreshDashboard();   // initial live-dashboard read
   // subscribe to live database changes — refreshes silently on any change,
   // INCLUDING runs happening on other machines/locations. The dashboard meter
   // updates live from those too.
   if (typeof Cloud !== 'undefined' && Cloud.subscribeRealtime) {
-    Cloud.subscribeRealtime(() => { syncFromDatabase(true).then(()=>{ renderReview(); if(typeof renderLedger==='function') renderLedger(); }); refreshDashboard(); });
+    Cloud.subscribeRealtime(() => { syncFromDatabase(true).then(()=>{ renderReview(); if(typeof renderLedger==='function') renderLedger(); }); refreshDashboard(); if(typeof refreshReviewProgress==='function') refreshReviewProgress(); });
   }
   // periodic safety refresh (every 20s) in case a realtime event is missed, so
   // the meter never goes stale even if the websocket drops.
@@ -6011,7 +6246,7 @@ async function openBillEditor(hash){
                  <div style="margin-top:6px"><a href="${billUrl}" target="_blank" rel="noopener" class="dim" style="font-size:12px">↗ Open bill in new tab</a></div>`
               : `<iframe src="${billUrl}" style="width:100%;height:66vh;border:1px solid var(--line);border-radius:8px"></iframe>
                  <div style="margin-top:6px"><a href="${billUrl}" target="_blank" rel="noopener" class="dim" style="font-size:12px">↗ Open bill in new tab (if it doesn't show above)</a></div>`)
-            : `<div class="editor-noview">The original bill couldn't be loaded for viewing.<br><span class="dim">${esc(window.__editorNoFileReason||'Edit the fields on the right using the details you have.')}</span></div>`}
+            : `<div class="editor-noview">No stored image for this bill — you can still edit every field on the right and save.<br><span class="dim">${esc(window.__editorNoFileReason||'')}</span></div>`}
         </div>
         <div class="editor-edit">
           ${checkSummaryHtml}
@@ -6065,6 +6300,172 @@ function renderEditorLines(){
 }
 
 window.openBillEditor = openBillEditor;
+
+/* Database tab — list every stored entry, drawn live from window.dbRows.
+   Searchable; each row has a Fix button that opens the same editor used in
+   Review, so a mistake can be corrected in place without hunting for it. */
+function renderDbList(){
+  const host = $('#dbListBody'); if (!host) return;
+  const rows = window.dbRows || [];
+  const q = ($('#dbSearch') && $('#dbSearch').value || '').trim().toLowerCase();
+  const dist = (inv) => {
+    try { const d = (typeof window.LumenCore!=='undefined' && window.LumenCore.districtFromInvoice) ? window.LumenCore.districtFromInvoice(inv) : null; return d ? d.d : ''; } catch(_){ return ''; }
+  };
+  let list = rows.map(r => ({ r, district: dist(r.invoice_no) }));
+  if (q) list = list.filter(({r,district}) =>
+    [r.invoice_no, r.client_raw, r.branch_raw, district].some(v => String(v||'').toLowerCase().includes(q)));
+  if ($('#dbCount')) $('#dbCount').textContent = `${list.length} of ${rows.length}`;
+  if (!rows.length){ host.innerHTML = '<div class="empty"><h3>Nothing stored yet</h3><p>Ingest bills to populate the database.</p></div>'; return; }
+  if (!list.length){ host.innerHTML = '<div class="empty"><p>No entries match your search.</p></div>'; return; }
+  const money = p => p==null ? '' : '₹'+(p/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const statusPill = s => { const v=(s||'').toUpperCase();
+    const c = v.includes('PAID')&&!v.includes('PART') ? 'var(--proof)' : v.includes('PART') ? 'var(--warn)' : 'var(--text-3)';
+    return `<span style="color:${c}">${esc(s||'—')}</span>`; };
+  const head = `<tr><th>Invoice</th><th>Client</th><th>Branch</th><th>District</th><th style="text-align:right">Total</th><th>Status</th><th>Verdict</th><th></th></tr>`;
+  const body = list.slice(0, 800).map(({r,district}) =>
+    `<tr>
+      <td class="mono">${esc(r.invoice_no||'')}</td>
+      <td>${esc(r.client_raw||'')}</td>
+      <td>${esc(r.branch_raw||'')}</td>
+      <td>${esc(district)}</td>
+      <td style="text-align:right" class="mono">${money(r.total_paise)}</td>
+      <td>${statusPill(r.settlement_status)}</td>
+      <td>${esc(r.verdict||'')}</td>
+      <td><button class="btn sm" onclick="openBillEditor('${esc(r.content_hash)}')">Fix</button></td>
+    </tr>`).join('');
+  const more = list.length > 800 ? `<p class="sub" style="margin:8px 0 0">Showing first 800 of ${list.length}. Search to narrow.</p>` : '';
+  host.innerHTML = `<div class="tablewrap"><table class="grid"><thead>${head}</thead><tbody>${body}</tbody></table></div>${more}`;
+}
+window.renderDbList = renderDbList;
+$('#dbSearch') && ($('#dbSearch').oninput = () => renderDbList());
+
+/* ===================== ANALYTICS DASHBOARD ==========================
+   Live pendency / DPD / throughput from window.dbRows, with district
+   decoding, filters, and write-offs (individual + bulk). Read-only except
+   for the write-off actions, which are password-gated for bulk. */
+window.__anSelected = window.__anSelected || {};   // {hash:true}
+function daysBetween(a,b){ if(!a||!b) return null; const d=(new Date(b)-new Date(a))/86400000; return isFinite(d)?Math.floor(d):null; }
+function anDistrictOf(inv){ try{ const d=(window.LumenCore&&window.LumenCore.districtFromInvoice)?window.LumenCore.districtFromInvoice(inv):null; return d?d.d:''; }catch(_){return '';} }
+function anFilteredRows(){
+  const rows = window.dbRows || [];
+  const fD=$('#anDistrict')&&$('#anDistrict').value, fC=$('#anClient')&&$('#anClient').value,
+        fS=$('#anStatus')&&$('#anStatus').value, fA=$('#anAge')&&$('#anAge').value;
+  const today = new Date().toISOString().slice(0,10);
+  return rows.map(r => ({ r, district: anDistrictOf(r.invoice_no), dpd: daysBetween(r.invoice_date, today) }))
+    .filter(({r,district,dpd}) => {
+      if (fD && district!==fD) return false;
+      if (fC && (r.client_raw||'')!==fC) return false;
+      if (fS==='__PENDING' && !/PENDING|PARTIAL/i.test(r.settlement_status||'')) return false;
+      else if (fS && fS!=='__PENDING' && (r.settlement_status||'')!==fS) return false;
+      if (fA){ const cap=parseInt(fA,10); if(dpd==null) return false;
+        if (cap===30 && !(dpd<=30)) return false;
+        if (cap===60 && !(dpd>30&&dpd<=60)) return false;
+        if (cap===90 && !(dpd>60&&dpd<=90)) return false;
+        if (cap===9999 && !(dpd>90)) return false; }
+      return true;
+    });
+}
+function renderAnalytics(){
+  const host = $('#anTable'); if (!host) return;
+  const rows = window.dbRows || [];
+  // populate filter dropdowns once
+  const fillSel = (sel, vals) => { const el=$(sel); if(!el) return; const cur=el.value;
+    const opts = [...new Set(vals.filter(Boolean))].sort();
+    if (el.options.length <= 1 + opts.length){ const first=el.options[0].outerHTML;
+      el.innerHTML = first + opts.map(v=>`<option${v===cur?' selected':''}>${esc(v)}</option>`).join(''); } };
+  fillSel('#anDistrict', rows.map(r=>anDistrictOf(r.invoice_no)));
+  fillSel('#anClient', rows.map(r=>r.client_raw));
+
+  const list = anFilteredRows();
+  if ($('#anCount')) $('#anCount').textContent = `${list.length} of ${rows.length}`;
+  const money = p => '₹'+((p||0)/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const isPend = s => /PENDING|PARTIAL/i.test(s||'');
+
+  // KPIs
+  const billed = list.reduce((a,{r})=>a+(r.total_paise||0),0);
+  const pend = list.filter(({r})=>isPend(r.settlement_status));
+  const pendAmt = pend.reduce((a,{r})=>a+(r.total_paise||0),0);
+  const woff = list.filter(({r})=>/WRITTEN_OFF/i.test(r.settlement_status||'')||r.written_off).length;
+  const kpi = (label,val,color) => `<div class="wcard"><div class="wtrait">${label}</div><div style="font-size:22px;font-weight:600;${color?`color:${color}`:''}">${val}</div></div>`;
+  $('#anKpis').innerHTML = kpi('Entries', list.length) + kpi('Total billed', money(billed))
+    + kpi('Pending', money(pendAmt), 'var(--warn)') + kpi('Pending count', pend.length, 'var(--warn)')
+    + kpi('Written off', woff, 'var(--fail)');
+
+  // Pendency by district
+  const byD = {};
+  list.forEach(({r,district})=>{ const k=district||'(unknown)'; (byD[k]=byD[k]||{n:0,amt:0,pend:0,pendAmt:0});
+    byD[k].n++; byD[k].amt+=(r.total_paise||0); if(isPend(r.settlement_status)){byD[k].pend++; byD[k].pendAmt+=(r.total_paise||0);} });
+  const dRows = Object.entries(byD).sort((a,b)=>b[1].pendAmt-a[1].pendAmt).map(([d,v])=>
+    `<tr><td>${esc(d)}</td><td style="text-align:right" class="mono">${v.n}</td><td style="text-align:right" class="mono">${money(v.amt)}</td><td style="text-align:right" class="mono">${v.pend}</td><td style="text-align:right;color:var(--warn)" class="mono">${money(v.pendAmt)}</td></tr>`).join('');
+  $('#anByDistrict').innerHTML = `<table class="grid"><thead><tr><th>District</th><th style="text-align:right">Entries</th><th style="text-align:right">Billed</th><th style="text-align:right">Pending #</th><th style="text-align:right">Pending ₹</th></tr></thead><tbody>${dRows||'<tr><td colspan=5 class=dim>No data</td></tr>'}</tbody></table>`;
+
+  // DPD buckets (pending only)
+  const buckets = {'0–30':0,'31–60':0,'61–90':0,'90+':0,'no date':0};
+  const bAmt = {'0–30':0,'31–60':0,'61–90':0,'90+':0,'no date':0};
+  pend.forEach(({r,dpd})=>{ let k; if(dpd==null)k='no date'; else if(dpd<=30)k='0–30'; else if(dpd<=60)k='31–60'; else if(dpd<=90)k='61–90'; else k='90+';
+    buckets[k]++; bAmt[k]+=(r.total_paise||0); });
+  const dpdRows = Object.keys(buckets).map(k=>`<tr><td>${k}${k!=='no date'?' days':''}</td><td style="text-align:right" class="mono">${buckets[k]}</td><td style="text-align:right" class="mono">${money(bAmt[k])}</td></tr>`).join('');
+  $('#anDpd').innerHTML = `<table class="grid"><thead><tr><th>Days past due</th><th style="text-align:right">Pending #</th><th style="text-align:right">Pending ₹</th></tr></thead><tbody>${dpdRows}</tbody></table>`;
+
+  // Entries table with checkboxes + individual write-off
+  const body = list.slice(0,600).map(({r,district,dpd})=>{
+    const wo = /WRITTEN_OFF/i.test(r.settlement_status||'')||r.written_off;
+    return `<tr${wo?' style="opacity:.55"':''}>
+      <td><input type="checkbox" data-anh="${esc(r.content_hash)}" ${window.__anSelected[r.content_hash]?'checked':''} ${wo?'disabled':''}></td>
+      <td class="mono">${esc(r.invoice_no||'')}</td>
+      <td>${esc(r.client_raw||'')}</td>
+      <td>${esc(district)}</td>
+      <td style="text-align:right" class="mono">${money(r.total_paise)}</td>
+      <td style="text-align:right" class="mono">${dpd==null?'—':dpd}</td>
+      <td>${esc(r.settlement_status||'')}</td>
+      <td>${wo?'<span class="dim">written off</span>':`<button class="btn sm" onclick="writeOffOne('${esc(r.content_hash)}')">Write off</button>`}</td>
+    </tr>`;
+  }).join('');
+  host.innerHTML = `<table class="grid"><thead><tr><th></th><th>Invoice</th><th>Client</th><th>District</th><th style="text-align:right">Total</th><th style="text-align:right">DPD</th><th>Status</th><th></th></tr></thead><tbody>${body||'<tr><td colspan=8 class=dim>No entries match.</td></tr>'}</tbody></table>${list.length>600?'<p class="sub">Showing first 600. Filter to narrow.</p>':''}`;
+  updateAnSelCount();
+}
+function updateAnSelCount(){ const n=Object.values(window.__anSelected).filter(Boolean).length; if($('#anSelCount')) $('#anSelCount').textContent = n?`${n} selected`:''; }
+window.renderAnalytics = renderAnalytics;
+
+// individual write-off
+window.writeOffOne = async (hash) => {
+  const reason = prompt('Reason for writing off this bill? (optional)'); if (reason===null) return;
+  try {
+    await Cloud.updateOne(hash, { written_off:true, write_off_reason:reason||'individual write-off', settlement_status:'WRITTEN_OFF' });
+    const row = (window.dbRows||[]).find(r=>r.content_hash===hash); if(row){ row.written_off=true; row.settlement_status='WRITTEN_OFF'; }
+    log('Bill written off.', 'ok'); DIAG && DIAG.ok('system',`write-off: ${hash}`);
+    renderAnalytics();
+  } catch(e){ log('Could not write off: '+e.message, 'er'); }
+};
+// bulk write-off (password-gated like the danger zone)
+$('#anBulkWriteoff') && ($('#anBulkWriteoff').onclick = async () => {
+  const hashes = Object.keys(window.__anSelected).filter(h=>window.__anSelected[h]);
+  if (!hashes.length) { alert('Tick some rows first.'); return; }
+  const pw = prompt(`Write off ${hashes.length} selected bill(s).\n\nThis is destructive. Enter the password to continue:`);
+  if (pw===null) return;
+  if (pw !== (typeof DANGER_PW!=='undefined'?DANGER_PW:'Shan@4612')) { alert('Incorrect password. No changes made.'); return; }
+  const reason = prompt('Reason for the bulk write-off? (optional)'); if (reason===null) return;
+  const total = (window.dbRows||[]).filter(r=>hashes.includes(r.content_hash)).reduce((a,r)=>a+(r.total_paise||0),0);
+  if (!confirm(`Write off ${hashes.length} bill(s) worth ₹${(total/100).toLocaleString('en-IN',{minimumFractionDigits:2})}? This cannot be undone.`)) return;
+  const btn=$('#anBulkWriteoff'); btn.disabled=true; btn.textContent='Writing off…';
+  try {
+    const r = await fetch(Cloud.url + '/rpc/bulk_write_off', { method:'POST', headers: Cloud.headers(), body: JSON.stringify({ p_hashes:hashes, p_reason:reason||'bulk write-off' }) });
+    if (!r.ok){ const t=await r.text(); throw new Error(`${r.status}: ${t.slice(0,120)}`); }
+    const res = await r.json();
+    (window.dbRows||[]).forEach(row=>{ if(hashes.includes(row.content_hash)){ row.written_off=true; row.settlement_status='WRITTEN_OFF'; } });
+    window.__anSelected = {};
+    log(`Wrote off ${res.written_off!=null?res.written_off:hashes.length} bill(s).`, 'ok');
+    DIAG && DIAG.ok('system',`bulk write-off: ${hashes.length}`);
+    renderAnalytics();
+  } catch(e){ log('Bulk write-off failed: '+e.message+' (is writeoffs.sql installed?)', 'er'); }
+  finally { btn.disabled=false; btn.textContent='Write off selected…'; }
+});
+// wire filters + checkbox selection
+['#anDistrict','#anClient','#anStatus','#anAge'].forEach(sel=>{ const el=$(sel); if(el) el.onchange=()=>renderAnalytics(); });
+$('#anTable') && $('#anTable').addEventListener('change', e => {
+  const cb = e.target.closest('input[data-anh]'); if(!cb) return;
+  window.__anSelected[cb.dataset.anh] = cb.checked; updateAnSelCount();
+});
 
 /* Find & fix any bill — search the database by invoice/client/branch, open the
    editor on any match to correct it. This covers mistakes that Review didn't
@@ -6165,6 +6566,9 @@ async function saveBillEditor(){
 
     log('Saved — the bill is updated in the database and cleared from Review.', 'ok');
     DIAG && DIAG.ok('system', `bill saved via editor: ${hash}`);
+    // Count toward this PC's reviewer tally (live across all 6 PCs).
+    { const me = (typeof myReviewerLetter==='function') ? myReviewerLetter() : null;
+      if (me && Cloud.bumpReviewCleared) { Cloud.bumpReviewCleared(me, 1).then(res => { if(res){ window.__reviewCleared[me]=res.cleared; if(typeof renderReviewProgress==='function') renderReviewProgress(); } }); } }
   } catch(e){
     // never leave the button stuck — always re-enable and say what happened
     log('Could not save: '+e.message, 'er');
