@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='34cc26bd9d49';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='78dbd28e6f41';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -1208,8 +1208,13 @@ const ANNEXURE_SIGNALS = [
   /invoice\s*details\s*of\s*invoice/i, /applicant\s*name/i
 ];
 function annexurePresent(view){
-  for (const g of view.grids)
-    for (const [, t] of textCells(g))
+  // An annexure lives on page 2+ or a separate sheet. A single-page / single-
+  // sheet document CANNOT have one, so never signal an annexure for a one-pager
+  // even if the word appears incidentally (e.g. "see annexure" on a bulk bill).
+  if (!view.grids || view.grids.length < 2) return null;
+  // Only scan the SECOND grid onward — the annexure is never on page 1.
+  for (let gi = 1; gi < view.grids.length; gi++)
+    for (const [, t] of textCells(view.grids[gi]))
       for (const p of ANNEXURE_SIGNALS) if (p.test(t)) return t.slice(0, 60);
   return null;
 }
@@ -1579,17 +1584,30 @@ function validate(rec) {
 
   /* C15 — applicant detail recovered. A bill can reconcile perfectly on its
      charge lines while every applicant row is lost to an unreadable annexure
-     header. The money looks right; the people are gone. Nothing else notices. */
+     header. But the customer/service detail may legitimately live on page 1 or
+     in the filename (bulk bills, service bills, single-customer bills). So a
+     missing annexure table is a WARNING to look, not a hard error — and only
+     when the document actually is multi-page (a one-pager has no annexure). */
   const expected = v._annexure_expected;
   const gotRows = (v._applicant_rows || []).length;
+  // did we get a customer name from somewhere else? (page-1 client, or filename)
+  const haveCustomerElsewhere = !!(v.client_raw || v.recipient_name || v._client_from_filename);
   if (expected && !gotRows) {
-    add('C15_applicant_detail', false,
-        `the document contains an annexure but no applicant rows could be read `
-        + `— applicant-level detail is missing from this invoice`);
+    if (haveCustomerElsewhere) {
+      // annexure header unreadable, but we DO have a customer — note it, don't fail
+      add('C15_applicant_detail', true,
+          `no annexure rows were read, but a customer was identified from the bill or filename `
+          + `— treated as a single-customer / bulk bill`, 'info');
+    } else {
+      // genuinely missing the people — worth a look, but a warning not an error
+      add('C15_applicant_detail', false,
+          `this multi-page bill mentions an annexure but no applicant rows or customer `
+          + `could be read — check page 1 and the filename for the customer`, 'warn');
+    }
   } else if (gotRows) {
     add('C15_applicant_detail', true, `${gotRows} applicant row(s) recovered`);
   } else {
-    skip('C15_applicant_detail', 'this invoice carries no annexure');
+    skip('C15_applicant_detail', 'this invoice carries no annexure (single-page bill)');
   }
 
   return R;
@@ -3880,7 +3898,7 @@ async function ingest(fileList){
       if (!r._pushed) {
         const tPush = Date.now();
         const outcome = await pushWithQA(r, wname, wid);
-        stage(outcome==='pushed'?'QA passed → saved':(outcome==='kicked'?'QA sent back (P1)':'save issue'), { worker:wid, ms: Date.now()-tPush });
+        stage(outcome==='pushed'?'saved for review':(outcome==='kicked'?'QA sent back (P1)':(outcome==='clean'?'clean — not saved':'save issue')), { worker:wid, ms: Date.now()-tPush });
       }
       // free heavy memory now that it's stored (keep buffer for image bills the OCR pass needs)
       if (!r._hasImagePage) { delete r._pdfBuf; }
@@ -3909,6 +3927,17 @@ async function ingest(fileList){
     // Attempt the push. IMPORTANT: only count as 'passed' after the database
     // CONFIRMS the write — never on the mere decision to push (that was giving a
     // false 'passed' count while the DB stayed empty).
+    // DESIGN: the database is a live worklist of bills that NEED REVIEW. A bill
+    // that is fully proven with no failing checks does not need review, so it is
+    // NOT saved — this keeps the database to just the review set.
+    const needsReview = (r.verdict && r.verdict !== 'PROVEN')
+      || ((r.checks||[]).some(c => c.status === 'FAIL' && c.severity !== 'warn' && c.severity !== 'warning' && c.severity !== 'info'));
+    if (!needsReview) {
+      r._skippedClean = true;
+      if (typeof Pipeline!=='undefined') Pipeline.stats.cleanSkipped = (Pipeline.stats.cleanSkipped||0) + 1;
+      DIAG.info('push', `${wname}: ${r.filename} is clean — not saved (review-only database)`, { worker:wid });
+      return 'clean';
+    }
     try {
       await Cloud.enrichFromMaster(r);
       await Cloud.pushOne(r);
@@ -4238,7 +4267,22 @@ function renderWorkerPanel(){
   el.innerHTML = `<div class="wtitle">${crewLabel} — ${online} of ${pool.n} online${progress}${queued?` · ${queued} waiting`:''}${teamNote}
       <span class="dim" style="text-transform:none;font-weight:400"> · Free a stuck one, bench to save memory, or recruit more for speed</span></div>
     <div class="wpanel">${cards}${qaCard}${recruitBtn}</div>`;
-  if (anyBusy && !_workerTick) _workerTick = setInterval(renderWorkerPanel, 1000);
+  // If the user is mid-drag on the crew slider, the 1s auto-refresh must not
+  // snap it back to the current size. Restore whatever they had set, and wire
+  // the slider to remember its value + pause auto-refresh while interacting.
+  const sl = document.getElementById('crewSlider');
+  if (sl) {
+    if (window.__crewSliderVal != null) {
+      sl.value = window.__crewSliderVal;
+      const num = document.getElementById('crewNum'); if (num) num.textContent = sl.value;
+      const ap = document.getElementById('crewApply'); if (ap) ap.textContent = (parseInt(sl.value,10)===pool.n)?'At '+sl.value:'Set to '+sl.value;
+    }
+    sl.addEventListener('input', () => { window.__crewSliderVal = sl.value; });
+    // once they interact, stop the auto-refresh from fighting them until Apply/blur
+    sl.addEventListener('pointerdown', () => { window.__crewDragging = true; });
+    sl.addEventListener('pointerup',   () => { window.__crewDragging = false; });
+  }
+  if (anyBusy && !_workerTick) _workerTick = setInterval(() => { if (!window.__crewDragging) renderWorkerPanel(); }, 1000);
   if (!anyBusy && _workerTick) { clearInterval(_workerTick); _workerTick = null; }
 }
 window.renderWorkerPanel = renderWorkerPanel;
@@ -4339,6 +4383,7 @@ window.recruitWorker = function(){
 // recruiting the difference, or shrinks by releasing — no repeated clicking.
 window.setCrewSize = function(target){
   target = Math.max(1, Math.min(target|0, OCR.MAX_CREW));
+  window.__crewSliderVal = null; window.__crewDragging = false;   // the applied size is now the truth
   const cur = (window.__procCrew && window.__procCrew.n) || (OCR._pool && OCR._pool.n) || OCR.poolSize();
   if (target === cur) return;
   if (target > cur) {
@@ -4658,6 +4703,12 @@ const FIELD_LABEL = {
 const MONEY_FIELDS = new Set(['taxable_paise','tax_total_paise','round_off_paise','total_paise',
   'face_total_paise','annexure_total_paise']);
 
+// A check only sends a bill to review if it is an ERROR-severity failure.
+// Warn/info-level fails (e.g. "annexure not read but customer found on page 1
+// or in the filename") are advisory and must NOT flood the review list.
+function blocksReview(c){ return c.status === 'FAIL' && c.severity !== 'warn' && c.severity !== 'warning' && c.severity !== 'info'; }
+window.blocksReview = blocksReview;
+
 function renderReview(){
   const t = $('#review');
   const flaggedOnly = (window.__reviewMode||'flagged') === 'flagged';
@@ -4680,7 +4731,7 @@ function renderReview(){
   const source = [...failed, ...base];
 
   let rows = source.filter(r => flaggedOnly
-    ? r.checks && r.checks.some(c => c.status === 'FAIL')
+    ? r.checks && r.checks.some(blocksReview)
     : true);
 
   // 6-WAY SPLIT: so 5-6 people can each take a fixed slice without two people
@@ -4700,7 +4751,7 @@ function renderReview(){
     return (b.invoice.total_paise||0) - (a.invoice.total_paise||0);
   });
 
-  const flaggedCount = source.filter(r=>r.checks&&r.checks.some(c=>c.status==='FAIL')).length;
+  const flaggedCount = source.filter(r=>r.checks&&r.checks.some(blocksReview)).length;
   $('#nReview').textContent = flaggedCount || '';
 
   // toolbar: toggle + push
@@ -4755,7 +4806,7 @@ function assignedCounts(){
   const failed = (window.failedBills||[]).map(f=>({hash:f.content_hash, checks:[{status:'FAIL'}]}));
   const base = (window.reviewPulled && window.reviewPulled.length) ? window.reviewPulled : DB.docs;
   const source = [...failed, ...base];
-  const flagged = source.filter(r => r.checks && r.checks.some(c=>c.status==='FAIL'));
+  const flagged = source.filter(r => r.checks && r.checks.some(blocksReview));
   const counts = [0,0,0,0,0,0];
   flagged.forEach(r => { const b = hashBucket(r.hash||r.content_hash||(r.invoice&&r.invoice.invoice_no)||'')%6; counts[b]++; });
   return counts;   // index 0 = Reviewer A
