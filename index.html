@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='ff8dae55a63b';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='eaf5cc6906d4';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -373,6 +373,16 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
           <div id="anChart"></div>
         </div>
       </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start;margin-top:18px">
+        <div>
+          <h2 style="margin:0 0 8px">Outstanding by client</h2>
+          <div id="anByClient" class="tblwrap" style="overflow-x:auto"></div>
+        </div>
+        <div>
+          <h2 style="margin:0 0 8px">Billed vs collected by month</h2>
+          <div id="anTrend"></div>
+        </div>
+      </div>
       <h2 style="margin:20px 0 8px">Priority accounts <span class="dim" style="font-size:12px;font-weight:400">— highest value × oldest, act first</span></h2>
       <div class="row" style="gap:8px;margin-bottom:8px">
         <button class="btn danger" id="anBulkWriteoff" title="Write off all ticked entries (password-protected)">Write off selected…</button>
@@ -466,6 +476,19 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
       </div>
 
       <div id="cloudBody"></div>
+      <h2 style="margin:20px 0 6px">Location codes <span class="dim" style="font-size:12px;font-weight:400">— the 3-letter prefix that identifies each location (PUN → Pune)</span></h2>
+      <p class="sub" style="margin:0 0 10px">The full list below is editable — including the built-in ones. Edit or add a code and it applies immediately across the tool and saves to the database for every machine.</p>
+      <div class="row" style="gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:flex-end">
+        <label style="font-size:11px;color:var(--text-2)">Code<br><input type="text" id="dcCode" maxlength="3" placeholder="PUN" style="width:70px;text-transform:uppercase" class="mono"></label>
+        <label style="font-size:11px;color:var(--text-2)">Location<br><input type="text" id="dcDistrict" placeholder="Pune" style="width:180px"></label>
+        <label style="font-size:11px;color:var(--text-2)">State<br><input type="text" id="dcState" placeholder="Maharashtra" style="width:180px"></label>
+        <button class="btn pri" id="dcAdd">Add / update code</button>
+        <span class="spacer"></span>
+        <span class="pill" id="dcCount"></span>
+        <input type="text" id="dcSearch" placeholder="Search codes…" style="width:180px">
+      </div>
+      <div id="dcListBody" class="tblwrap" style="max-height:320px;overflow:auto;margin-bottom:8px"></div>
+
       <h2 style="margin:20px 0 6px">All entries in the database</h2>
       <p class="sub" style="margin:0 0 10px">Everything stored, drawn live. Search to narrow it, and use Fix to correct any entry in place.</p>
       <div class="row" style="gap:8px;margin-bottom:10px;flex-wrap:wrap">
@@ -1991,15 +2014,19 @@ const DISTRICT_MAP = {
 function districtFromInvoice(inv){
   if (!inv) return null;
   const s = String(inv).trim().toUpperCase();
+  // A user-editable overlay (loaded from Supabase, if any) takes precedence over
+  // the built-in map, so branches can add or correct codes without a code change.
+  const overlay = (typeof globalThis!=='undefined' && globalThis.__DISTRICT_OVERLAY) || {};
+  const lookup = (k) => overlay[k] || DISTRICT_MAP[k] || null;
   // 1. Fast path: the first 3 characters (works for invoice numbers like
   //    PUN-2026-001 and filenames that start with the code, e.g. PUN_bill.pdf).
   const head = s.slice(0,3);
-  if (DISTRICT_MAP[head]) return DISTRICT_MAP[head];
+  if (lookup(head)) return lookup(head);
   // 2. Filename fallback: the code may sit between separators anywhere in the
   //    name (e.g. bill_PUN_2026.pdf, 2026-DEL-retail.xlsx). Scan each 3-letter
   //    token and return the first that is a known district code.
   const tokens = s.split(/[^A-Z]+/).filter(t => t.length === 3);
-  for (const t of tokens) if (DISTRICT_MAP[t]) return DISTRICT_MAP[t];
+  for (const t of tokens) if (lookup(t)) return lookup(t);
   return null;
 }
 
@@ -2742,6 +2769,29 @@ const Cloud = {
       if (!r.ok) return [];
       return await r.json();
     } catch(_){ return []; }
+  },
+  // ---- editable district codes (overlay over the built-in map) ----
+  async fetchDistrictCodes(){
+    try {
+      const r = await fetch(this.url + '/district_codes?select=code,district,state', { headers: this.headers() });
+      if (!r.ok) return [];
+      return await r.json();
+    } catch(_){ return []; }
+  },
+  async saveDistrictCode(code, district, state){
+    // upsert by primary key (code)
+    const r = await fetch(this.url + '/district_codes', {
+      method:'POST',
+      headers: this.headers({ 'Prefer':'resolution=merge-duplicates,return=minimal' }),
+      body: JSON.stringify({ code:String(code).toUpperCase().trim(), district, state: state||null }) });
+    if (!r.ok){ const t = await r.text(); throw new Error(`${r.status}: ${t.slice(0,120)}`); }
+    return true;
+  },
+  async deleteDistrictCode(code){
+    const r = await fetch(this.url + '/district_codes?code=eq.' + encodeURIComponent(String(code).toUpperCase().trim()),
+      { method:'DELETE', headers: this.headers({ 'Prefer':'return=minimal' }) });
+    if (!r.ok){ const t = await r.text(); throw new Error(`${r.status}: ${t.slice(0,120)}`); }
+    return true;
   }
 };
 
@@ -5041,7 +5091,7 @@ $('#rail').addEventListener('click', e => { const b = e.target.closest('button[d
   try {
     if (v === 'review') { renderReview(); }
     else if (v === 'report') { if (typeof buildMisFilters==='function') buildMisFilters(); renderReport(); }
-    else if (v === 'cloud') { if (typeof renderDbList==='function') renderDbList(); }
+    else if (v === 'cloud') { if (typeof renderDbList==='function') renderDbList(); if (typeof renderDistrictCodes==='function') renderDistrictCodes(); }
     else if (v === 'analytics') { if (typeof renderAnalytics==='function') renderAnalytics(); }
   } catch(err){ DIAG && DIAG.warn && DIAG.warn('system','view render failed',{view:v,reason:err.message}); }
 });
@@ -5989,6 +6039,7 @@ window.wireReconcile = wireReconcile;
 (async () => {
   await syncFromDatabase(false);
   if (typeof refreshReviewProgress==='function') refreshReviewProgress();
+  if (typeof loadDistrictCodes==='function') loadDistrictCodes();
   refreshDashboard();   // initial live-dashboard read
   // subscribe to live database changes — refreshes silently on any change,
   // INCLUDING runs happening on other machines/locations. The dashboard meter
@@ -6427,6 +6478,102 @@ function renderDbList(){
   host.innerHTML = `<div class="tablewrap" style="overflow-x:auto"><table class="grid" style="table-layout:fixed;min-width:1200px">${colgroup}<thead>${head}</thead><tbody>${body}</tbody></table></div>${more}`;
 }
 window.renderDbList = renderDbList;
+
+/* ---- Editable location (district) codes ----
+   Loaded from Supabase into an overlay the decoder consults first, so the team
+   can add or correct codes without a code change. Edits push back to the DB. */
+window.__districtCodes = window.__districtCodes || [];   // [{code,district,state}]
+function applyDistrictOverlay(){
+  const o = {};
+  (window.__districtCodes||[]).forEach(c => { if(c.code) o[String(c.code).toUpperCase()] = { d:c.location||'', s:c.state||'' }; });
+  globalThis.__DISTRICT_OVERLAY = o;
+}
+async function loadDistrictCodes(){
+  // Only custom/edited codes live in window.__districtCodes (the overlay). The
+  // built-in list is merged in for DISPLAY at render time, so every existing
+  // prefix is visible and editable without duplicating the built-in map here.
+  if (typeof Cloud!=='undefined' && Cloud.fetchDistrictCodes){
+    try {
+      const codes = await Cloud.fetchDistrictCodes();
+      window.__districtCodes = (codes||[]).map(c => ({ code:String(c.code).toUpperCase(), location:(c.district||c.location||''), state:(c.state||'') }));
+    } catch(_){ window.__districtCodes = window.__districtCodes||[]; }
+  }
+  applyDistrictOverlay();
+  renderDistrictCodes();
+  if (typeof renderDbList==='function') renderDbList();
+  if (typeof renderAnalytics==='function') renderAnalytics();
+}
+window.loadDistrictCodes = loadDistrictCodes;
+function renderDistrictCodes(){
+  const host = $('#dcListBody'); if (!host) return;
+  const q = ($('#dcSearch') && $('#dcSearch').value || '').trim().toLowerCase();
+  // Merge built-in map + custom codes for display. Custom overrides built-in.
+  const builtin = (window.LumenCore && window.LumenCore.DISTRICT_MAP) || {};
+  const merged = {};
+  Object.entries(builtin).forEach(([code,v]) => { merged[code] = { code, location:v.d, state:v.s, source:'built-in' }; });
+  (window.__districtCodes||[]).forEach(c => { const k=String(c.code).toUpperCase();
+    merged[k] = { code:k, location:c.location, state:c.state, source: builtin[k] ? 'edited' : 'custom' }; });
+  let list = Object.values(merged).sort((a,b)=>String(a.code).localeCompare(String(b.code)));
+  if (q) list = list.filter(c => [c.code,c.location,c.state,c.source].some(v=>String(v||'').toLowerCase().includes(q)));
+  if ($('#dcCount')) $('#dcCount').textContent = `${list.length} code(s)`;
+  if (!list.length){ host.innerHTML = '<p class="dim" style="padding:8px">No codes match your search.</p>'; return; }
+  const badge = s => s==='custom' ? '<span style="color:var(--proof);font-size:10px">custom</span>'
+    : s==='edited' ? '<span style="color:var(--warn);font-size:10px">edited</span>'
+    : '<span class="dim" style="font-size:10px">built-in</span>';
+  const rows = list.map(c => `<tr>
+    <td class="mono"><b>${esc(c.code)}</b></td>
+    <td>${esc(c.location||'')}</td>
+    <td>${esc(c.state||'')}</td>
+    <td>${badge(c.source)}</td>
+    <td style="text-align:right">
+      <button class="btn sm" onclick="editDistrictCode('${esc(c.code)}')">Edit</button>
+      ${c.source==='built-in' ? '' : `<button class="btn sm danger" onclick="removeDistrictCode('${esc(c.code)}')">Delete</button>`}
+    </td></tr>`).join('');
+  host.innerHTML = `<table class="grid"><thead><tr><th>Code</th><th>Location</th><th>State</th><th>Source</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+window.renderDistrictCodes = renderDistrictCodes;
+window.editDistrictCode = (code) => {
+  const k = String(code).toUpperCase();
+  let c = (window.__districtCodes||[]).find(x=>String(x.code).toUpperCase()===k);
+  if (!c) { const b=(window.LumenCore&&window.LumenCore.DISTRICT_MAP||{})[k]; if(b) c={code:k,location:b.d,state:b.s}; }
+  if (!c) return;
+  if ($('#dcCode')) $('#dcCode').value = c.code;
+  if ($('#dcDistrict')) $('#dcDistrict').value = c.location||'';
+  if ($('#dcState')) $('#dcState').value = c.state||'';
+  if ($('#dcCode')) $('#dcCode').focus();
+};
+window.removeDistrictCode = async (code) => {
+  if (!confirm(`Delete the code ${code}? Bills using it will fall back to the built-in list (or show no location).`)) return;
+  try {
+    await Cloud.deleteDistrictCode(code);
+    window.__districtCodes = (window.__districtCodes||[]).filter(x=>String(x.code).toUpperCase()!==String(code).toUpperCase());
+    applyDistrictOverlay(); renderDistrictCodes();
+    if (typeof renderDbList==='function') renderDbList();
+    if (typeof renderAnalytics==='function') renderAnalytics();
+    log(`Location code ${code} deleted.`, 'ok');
+  } catch(e){ log('Could not delete code: '+e.message+' (is district_codes.sql installed?)', 'er'); }
+};
+$('#dcAdd') && ($('#dcAdd').onclick = async () => {
+  const code = ($('#dcCode').value||'').toUpperCase().trim();
+  const location = ($('#dcDistrict').value||'').trim();
+  const state = ($('#dcState').value||'').trim();
+  if (!/^[A-Z]{3}$/.test(code)) { alert('The code must be exactly 3 letters, e.g. PUN.'); return; }
+  if (!location) { alert('Please enter the location name.'); return; }
+  const btn=$('#dcAdd'); btn.disabled=true; btn.textContent='Saving…';
+  try {
+    await Cloud.saveDistrictCode(code, location, state);
+    const existing = (window.__districtCodes||[]).find(x=>String(x.code).toUpperCase()===code);
+    if (existing) { existing.location=location; existing.state=state; }
+    else window.__districtCodes.push({ code, location, state });
+    applyDistrictOverlay(); renderDistrictCodes();
+    if (typeof renderDbList==='function') renderDbList();
+    if (typeof renderAnalytics==='function') renderAnalytics();
+    $('#dcCode').value=''; $('#dcDistrict').value=''; $('#dcState').value='';
+    log(`Location code ${code} → ${location} saved.`, 'ok');
+  } catch(e){ log('Could not save code: '+e.message+' (is district_codes.sql installed?)', 'er'); }
+  finally { btn.disabled=false; btn.textContent='Add / update code'; }
+});
+$('#dcSearch') && ($('#dcSearch').oninput = () => renderDistrictCodes());
 $('#dbSearch') && ($('#dbSearch').oninput = () => renderDbList());
 ['#dbfStatus','#dbfDistrict','#dbfVerdict'].forEach(sel=>{ const el=$(sel); if(el) el.onchange=()=>renderDbList(); });
 
@@ -6521,6 +6668,38 @@ function renderAnalytics(){
   $('#anChart').innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;height:auto">
     <line x1="${pad}" y1="${H-pad}" x2="${W-pad}" y2="${H-pad}" stroke="var(--line)"></line>${bars}</svg>
     <p class="dim" style="font-size:10.5px;margin:4px 0 0">Outstanding rupees grouped by how overdue they are. Red is the money most at risk.</p>`;
+
+  // ---- outstanding by client ----
+  const byC = {};
+  list.forEach(({r})=>{ const k=r.client_raw||'(unknown)'; byC[k]=byC[k]||{billed:0,out:0,n:0,outN:0};
+    byC[k].billed+=(r.total_paise||0); byC[k].n++;
+    if(isPend(r.settlement_status)){ byC[k].out+=(r.total_paise||0); byC[k].outN++; } });
+  const cRows = Object.entries(byC).sort((a,b)=>b[1].out-a[1].out).slice(0,20).map(([c,v])=>
+    `<tr><td>${esc(c)}</td><td style="text-align:right" class="mono">${v.n}</td><td style="text-align:right" class="mono">${money(v.billed)}</td><td style="text-align:right;color:var(--warn)" class="mono">${money(v.out)}</td><td style="text-align:right" class="mono">${v.billed?Math.round((1-v.out/v.billed)*100):100}%</td></tr>`).join('');
+  if ($('#anByClient')) $('#anByClient').innerHTML = `<table class="grid" style="font-size:11.5px"><thead><tr><th>Client</th><th style="text-align:right">Bills</th><th style="text-align:right">Billed</th><th style="text-align:right">Outstanding</th><th style="text-align:right">Collected</th></tr></thead><tbody>${cRows||'<tr><td colspan=5 class=dim>No data</td></tr>'}</tbody></table>${Object.keys(byC).length>20?`<p class="sub">Top 20 of ${Object.keys(byC).length} clients by outstanding.</p>`:''}`;
+
+  // ---- billed vs collected by month (from invoice_date) ----
+  const byM = {};
+  list.forEach(({r})=>{ if(!r.invoice_date) return; const mo=String(r.invoice_date).slice(0,7); if(!/^\d{4}-\d{2}$/.test(mo)) return;
+    byM[mo]=byM[mo]||{billed:0,collected:0};
+    byM[mo].billed+=(r.total_paise||0);
+    if(/PAID/i.test(r.settlement_status||'')&&!isPend(r.settlement_status)) byM[mo].collected+=(r.total_paise||0); });
+  const months = Object.keys(byM).sort().slice(-6);   // last 6 months
+  if ($('#anTrend')) {
+    if (!months.length) { $('#anTrend').innerHTML = '<p class="dim" style="font-size:11px">No dated bills yet to chart a trend.</p>'; }
+    else {
+      const maxM = Math.max(1, ...months.map(m=>byM[m].billed));
+      const W=340,H=200,pad=34,gw=(W-pad*2)/months.length,bw=gw*0.34;
+      const bars = months.map((m,i)=>{ const bh=Math.round((byM[m].billed/maxM)*(H-pad*2)), ch=Math.round((byM[m].collected/maxM)*(H-pad*2));
+        const x=pad+i*gw; const label=m.slice(5)+'/'+m.slice(2,4);
+        return `<rect x="${x+gw/2-bw-1}" y="${H-pad-bh}" width="${bw}" height="${bh}" rx="2" fill="#6A15C4"></rect>
+          <rect x="${x+gw/2+1}" y="${H-pad-ch}" width="${bw}" height="${ch}" rx="2" fill="#1A7A3A"></rect>
+          <text x="${x+gw/2}" y="${H-pad+13}" font-size="9" text-anchor="middle" fill="var(--text-2)">${label}</text>`; }).join('');
+      $('#anTrend').innerHTML = `<svg viewBox="0 0 ${W} ${H}" style="width:100%;max-width:${W}px;height:auto">
+        <line x1="${pad}" y1="${H-pad}" x2="${W-pad}" y2="${H-pad}" stroke="var(--line)"></line>${bars}</svg>
+        <p class="dim" style="font-size:10.5px;margin:4px 0 0"><span style="color:#6A15C4">■</span> billed &nbsp; <span style="color:#1A7A3A">■</span> collected — last ${months.length} month(s)</p>`;
+    }
+  }
 
   // ---- priority accounts: highest value × oldest first ----
   const scored = outList.map(o=>({...o, score:(o.r.total_paise||0)*(1+(o.dpd||0)/30)})).sort((a,b)=>b.score-a.score);
