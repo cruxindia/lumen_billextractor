@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='eaf5cc6906d4';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='34cc26bd9d49';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -375,7 +375,15 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start;margin-top:18px">
         <div>
-          <h2 style="margin:0 0 8px">Outstanding by client</h2>
+          <div class="row" style="gap:8px;align-items:center;margin:0 0 8px">
+            <h2 style="margin:0">Breakdown by</h2>
+            <select id="anGroupBy" style="padding:4px 8px">
+              <option value="location">Location</option>
+              <option value="client">Client</option>
+              <option value="branch">Client branch</option>
+              <option value="service">Service</option>
+            </select>
+          </div>
           <div id="anByClient" class="tblwrap" style="overflow-x:auto"></div>
         </div>
         <div>
@@ -476,10 +484,43 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
       </div>
 
       <div id="cloudBody"></div>
+
+      <h2 style="margin:22px 0 6px">Client &amp; branch master <span class="dim" style="font-size:12px;font-weight:400">— client, branch, code, email, GSTIN used to auto-fill missing details on bills</span></h2>
+      <p class="sub" style="margin:0 0 10px">Add or correct a branch here, or bulk-upload from Excel. These details fill genuinely-missing fields on future bills — reducing review load. Emails ending in <span class="mono">@cruxindia.co.in</span> are treated as internal senders, never as client emails.</p>
+      <div class="row" style="gap:6px;margin-bottom:8px;flex-wrap:wrap;align-items:flex-end">
+        <label style="font-size:11px;color:var(--text-2)">Client<br><input type="text" id="bmClient" placeholder="Bank of Maharashtra" style="width:170px"></label>
+        <label style="font-size:11px;color:var(--text-2)">Branch<br><input type="text" id="bmBranch" placeholder="Pune Main" style="width:150px"></label>
+        <label style="font-size:11px;color:var(--text-2)">Branch code<br><input type="text" id="bmCode" placeholder="0012" style="width:90px" class="mono"></label>
+        <label style="font-size:11px;color:var(--text-2)">Email<br><input type="text" id="bmEmail" placeholder="branch@…" style="width:170px"></label>
+        <label style="font-size:11px;color:var(--text-2)">GSTIN<br><input type="text" id="bmGstin" placeholder="27AAAA…" style="width:150px" class="mono"></label>
+        <button class="btn pri" id="bmAdd">Add / update</button>
+      </div>
+      <div class="row" style="gap:8px;margin-bottom:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn" id="bmTemplate" title="Download an Excel template to fill and upload">⬇ Excel template</button>
+        <label class="btn" style="cursor:pointer" title="Upload a filled Excel to bulk-add branches">⬆ Bulk upload Excel<input type="file" id="bmUpload" accept=".xlsx,.xls,.csv" style="display:none"></label>
+        <button class="btn" id="bmHarvest" title="Scan bills already in the database and fill the master with any GSTIN, email, or branch code found">⟳ Harvest from existing bills</button>
+        <span class="spacer"></span>
+        <input type="text" id="bmSearch" placeholder="Search master…" style="width:200px">
+        <span class="pill" id="bmCount"></span>
+      </div>
+      <div id="bmListBody" class="tblwrap" style="max-height:340px;overflow:auto"></div>
+
+      <h2 style="margin:22px 0 6px">CRUX identity <span class="dim" style="font-size:12px;font-weight:400">— our own GSTIN / SAC / PAN / MSME, used to fill missing supplier details on bills</span></h2>
+      <p class="sub" style="margin:0 0 10px">The Default row applies to every bill. Add a scoped row (for a specific client or location) only when those details differ. These fill genuinely-missing supplier fields — they never overwrite what a bill actually states.</p>
+      <div class="row" style="gap:6px;margin-bottom:8px;flex-wrap:wrap;align-items:flex-end">
+        <label style="font-size:11px;color:var(--text-2)">Scope<br><input type="text" id="ciScope" placeholder="DEFAULT or CLIENT:BOM" style="width:150px" class="mono"></label>
+        <label style="font-size:11px;color:var(--text-2)">Label<br><input type="text" id="ciLabel" placeholder="CRUX (default)" style="width:140px"></label>
+        <label style="font-size:11px;color:var(--text-2)">GSTIN<br><input type="text" id="ciGstin" placeholder="07AAGCC2924C1Z3" style="width:150px" class="mono"></label>
+        <label style="font-size:11px;color:var(--text-2)">SAC<br><input type="text" id="ciSac" placeholder="997159" style="width:80px" class="mono"></label>
+        <label style="font-size:11px;color:var(--text-2)">PAN<br><input type="text" id="ciPan" placeholder="AAGCC2924C" style="width:110px" class="mono"></label>
+        <label style="font-size:11px;color:var(--text-2)">MSME<br><input type="text" id="ciMsme" placeholder="UDYAM-MH-33-0156622" style="width:170px" class="mono"></label>
+        <button class="btn pri" id="ciAdd">Add / update</button>
+      </div>
+      <div id="ciListBody" class="tblwrap" style="max-height:220px;overflow:auto"></div>
       <h2 style="margin:20px 0 6px">Location codes <span class="dim" style="font-size:12px;font-weight:400">— the 3-letter prefix that identifies each location (PUN → Pune)</span></h2>
       <p class="sub" style="margin:0 0 10px">The full list below is editable — including the built-in ones. Edit or add a code and it applies immediately across the tool and saves to the database for every machine.</p>
       <div class="row" style="gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:flex-end">
-        <label style="font-size:11px;color:var(--text-2)">Code<br><input type="text" id="dcCode" maxlength="3" placeholder="PUN" style="width:70px;text-transform:uppercase" class="mono"></label>
+        <label style="font-size:11px;color:var(--text-2)">Code<br><input type="text" id="dcCode" maxlength="6" placeholder="PUN" style="width:70px;text-transform:uppercase" class="mono"></label>
         <label style="font-size:11px;color:var(--text-2)">Location<br><input type="text" id="dcDistrict" placeholder="Pune" style="width:180px"></label>
         <label style="font-size:11px;color:var(--text-2)">State<br><input type="text" id="dcState" placeholder="Maharashtra" style="width:180px"></label>
         <button class="btn pri" id="dcAdd">Add / update code</button>
@@ -992,6 +1033,41 @@ function extractFace(view) {
     let norm = String(val).trim(), type = 'string';
     if (f.endsWith('date')) { const d = parseDate(val); if (d) { norm = iso(d); type = 'date'; } }
     push(f, val, norm, type, .85, 'label:' + method, face.name, cell, "label '" + hits[0][1].slice(0, 44) + "'");
+  }
+
+  // Invoice-number format fallback. The number follows a fixed shape:
+  //   ABBR-xxxx-xxxx   (ABBR = 2+ strictly-alphabetical location code)
+  // If the label search above didn't yield one, scan every text cell (and the
+  // filename) for that pattern. A candidate whose ABBR is a known location code
+  // is preferred; otherwise the first well-formed match is used. This is what
+  // pushes invoice-number capture toward 100%.
+  if (!out.some(o => o.field === 'invoice_no')) {
+    const FMT = /\b([A-Za-z]{2,})[-/]([A-Za-z0-9]+)[-/]([A-Za-z0-9]+)\b/g;
+    const isCode = (ab) => {
+      try { const ov = (typeof globalThis!=='undefined' && globalThis.__DISTRICT_OVERLAY) || {};
+        const up = ab.toUpperCase(); return !!(ov[up] || (typeof DISTRICT_MAP!=='undefined' && DISTRICT_MAP[up])); } catch(_){ return false; }
+    };
+    let best = null, bestRef = null, fallback = null, fallbackRef = null;
+    for (const [ref, text] of textCells(face)) {
+      FMT.lastIndex = 0; let m;
+      while ((m = FMT.exec(String(text)))) {
+        const abbr = m[1];
+        if (!/^[A-Za-z]+$/.test(abbr)) continue;        // abbreviation strictly alphabetical
+        const full = m[0].toUpperCase();
+        if (isCode(abbr)) { if (!best) { best = full; bestRef = ref; } }
+        else if (!fallback) { fallback = full; fallbackRef = ref; }
+      }
+      if (best) break;
+    }
+    // filename as a last resort (many exports carry the number in the name)
+    if (!best && !fallback && view && view.filename) {
+      FMT.lastIndex = 0; const fm = FMT.exec(String(view.filename));
+      if (fm && /^[A-Za-z]+$/.test(fm[1])) { if (isCode(fm[1])) best = fm[0].toUpperCase(); else fallback = fm[0].toUpperCase(); }
+    }
+    const chosen = best || fallback;
+    if (chosen) push('invoice_no', chosen, chosen, 'string', best?.8:.6,
+      best ? 'format:code-validated' : 'format:pattern', face.name, bestRef||fallbackRef,
+      best ? 'ABBR-xxxx-xxxx with known location code' : 'ABBR-xxxx-xxxx pattern');
   }
 
   const gst = [];
@@ -1547,7 +1623,29 @@ function verdictOf(checks) {
    ALLOCATION — integer paise, deterministic residual, invariant enforced.
    ===================================================================== */
 function allocate(rec) {
-  const rows = rec.values._applicant_rows || [], taxable = rec.values.taxable_paise, total = rec.values.total_paise;
+  let rows = rec.values._applicant_rows || [];
+  const taxable = rec.values.taxable_paise, total = rec.values.total_paise;
+  // BULK BILL — no itemised annexure. Rather than lose the bill's money to an
+  // empty applicant list, synthesise ONE applicant line so the amount is still
+  // attributed and appears in the applicant-wise report:
+  //   name    = recipient bank / client name, else a name in the description,
+  //             else the filename stem
+  //   service = whatever the bill states, else the default "Verification service"
+  if (!rows.length && taxable != null) {
+    const v = rec.values;
+    const stripExt = s => String(s||'').replace(/\.[a-z0-9]{2,4}$/i,'').replace(/[_-]+/g,' ').trim();
+    const name = (v.client_raw && String(v.client_raw).trim())
+              || (v.recipient_name && String(v.recipient_name).trim())
+              || (v.description && String(v.description).trim())
+              || (v._filename ? stripExt(v._filename) : '')
+              || 'Bulk bill';
+    const service = (v.service_type && String(v.service_type).trim()) || 'Verification service';
+    rows = [{ applicant_name: name, amount_paise: taxable, service_type: service,
+              location: v.location || null, receipt_date: v.invoice_date || null,
+              locator: { sheet: 'bulk', row: 0 }, _bulk: true }];
+    rec.values._applicant_rows = rows;   // persist so downstream row counts see it
+    rec.values._bulk_bill = true;
+  }
   if (!rows.length || taxable == null) return { rows: [], method: null };
   const by = {};
   rows.forEach(r => { const s = by[r.applicant_name] = by[r.applicant_name] || { amount: 0, explicit: false, meta: r }; if (typeof r.amount_paise === 'number') { s.amount += r.amount_paise; s.explicit = true; } });
@@ -1899,6 +1997,7 @@ function processView(view) {
   const res = resolve(cands);
   const rec = { values: res.values, confidences: res.confidences, agreement: res.agreement,
                 byField: res.byField, unresolvedCount: view.metadata.unresolvedFormulas };
+  if (rec.values && view.filename) rec.values._filename = view.filename;
   const checks = validate(rec);
   const verdict = verdictOf(checks);
   const alloc = allocate(rec);
@@ -1921,6 +2020,21 @@ function processView(view) {
     const linesWhole = amts.length > 0 && amts.every(a => a % 100 === 0);
     const tol = linesWhole ? 50 * amts.length : 2;
     matchStatus = Math.abs(matchDiff) <= tol ? 'MATCH' : (rounded ? 'ROUNDED' : 'RECHECK');
+  }
+
+  // Customer-name-from-filename fallback. If the bill never yielded a client /
+  // customer name, try the filename: strip the extension and any leading
+  // location code + invoice-number tokens, and use the remaining words. Marked
+  // as filename-derived so it's visibly a fallback, and only used when blank.
+  if (!v.client_raw && view.filename) {
+    const stem = String(view.filename).replace(/\.[a-z0-9]{2,4}$/i,'');
+    let cust = stem
+      .replace(/^[A-Za-z]{2,}[-/]\d[\d-]*(?=[\s_]|$)/, '')   // drop a leading ABBR-xxxx invoice token only
+      .replace(/\b\d{4,}\b/g,' ')                      // drop long number runs
+      .replace(/[_-]+/g,' ').replace(/\s+/g,' ').trim();
+    if (cust && cust.length >= 3 && /[A-Za-z]/.test(cust)) {
+      v.client_raw = cust; v._client_from_filename = true;
+    }
   }
 
   return {
@@ -2018,14 +2132,19 @@ function districtFromInvoice(inv){
   // the built-in map, so branches can add or correct codes without a code change.
   const overlay = (typeof globalThis!=='undefined' && globalThis.__DISTRICT_OVERLAY) || {};
   const lookup = (k) => overlay[k] || DISTRICT_MAP[k] || null;
-  // 1. Fast path: the first 3 characters (works for invoice numbers like
-  //    PUN-2026-001 and filenames that start with the code, e.g. PUN_bill.pdf).
-  const head = s.slice(0,3);
-  if (lookup(head)) return lookup(head);
-  // 2. Filename fallback: the code may sit between separators anywhere in the
-  //    name (e.g. bill_PUN_2026.pdf, 2026-DEL-retail.xlsx). Scan each 3-letter
-  //    token and return the first that is a known district code.
-  const tokens = s.split(/[^A-Z]+/).filter(t => t.length === 3);
+  // Codes are 2+ alphabetical characters (e.g. MP, PUN, DEL). We try, in order:
+  // 1. The leading alphabetical run before the first separator — this is the
+  //    invoice format abbreviation-xxxx-xxxx (e.g. PUN-2026-001, MP-2026-045).
+  const lead = (s.match(/^[A-Z]+/) || [''])[0];
+  if (lead.length >= 2 && lookup(lead)) return lookup(lead);
+  // 2. Longest-prefix match: for names with no separator (PUNbill.pdf) try the
+  //    longest known code that the string starts with.
+  const allCodes = Object.keys(Object.assign({}, DISTRICT_MAP, overlay)).sort((a,b)=>b.length-a.length);
+  for (const c of allCodes) if (s.startsWith(c)) return lookup(c);
+  // 3. Token scan: the code may sit between separators anywhere in a filename
+  //    (bill_PUN_2026.pdf, 2026-MP-retail.xlsx). Match any alphabetical token
+  //    of length >= 2 that is a known code.
+  const tokens = s.split(/[^A-Z]+/).filter(t => t.length >= 2);
   for (const t of tokens) if (lookup(t)) return lookup(t);
   return null;
 }
@@ -2394,6 +2513,19 @@ const Cloud = {
     if (!r.ok) { const t = await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
     return await r.json();
   },
+  // Fetch every applicant line and group them by bill (content_hash), so the
+  // reports and the applicant-wise view have their rows. Without this, bills
+  // load but their applicant names come back blank.
+  async pullLinesByHash(){
+    const out = {};
+    try {
+      const r = await fetch(this.url + '/applicant_lines?select=*&order=line_no.asc',
+        { headers: this.headers({ 'Range':'0-499999', 'Range-Unit':'items' }) });
+      if (!r.ok) return out;
+      (await r.json()).forEach(l => { (out[l.content_hash] = out[l.content_hash] || []).push(l); });
+    } catch(_){}
+    return out;
+  },
 
   /* Look up a branch in the master table to fill a gap a bill is missing.
      Returns the learned record or null. */
@@ -2436,6 +2568,37 @@ const Cloud = {
     if(!r.ok){ const t=await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
     return await r.json();
   },
+  // Save (upsert) one branch master row. branch_key = normalized client|branch.
+  async saveBranch(b){
+    const key = (String(b.client_raw||'').trim()+'|'+String(b.branch_raw||'').trim()).toUpperCase().replace(/\s+/g,' ');
+    const body = { branch_key:key, client_raw:b.client_raw||null, branch_raw:b.branch_raw||null,
+      branch_code:b.branch_code||null, branch_email:b.branch_email||null, recipient_gstin:b.recipient_gstin||null,
+      updated_at:new Date().toISOString() };
+    const r = await fetch(this.url + '/branches', { method:'POST',
+      headers: this.headers({ 'Prefer':'resolution=merge-duplicates,return=minimal' }), body: JSON.stringify(body) });
+    if(!r.ok){ const t=await r.text(); throw new Error(`${r.status}: ${t.slice(0,140)}`); }
+    return true;
+  },
+  // Bulk upsert branch rows (from Excel). Returns count written.
+  async saveBranchesBulk(rows){
+    const payload = rows.map(b => {
+      const key = (String(b.client_raw||'').trim()+'|'+String(b.branch_raw||'').trim()).toUpperCase().replace(/\s+/g,' ');
+      return { branch_key:key, client_raw:b.client_raw||null, branch_raw:b.branch_raw||null,
+        branch_code:b.branch_code||null, branch_email:b.branch_email||null, recipient_gstin:b.recipient_gstin||null,
+        updated_at:new Date().toISOString() };
+    }).filter(x => x.branch_key !== '|');
+    if (!payload.length) return 0;
+    const r = await fetch(this.url + '/branches', { method:'POST',
+      headers: this.headers({ 'Prefer':'resolution=merge-duplicates,return=minimal' }), body: JSON.stringify(payload) });
+    if(!r.ok){ const t=await r.text(); throw new Error(`${r.status}: ${t.slice(0,140)}`); }
+    return payload.length;
+  },
+  async deleteBranch(key){
+    const r = await fetch(this.url + '/branches?branch_key=eq.' + encodeURIComponent(key),
+      { method:'DELETE', headers: this.headers({ 'Prefer':'return=minimal' }) });
+    if(!r.ok){ const t=await r.text(); throw new Error(`${r.status}: ${t.slice(0,140)}`); }
+    return true;
+  },
 
   /* Fill genuinely-missing invoice fields from the master table BEFORE push.
      Only fills a field that is null/empty on the bill — never overwrites what
@@ -2444,6 +2607,23 @@ const Cloud = {
   async enrichFromMaster(doc){
     const i = doc.invoice;
     doc.enriched = doc.enriched || {};
+
+    // Fill our own (supplier) GSTIN/SAC/PAN/MSME from the CRUX identity block
+    // when the bill didn't carry them. Scoped rows (client/location) win over
+    // DEFAULT. Never overwrite a value the bill actually stated.
+    try {
+      const ID = (typeof globalThis!=='undefined' && globalThis.__CRUX_IDENTITY) || {};
+      if (Object.keys(ID).length) {
+        const clientKey = i.client_raw ? 'CLIENT:'+String(i.client_raw).trim().toUpperCase() : null;
+        const chosen = (clientKey && ID[clientKey]) || ID['DEFAULT'] || null;
+        if (chosen) {
+          if (!i.supplier_gstin && chosen.gstin) { i.supplier_gstin = chosen.gstin; doc.enriched.supplier_gstin = 'crux_identity'; }
+          if (!i.supplier_pan && chosen.pan) { i.supplier_pan = chosen.pan; doc.enriched.supplier_pan = 'crux_identity'; }
+          if (!i.sac_hsn && chosen.sac) { i.sac_hsn = chosen.sac; doc.enriched.sac_hsn = 'crux_identity'; }
+          if (!i.msme_no && chosen.msme_no) { i.msme_no = chosen.msme_no; doc.enriched.msme_no = 'crux_identity'; }
+        }
+      }
+    } catch(_){}
 
     /* STEP 1 — resolve client vs branch against the clients master table.
        If the addressee contains a KNOWN client name (bank, NBFC, insurer,
@@ -2792,6 +2972,25 @@ const Cloud = {
       { method:'DELETE', headers: this.headers({ 'Prefer':'return=minimal' }) });
     if (!r.ok){ const t = await r.text(); throw new Error(`${r.status}: ${t.slice(0,120)}`); }
     return true;
+  },
+  // ---- CRUX identity block (supplier's own GSTIN/SAC/PAN/MSME) ----
+  async fetchCruxIdentity(){
+    try { const r = await fetch(this.url + '/crux_identity?select=*&order=scope_key', { headers: this.headers() });
+      if (!r.ok) return []; return await r.json(); } catch(_){ return []; }
+  },
+  async saveCruxIdentity(row){
+    const body = { scope_key:row.scope_key||'DEFAULT', label:row.label||null, gstin:row.gstin||null,
+      sac:row.sac||null, pan:row.pan||null, msme_no:row.msme_no||null, updated_at:new Date().toISOString() };
+    const r = await fetch(this.url + '/crux_identity', { method:'POST',
+      headers: this.headers({ 'Prefer':'resolution=merge-duplicates,return=minimal' }), body: JSON.stringify(body) });
+    if (!r.ok){ const t = await r.text(); throw new Error(`${r.status}: ${t.slice(0,120)}`); }
+    return true;
+  },
+  async deleteCruxIdentity(scope_key){
+    const r = await fetch(this.url + '/crux_identity?scope_key=eq.' + encodeURIComponent(scope_key),
+      { method:'DELETE', headers: this.headers({ 'Prefer':'return=minimal' }) });
+    if (!r.ok){ const t = await r.text(); throw new Error(`${r.status}: ${t.slice(0,120)}`); }
+    return true;
   }
 };
 
@@ -2909,12 +3108,12 @@ const OCR = {
   workerTrait(i){ return (this._roster[i % this._roster.length] || { trait:'' }).trait; },
 
   poolSize(){
-    // The DEFAULT safe size: half the logical cores, clamped 1..4. But the
-    // manager can recruit more via the panel (up to the hard ceiling), with a
-    // compatibility warning. desiredCrew (if set) overrides the default.
-    if (window.__desiredCrew) return window.__desiredCrew;
-    const cores = (navigator && navigator.hardwareConcurrency) || 2;
-    return Math.max(1, Math.min(4, Math.floor(cores / 2)));
+    // The DEFAULT size: use most of the logical cores (cores-1, min 2) so big
+    // uploads distribute across the machine. desiredCrew (set via the crew
+    // control) overrides this. The hard ceiling is MAX_CREW.
+    if (window.__desiredCrew) return Math.min(window.__desiredCrew, this.MAX_CREW);
+    const cores = (navigator && navigator.hardwareConcurrency) || 4;
+    return Math.max(2, Math.min(this.MAX_CREW, cores - 1));
   },
   MAX_CREW: 20,   // hard ceiling — the roster has 20 named workers
 
@@ -2970,6 +3169,29 @@ const OCR = {
       return this._pool;
     })().catch(e => { setOcrStatus('error'); this._poolLoading = null; throw e; });
     return this._poolLoading;
+  },
+  // Grow the live OCR pool up to `target` workers so recruiting more crew
+  // actually speeds up scanning (previously the pool was fixed at creation).
+  async growPool(target){
+    if (!this._pool) return;
+    const p = this._pool;
+    target = Math.min(target, this.MAX_CREW);
+    if (target <= p.n) return;
+    const add = target - p.n;
+    const mk = () => Tesseract.createWorker('eng', 1, {
+      corePath: this.base + '/tesseract-core-lstm.wasm.js',
+      workerPath: this.base + '/worker.min.js',
+      langPath: this.base, gzip: false, cacheMethod: 'write'
+    });
+    try {
+      const fresh = await this._withTimeout(Promise.all(Array.from({length:add}, mk)), 120000, 'OCR pool grow');
+      fresh.forEach(w => {
+        p.workers.push(w); p.busy.push(false); p.startedAt.push(0); p.preempt.push(false);
+        p.jobs.push(null); p.offline.push(false); p.freed.push(0);
+      });
+      p.n = p.workers.length;
+      log(`Scan crew grown to ${p.n} workers.`, 'dim');
+    } catch(e){ log('Could not grow scan crew: '+e.message, 'wn'); }
   },
 
   /* Grab a free worker and run fn(worker). No hard timer. If every worker is
@@ -4004,12 +4226,14 @@ function renderWorkerPanel(){
   const canRelease = pool.n > 1;
   const recruitBtn = `<div class="wcard recruit">
     <div class="whead" style="justify-content:center"><b>Team size</b></div>
-    <div style="text-align:center;font-size:26px;font-weight:600;margin:4px 0">${pool.n}</div>
-    <div class="wtrait" style="text-align:center">workers${teams>1?` · ${teams} teams`:''}</div>
-    <div class="wctrl" style="justify-content:center">
-      <button class="wbtn" onclick="releaseWorker()" ${canRelease?'':'disabled'} title="Remove a worker">−</button>
-      <button class="wbtn" onclick="recruitWorker()" ${canRecruit?'':'disabled'} title="Recruit a worker (checks your system first)">+ Recruit</button>
-    </div>
+    <div style="text-align:center;font-size:26px;font-weight:600;margin:2px 0" id="crewNum">${pool.n}</div>
+    <div class="wtrait" style="text-align:center;margin-bottom:8px">workers${teams>1?` · ${teams} teams`:''}</div>
+    <input type="range" min="1" max="${OCR.MAX_CREW}" value="${pool.n}" id="crewSlider"
+      style="width:100%;accent-color:var(--accent);cursor:pointer"
+      oninput="document.getElementById('crewNum').textContent=this.value;document.getElementById('crewApply').textContent=(this.value==${pool.n})?'At '+this.value:'Set to '+this.value">
+    <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text-3);margin-top:2px"><span>1</span><span>${OCR.MAX_CREW}</span></div>
+    <button class="btn pri" id="crewApply" onclick="setCrewSize(parseInt(document.getElementById('crewSlider').value,10))"
+      style="width:100%;margin-top:8px">At ${pool.n}</button>
   </div>`;
   el.innerHTML = `<div class="wtitle">${crewLabel} — ${online} of ${pool.n} online${progress}${queued?` · ${queued} waiting`:''}${teamNote}
       <span class="dim" style="text-transform:none;font-weight:400"> · Free a stuck one, bench to save memory, or recruit more for speed</span></div>
@@ -4106,7 +4330,43 @@ window.recruitWorker = function(){
     // recruiting appear to stop after a dozen.
     if (typeof window.__spawnLineWorker === 'function') window.__spawnLineWorker(newIndex);
   }
+  if (OCR && typeof OCR.growPool === 'function') OCR.growPool(want);   // grow the scan pool too
   DIAG && DIAG.info('system', `manager recruited worker #${want}`, { level:a.level, cores:a.cores });
+  renderWorkerPanel();
+};
+
+// Set the crew to an exact size in one action (from the slider). Grows by
+// recruiting the difference, or shrinks by releasing — no repeated clicking.
+window.setCrewSize = function(target){
+  target = Math.max(1, Math.min(target|0, OCR.MAX_CREW));
+  const cur = (window.__procCrew && window.__procCrew.n) || (OCR._pool && OCR._pool.n) || OCR.poolSize();
+  if (target === cur) return;
+  if (target > cur) {
+    // one compatibility check for the whole jump
+    const a = OCR.assessCrew(target);
+    const icon = a.level==='ok' ? '✅' : (a.level==='caution' ? '⚠️' : '⛔');
+    const head = a.level==='ok' ? 'This is fine' : (a.level==='caution' ? 'Heads up' : 'Not recommended');
+    if (!confirm(`${icon}  ${head}\n\nSetting the crew to ${target} workers.\n\n${a.msg}\n\nProceed?`)) { renderWorkerPanel(); return; }
+    window.__desiredCrew = target;
+    if (window.__procCrew) {
+      const c = window.__procCrew;
+      for (let idx = c.n; idx < target; idx++) {
+        c.busy.push(false); c.startedAt.push(0); c.jobs.push(null); c.offline.push(false); c.freed.push(0);
+        if (typeof window.__spawnLineWorker === 'function') window.__spawnLineWorker(idx);
+      }
+      c.n = target;
+    }
+    if (OCR && typeof OCR.growPool === 'function') OCR.growPool(target);
+    DIAG && DIAG.info('system', `crew set to ${target}`, { level:a.level });
+  } else {
+    window.__desiredCrew = target;
+    if (window.__procCrew) {
+      const c = window.__procCrew;
+      for (let idx = c.n - 1; idx >= target; idx--) c.offline[idx] = true;  // let them finish and idle
+      c.n = target;
+    }
+    DIAG && DIAG.info('system', `crew set to ${target}`);
+  }
   renderWorkerPanel();
 };
 
@@ -4465,13 +4725,13 @@ function renderReview(){
     const fails = (r.checks||[]).filter(c=>c.status==='FAIL');
     const clean = fails.length===0;
     const problems = fails.map(c=>plainFor(r,c));
-    return `<tr data-h="${esc(r.hash||r.content_hash||r.id)}" class="revrow">
+    return `<tr data-h="${esc(r.hash||r.content_hash||r.id)}" class="revrow" style="cursor:pointer" onclick="openBillEditor('${esc(r.hash||r.content_hash||r.id)}')">
       <td>${clean?'<span class="tag proof">OK</span>':`<span class="tag ${fails.some(f=>f.severity==='error')?'fail':'warn'}">${fails.length} issue${fails.length>1?'s':''}</span>`}</td>
       <td class="mono">${esc(r.invoice.invoice_no||'—')}</td>
       <td>${esc(r.invoice.client_raw||'—')}<br><span class="dim">${esc(r.invoice.branch_raw||'')}</span></td>
       <td>${clean?'<span class="dim">Nothing — this bill is clean.</span>'
               :problems.map(p=>`<div><b>${esc(p.title)}.</b> <span class="dim">${esc(p.say)}</span></div>`).join('')}</td>
-      <td><button class="btn sm" onclick="openBillEditor('${esc(r.hash||r.content_hash||r.id)}')">${clean?'View':'Fix'}</button></td>
+      <td><button class="btn sm" onclick="event.stopPropagation();openBillEditor('${esc(r.hash||r.content_hash||r.id)}')">${clean?'View':'Fix'}</button></td>
     </tr>`;
   }).join('')
    : `<tr><td colspan="5"><div class="empty"><h3>${flaggedOnly?'Nothing needs fixing':'No bills yet'}</h3><p>${flaggedOnly?'Every bill is clean.':'Ingest or pull some bills.'}</p></div></td></tr>`;
@@ -4847,9 +5107,9 @@ function renderReport(){
     const arrow = rsrt.col===i ? (rsrt.dir===1?' ▲':' ▼') : '';
     return `<th class="sortable" onclick="sortReport(${i})" style="cursor:pointer;user-select:none">${colLabel(k)}${arrow}</th>`;
   }).join('') + '<th></th></tr>';
-  t.tBodies[0].innerHTML = rows.length ? rows.slice(0,300).map(r=>'<tr>'+r.map((v,i)=>
+  t.tBodies[0].innerHTML = rows.length ? rows.slice(0,300).map(r=>`<tr${r.__hash?` style="cursor:pointer" onclick="openBillChooser('${esc(r.__hash)}')"`:''}>`+r.map((v,i)=>
     `<td class="${FIELD_MAP[reportCols[i]].n?'num':''}"${String(v).includes('RECHECK')?' style="color:var(--fail);font-weight:600"':''}>${FIELD_MAP[reportCols[i]].n && typeof v==='number' ? v.toLocaleString('en-IN',{minimumFractionDigits:2}) : esc(v)}</td>`).join('')
-    + (r.__hash ? `<td><button class="btn sm" onclick="openBillEditor('${esc(r.__hash)}')" title="Open this bill and correct it in place">Fix</button></td>` : '<td></td>')
+    + (r.__hash ? `<td><button class="btn sm" onclick="event.stopPropagation();openBillEditor('${esc(r.__hash)}')" title="Open this bill and correct it in place">Fix</button></td>` : '<td></td>')
     +'</tr>').join('')
     : `<tr><td colspan="${reportCols.length+1}"><div class="empty"><h3>No rows</h3><p>Ingest documents first.</p></div></td></tr>`;
   if (flashCol) {
@@ -5091,7 +5351,7 @@ $('#rail').addEventListener('click', e => { const b = e.target.closest('button[d
   try {
     if (v === 'review') { renderReview(); }
     else if (v === 'report') { if (typeof buildMisFilters==='function') buildMisFilters(); renderReport(); }
-    else if (v === 'cloud') { if (typeof renderDbList==='function') renderDbList(); if (typeof renderDistrictCodes==='function') renderDistrictCodes(); }
+    else if (v === 'cloud') { if (typeof renderDbList==='function') renderDbList(); if (typeof renderDistrictCodes==='function') renderDistrictCodes(); if (typeof renderBranchMaster==='function') renderBranchMaster(); if (typeof renderCruxIdentity==='function') renderCruxIdentity(); }
     else if (v === 'analytics') { if (typeof renderAnalytics==='function') renderAnalytics(); }
   } catch(err){ DIAG && DIAG.warn && DIAG.warn('system','view render failed',{view:v,reason:err.message}); }
 });
@@ -5782,6 +6042,10 @@ async function syncFromDatabase(silent){
     if (!silent) setCloud('Loading database…','dim');
     const rows = await Cloud.pullAll();
     window.dbRows = rows;
+    // pull applicant lines and group by bill — without this the reports and the
+    // applicant-wise view show blank names.
+    const linesByHash = await Cloud.pullLinesByHash();
+    window.__linesByHash = linesByHash;
     // also fetch failed bills so they show in Sync for manual completion
     try { window.failedBills = await Cloud.fetchFailed(); } catch(_){ window.failedBills = []; }
     let checksByHash = {};
@@ -5792,7 +6056,7 @@ async function syncFromDatabase(silent){
     } catch(_){}
     window.reviewPulled = rows.map(row => ({ content_hash: row.content_hash, hash: row.content_hash,
       invoice: row, checks: checksByHash[row.content_hash]||[], verdict: row.verdict, verification: row.verification, filename: row.source_file }));
-    window.misRows = rows.map(row => ({ invoice: row, applicants: [], checks: checksByHash[row.content_hash]||[],
+    window.misRows = rows.map(row => ({ invoice: row, applicants: (linesByHash[row.content_hash]||[]), checks: checksByHash[row.content_hash]||[],
       verdict: row.verdict, verification: row.verification, hash: row.content_hash,
       candidates: {}, filename: row.source_file }));
     window.__misSource = 'database';
@@ -6040,6 +6304,8 @@ window.wireReconcile = wireReconcile;
   await syncFromDatabase(false);
   if (typeof refreshReviewProgress==='function') refreshReviewProgress();
   if (typeof loadDistrictCodes==='function') loadDistrictCodes();
+  if (typeof loadBranchMaster==='function') loadBranchMaster();
+  if (typeof loadCruxIdentity==='function') loadCruxIdentity();
   refreshDashboard();   // initial live-dashboard read
   // subscribe to live database changes — refreshes silently on any change,
   // INCLUDING runs happening on other machines/locations. The dashboard meter
@@ -6240,7 +6506,8 @@ async function openBillEditor(hash){
   let lines = [];
   try { lines = await Cloud.fetchLines(hash); } catch(_){}
   editorState = { hash, invoice: { ...row }, lines: lines.map(l=>({...l})),
-    isFailed: !!failedRow, storagePath: failedRow ? failedRow.storage_path : null };
+    isFailed: !!failedRow, storagePath: failedRow ? failedRow.storage_path : null,
+    __original: { ...row }, __linesChanged: false };
 
   // the original bill: held in session, OR fetched from Storage
   const held = DB.docs.find(d => d.hash === hash);
@@ -6372,6 +6639,20 @@ function renderEditorLines(){
 
 window.openBillEditor = openBillEditor;
 
+/* Click-a-row behaviour. In Review, clicking a row opens the editor directly
+   (reviewers are there to update). In Report and Database, a small popup first
+   offers a read-through or a direct edit — both open the same editor, which
+   shows every field and the applicant lines. */
+window.openBillChooser = (hash) => {
+  if (typeof showModal !== 'function') { openBillEditor(hash); return; }
+  showModal(`<div class="modal-head"><b>Open this bill</b><button class="x" onclick="closeModal()">×</button></div>
+    <div style="padding:6px 2px 2px;display:flex;flex-direction:column;gap:10px">
+      <p class="dim" style="margin:0 0 4px">What would you like to do?</p>
+      <button class="btn pri" onclick="openBillEditor('${esc(hash)}')">View &amp; edit details</button>
+      <button class="btn" onclick="closeModal()">Cancel</button>
+    </div>`);
+};
+
 /* Database tab — list every stored entry, drawn live from window.dbRows.
    Searchable; each row has a Fix button that opens the same editor used in
    Review, so a mistake can be corrected in place without hunting for it. */
@@ -6472,8 +6753,8 @@ function renderDbList(){
     return `<th style="text-align:${c[3]};cursor:pointer;user-select:none;white-space:nowrap" onclick="sortDb('${c[0]}')">${c[1]}${arrow}</th>`;
   }).join('')}<th></th></tr>`;
   const body = list.slice(0,800).map(row =>
-    `<tr>${DB_COLS.map(c=>`<td style="text-align:${c[3]}${c[4]==='money'||c[0]==='invoice_no'?';font-family:var(--mono)':''};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:${c[2]}px">${cellVal(row,c)}</td>`).join('')}
-      <td><button class="btn sm" onclick="openBillEditor('${esc(row.r.content_hash)}')">Fix</button></td></tr>`).join('');
+    `<tr style="cursor:pointer" onclick="openBillChooser('${esc(row.r.content_hash)}')">${DB_COLS.map(c=>`<td style="text-align:${c[3]}${c[4]==='money'||c[0]==='invoice_no'?';font-family:var(--mono)':''};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:${c[2]}px">${cellVal(row,c)}</td>`).join('')}
+      <td><button class="btn sm" onclick="event.stopPropagation();openBillEditor('${esc(row.r.content_hash)}')">Fix</button></td></tr>`).join('');
   const more = list.length>800 ? `<p class="sub" style="margin:8px 0 0">Showing first 800 of ${list.length}. Filter to narrow.</p>` : '';
   host.innerHTML = `<div class="tablewrap" style="overflow-x:auto"><table class="grid" style="table-layout:fixed;min-width:1200px">${colgroup}<thead>${head}</thead><tbody>${body}</tbody></table></div>${more}`;
 }
@@ -6504,6 +6785,23 @@ async function loadDistrictCodes(){
   if (typeof renderAnalytics==='function') renderAnalytics();
 }
 window.loadDistrictCodes = loadDistrictCodes;
+/* Scan stored bills for invoice-number prefixes (2+ leading letters) that are
+   NOT yet a known location code. These are surfaced at the top of the codes
+   list so the team can name and save them — closing the loop on new locations. */
+function unknownAbbreviations(){
+  const builtin = (window.LumenCore && window.LumenCore.DISTRICT_MAP) || {};
+  const overlay = {}; (window.__districtCodes||[]).forEach(c => { if(c.code) overlay[String(c.code).toUpperCase()]=1; });
+  const known = (k) => !!(overlay[k] || builtin[k]);
+  const counts = {};
+  (window.dbRows||[]).forEach(r => {
+    const src = String(r.invoice_no || r.source_file || '').toUpperCase();
+    const lead = (src.match(/^[A-Z]+/) || [''])[0];   // leading alphabetical run = the abbreviation
+    if (lead.length >= 2 && !known(lead)) counts[lead] = (counts[lead]||0) + 1;
+  });
+  return Object.entries(counts).sort((a,b)=>b[1]-a[1]).map(([code,n]) => ({ code, n }));
+}
+window.unknownAbbreviations = unknownAbbreviations;
+
 function renderDistrictCodes(){
   const host = $('#dcListBody'); if (!host) return;
   const q = ($('#dcSearch') && $('#dcSearch').value || '').trim().toLowerCase();
@@ -6516,7 +6814,7 @@ function renderDistrictCodes(){
   let list = Object.values(merged).sort((a,b)=>String(a.code).localeCompare(String(b.code)));
   if (q) list = list.filter(c => [c.code,c.location,c.state,c.source].some(v=>String(v||'').toLowerCase().includes(q)));
   if ($('#dcCount')) $('#dcCount').textContent = `${list.length} code(s)`;
-  if (!list.length){ host.innerHTML = '<p class="dim" style="padding:8px">No codes match your search.</p>'; return; }
+  if (!list.length){ host.innerHTML = '<p class="dim" style="padding:8px">No codes match your search. Clear the search to see all codes and any unrecognised prefixes.</p>'; return; }
   const badge = s => s==='custom' ? '<span style="color:var(--proof);font-size:10px">custom</span>'
     : s==='edited' ? '<span style="color:var(--warn);font-size:10px">edited</span>'
     : '<span class="dim" style="font-size:10px">built-in</span>';
@@ -6529,9 +6827,225 @@ function renderDistrictCodes(){
       <button class="btn sm" onclick="editDistrictCode('${esc(c.code)}')">Edit</button>
       ${c.source==='built-in' ? '' : `<button class="btn sm danger" onclick="removeDistrictCode('${esc(c.code)}')">Delete</button>`}
     </td></tr>`).join('');
-  host.innerHTML = `<table class="grid"><thead><tr><th>Code</th><th>Location</th><th>State</th><th>Source</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+  // Surface any invoice prefixes seen in bills that aren't a known code yet.
+  const unknown = (typeof unknownAbbreviations==='function') ? unknownAbbreviations() : [];
+  const unknownBanner = unknown.length ? `
+    <div style="background:var(--warn-soft,rgba(179,116,0,.12));border:1px solid var(--warn);border-radius:8px;padding:10px 12px;margin-bottom:10px">
+      <b style="font-size:12px">${unknown.length} unrecognised code(s) found in your bills — name them so locations resolve:</b>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+        ${unknown.slice(0,20).map(u=>`<button class="btn sm" onclick="nameUnknownCode('${esc(u.code)}')" title="${u.n} bill(s) use this prefix">${esc(u.code)} · ${u.n}</button>`).join('')}
+      </div>
+    </div>` : '';
+  host.innerHTML = unknownBanner + `<table class="grid"><thead><tr><th>Code</th><th>Location</th><th>State</th><th>Source</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 window.renderDistrictCodes = renderDistrictCodes;
+// Clicking an unrecognised code pre-fills the add form so the team names + saves it.
+window.nameUnknownCode = (code) => {
+  if ($('#dcCode')) { $('#dcCode').value = code; $('#dcCode').focus(); }
+  if ($('#dcDistrict')) $('#dcDistrict').focus();
+};
+
+/* ---- Client & branch master manager ----
+   Add/edit branches, bulk-upload from Excel, and download a template. These
+   feed enrichFromMaster() which fills genuinely-missing fields on future bills. */
+window.__branchMaster = window.__branchMaster || [];
+async function loadBranchMaster(){
+  if (typeof Cloud==='undefined' || !Cloud.allBranches) return;
+  try { window.__branchMaster = await Cloud.allBranches(); renderBranchMaster(); } catch(_){}
+}
+window.loadBranchMaster = loadBranchMaster;
+function renderBranchMaster(){
+  const host = $('#bmListBody'); if (!host) return;
+  const q = ($('#bmSearch') && $('#bmSearch').value || '').trim().toLowerCase();
+  let list = (window.__branchMaster||[]).slice();
+  if (q) list = list.filter(b => [b.client_raw,b.branch_raw,b.branch_code,b.branch_email,b.recipient_gstin].some(v=>String(v||'').toLowerCase().includes(q)));
+  if ($('#bmCount')) $('#bmCount').textContent = `${list.length} branch(es)`;
+  if (!list.length){ host.innerHTML = '<p class="dim" style="padding:8px">No branches yet. Add one above or bulk-upload from Excel. The tool also learns them automatically from bills.</p>'; return; }
+  const rows = list.slice(0,1000).map(b => `<tr>
+    <td>${esc(b.client_raw||'')}</td><td>${esc(b.branch_raw||'')}</td>
+    <td class="mono">${esc(b.branch_code||'')}</td><td>${esc(b.branch_email||'')}</td>
+    <td class="mono">${esc(b.recipient_gstin||'')}</td>
+    <td style="text-align:right">
+      <button class="btn sm" onclick="editBranchMaster('${esc(b.branch_key)}')">Edit</button>
+      <button class="btn sm danger" onclick="deleteBranchMaster('${esc(b.branch_key)}')">Delete</button>
+    </td></tr>`).join('');
+  host.innerHTML = `<table class="grid"><thead><tr><th>Client</th><th>Branch</th><th>Code</th><th>Email</th><th>GSTIN</th><th></th></tr></thead><tbody>${rows}</tbody></table>${list.length>1000?'<p class="sub">First 1000 shown; search to narrow.</p>':''}`;
+}
+window.renderBranchMaster = renderBranchMaster;
+window.editBranchMaster = (key) => {
+  const b = (window.__branchMaster||[]).find(x=>x.branch_key===key); if(!b) return;
+  if($('#bmClient')) $('#bmClient').value=b.client_raw||''; if($('#bmBranch')) $('#bmBranch').value=b.branch_raw||'';
+  if($('#bmCode')) $('#bmCode').value=b.branch_code||''; if($('#bmEmail')) $('#bmEmail').value=b.branch_email||'';
+  if($('#bmGstin')) $('#bmGstin').value=b.recipient_gstin||''; if($('#bmClient')) $('#bmClient').focus();
+};
+window.deleteBranchMaster = async (key) => {
+  if(!confirm('Delete this branch from the master? Bills already stored are unaffected.')) return;
+  try { await Cloud.deleteBranch(key);
+    window.__branchMaster = (window.__branchMaster||[]).filter(x=>x.branch_key!==key);
+    renderBranchMaster(); log('Branch removed from master.','ok');
+  } catch(e){ log('Could not delete branch: '+e.message,'er'); }
+};
+$('#bmAdd') && ($('#bmAdd').onclick = async () => {
+  const b = { client_raw:($('#bmClient').value||'').trim(), branch_raw:($('#bmBranch').value||'').trim(),
+    branch_code:($('#bmCode').value||'').trim(), branch_email:($('#bmEmail').value||'').trim(),
+    recipient_gstin:($('#bmGstin').value||'').trim() };
+  if (!b.client_raw || !b.branch_raw){ alert('Client and Branch are required.'); return; }
+  // internal-email guard: a @cruxindia.co.in address is the sender, not a client email
+  if (/@cruxindia\.co\.in$/i.test(b.branch_email)) { /* allowed as branch/internal sender email */ }
+  const btn=$('#bmAdd'); btn.disabled=true; btn.textContent='Saving…';
+  try {
+    await Cloud.saveBranch(b);
+    const key=(b.client_raw+'|'+b.branch_raw).toUpperCase().replace(/\s+/g,' ');
+    const ex=(window.__branchMaster||[]).find(x=>x.branch_key===key);
+    if(ex) Object.assign(ex,{client_raw:b.client_raw,branch_raw:b.branch_raw,branch_code:b.branch_code,branch_email:b.branch_email,recipient_gstin:b.recipient_gstin});
+    else window.__branchMaster.push({branch_key:key,...b,recipient_gstin:b.recipient_gstin});
+    renderBranchMaster();
+    ['#bmClient','#bmBranch','#bmCode','#bmEmail','#bmGstin'].forEach(s=>{ if($(s)) $(s).value=''; });
+    log(`Branch ${b.branch_raw} saved to master.`,'ok');
+  } catch(e){ log('Could not save branch: '+e.message+' (is branches_table.sql installed?)','er'); }
+  finally { btn.disabled=false; btn.textContent='Add / update'; }
+});
+// Excel template download
+$('#bmTemplate') && ($('#bmTemplate').onclick = () => {
+  if (!window.XLSX){ log('Excel writer not ready — try again in a moment.','er'); return; }
+  const ws = XLSX.utils.aoa_to_sheet([
+    ['client_raw','branch_raw','branch_code','branch_email','recipient_gstin'],
+    ['Bank of Maharashtra','Pune Main','0012','pune.main@bankofmaharashtra.bank.in','27AAACB0000A1Z5']
+  ]);
+  ws['!cols'] = [{wch:26},{wch:22},{wch:12},{wch:34},{wch:18}];
+  const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Branches');
+  XLSX.writeFile(wb, 'branch_master_template.xlsx');
+});
+// Excel bulk upload
+$('#bmUpload') && ($('#bmUpload').onchange = async (e) => {
+  const file = e.target.files && e.target.files[0]; if(!file) return;
+  if (!window.XLSX){ log('Excel reader not ready — try again in a moment.','er'); return; }
+  try {
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type:'array' });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const json = XLSX.utils.sheet_to_json(ws, { defval:'' });
+    // map headers flexibly
+    const norm = s => String(s||'').toLowerCase().replace(/[^a-z]/g,'');
+    const rows = json.map(r => { const o={}; Object.keys(r).forEach(k=>{ const n=norm(k);
+      if(/client/.test(n)) o.client_raw=String(r[k]).trim();
+      else if(/branchcode|code/.test(n)) o.branch_code=String(r[k]).trim();
+      else if(/branch/.test(n)&&!o.branch_raw) o.branch_raw=String(r[k]).trim();
+      else if(/email|mail/.test(n)) o.branch_email=String(r[k]).trim();
+      else if(/gst/.test(n)) o.recipient_gstin=String(r[k]).trim();
+    }); return o; }).filter(o=>o.client_raw && o.branch_raw);
+    if (!rows.length){ alert('No valid rows found. Use the template — it needs at least client and branch columns.'); e.target.value=''; return; }
+    if (!confirm(`Upload ${rows.length} branch(es) to the master? Existing ones with the same client+branch are updated.`)) { e.target.value=''; return; }
+    const n = await Cloud.saveBranchesBulk(rows);
+    await loadBranchMaster();
+    log(`Bulk upload complete — ${n} branch(es) saved to master.`,'ok');
+    DIAG && DIAG.ok('system',`branch master bulk upload: ${n}`);
+  } catch(err){ log('Bulk upload failed: '+err.message,'er'); }
+  finally { e.target.value=''; }
+});
+$('#bmSearch') && ($('#bmSearch').oninput = () => renderBranchMaster());
+
+/* Harvest identifiers from bills already in the database. For each client+branch
+   seen across dbRows, keep the first non-empty branch_code / branch_email /
+   recipient_gstin and upsert it into the master — backfilling gaps for bills
+   processed before the master existed. Internal @cruxindia.co.in emails are
+   kept as branch/sender emails (per the internal-email rule), which is correct
+   here since branch_email IS the sender address. */
+$('#bmHarvest') && ($('#bmHarvest').onclick = async () => {
+  const rows = window.dbRows || [];
+  if (!rows.length){ alert('No bills in the database yet to harvest from.'); return; }
+  const group = {};
+  rows.forEach(r => {
+    const client = (r.client_raw||'').trim(), branch = (r.branch_raw||'').trim();
+    if (!client || !branch) return;
+    const key = (client+'|'+branch).toUpperCase().replace(/\s+/g,' ');
+    const g = group[key] = group[key] || { client_raw:client, branch_raw:branch, branch_code:'', branch_email:'', recipient_gstin:'' };
+    if (!g.branch_code && r.branch_code) g.branch_code = String(r.branch_code).trim();
+    if (!g.branch_email && r.branch_email) g.branch_email = String(r.branch_email).trim();
+    if (!g.recipient_gstin && r.recipient_gstin) g.recipient_gstin = String(r.recipient_gstin).trim();
+  });
+  // only rows that actually carry at least one identifier are worth writing
+  const toWrite = Object.values(group).filter(g => g.branch_code || g.branch_email || g.recipient_gstin);
+  if (!toWrite.length){ alert('No GSTIN, email, or branch code found on the stored bills to harvest.'); return; }
+  // Merge with what the master already holds so a harvested blank never wipes an
+  // existing value — we only ever fill gaps, matching the learn-branch intent.
+  const masterByKey = {}; (window.__branchMaster||[]).forEach(m => { masterByKey[m.branch_key] = m; });
+  const merged = toWrite.map(g => {
+    const key = (g.client_raw+'|'+g.branch_raw).toUpperCase().replace(/\s+/g,' ');
+    const ex = masterByKey[key] || {};
+    return { client_raw:g.client_raw, branch_raw:g.branch_raw,
+      branch_code: g.branch_code || ex.branch_code || '',
+      branch_email: g.branch_email || ex.branch_email || '',
+      recipient_gstin: g.recipient_gstin || ex.recipient_gstin || '' };
+  });
+  if (!confirm(`Found identifiers for ${merged.length} branch(es) in your bills. Add/update them in the master? Existing values are kept — only gaps are filled.`)) return;
+  const btn=$('#bmHarvest'); btn.disabled=true; btn.textContent='Harvesting…';
+  try {
+    const n = await Cloud.saveBranchesBulk(merged);
+    await loadBranchMaster();
+    log(`Harvest complete — ${n} branch(es) enriched from existing bills.`,'ok');
+    DIAG && DIAG.ok('system',`branch master harvest: ${n}`);
+  } catch(e){ log('Harvest failed: '+e.message+' (is branches_table.sql installed?)','er'); }
+  finally { btn.disabled=false; btn.textContent='⟳ Harvest from existing bills'; }
+});
+
+/* ---- CRUX identity block ----
+   Our own GSTIN/SAC/PAN/MSME. A DEFAULT row applies to every bill; scoped rows
+   (CLIENT:x / LOCATION:y) override it. Used by enrichFromMaster to fill missing
+   supplier details, never to overwrite what a bill states. */
+window.__cruxIdentity = window.__cruxIdentity || [];
+function applyCruxIdentity(){
+  const map = {}; (window.__cruxIdentity||[]).forEach(r => { map[r.scope_key] = r; });
+  globalThis.__CRUX_IDENTITY = map;   // enrichFromMaster reads this
+}
+async function loadCruxIdentity(){
+  if (typeof Cloud==='undefined' || !Cloud.fetchCruxIdentity) return;
+  try { window.__cruxIdentity = await Cloud.fetchCruxIdentity(); applyCruxIdentity(); renderCruxIdentity(); } catch(_){}
+}
+window.loadCruxIdentity = loadCruxIdentity;
+function renderCruxIdentity(){
+  const host = $('#ciListBody'); if (!host) return;
+  const list = (window.__cruxIdentity||[]).slice().sort((a,b)=>a.scope_key==='DEFAULT'?-1:b.scope_key==='DEFAULT'?1:String(a.scope_key).localeCompare(b.scope_key));
+  if (!list.length){ host.innerHTML = '<p class="dim" style="padding:8px">No identity rows yet. The Default row (with our GSTIN/SAC/PAN/MSME) loads once crux_identity.sql is installed.</p>'; return; }
+  const rows = list.map(r => `<tr>
+    <td class="mono">${esc(r.scope_key)}</td><td>${esc(r.label||'')}</td>
+    <td class="mono">${esc(r.gstin||'')}</td><td class="mono">${esc(r.sac||'')}</td>
+    <td class="mono">${esc(r.pan||'')}</td><td class="mono">${esc(r.msme_no||'')}</td>
+    <td style="text-align:right"><button class="btn sm" onclick="editCruxIdentity('${esc(r.scope_key)}')">Edit</button>
+      ${r.scope_key==='DEFAULT'?'':`<button class="btn sm danger" onclick="deleteCruxIdentity('${esc(r.scope_key)}')">Delete</button>`}</td></tr>`).join('');
+  host.innerHTML = `<table class="grid" style="font-size:11.5px"><thead><tr><th>Scope</th><th>Label</th><th>GSTIN</th><th>SAC</th><th>PAN</th><th>MSME</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+window.renderCruxIdentity = renderCruxIdentity;
+window.editCruxIdentity = (k) => {
+  const r = (window.__cruxIdentity||[]).find(x=>x.scope_key===k); if(!r) return;
+  if($('#ciScope')) $('#ciScope').value=r.scope_key||''; if($('#ciLabel')) $('#ciLabel').value=r.label||'';
+  if($('#ciGstin')) $('#ciGstin').value=r.gstin||''; if($('#ciSac')) $('#ciSac').value=r.sac||'';
+  if($('#ciPan')) $('#ciPan').value=r.pan||''; if($('#ciMsme')) $('#ciMsme').value=r.msme_no||'';
+};
+window.deleteCruxIdentity = async (k) => {
+  if (k==='DEFAULT'){ alert('The Default row cannot be deleted — edit it instead.'); return; }
+  if (!confirm('Delete this scoped identity row?')) return;
+  try { await Cloud.deleteCruxIdentity(k);
+    window.__cruxIdentity = (window.__cruxIdentity||[]).filter(x=>x.scope_key!==k); applyCruxIdentity(); renderCruxIdentity();
+    log('Identity row removed.','ok');
+  } catch(e){ log('Could not delete: '+e.message,'er'); }
+};
+$('#ciAdd') && ($('#ciAdd').onclick = async () => {
+  const row = { scope_key:($('#ciScope').value||'DEFAULT').trim().toUpperCase(), label:($('#ciLabel').value||'').trim(),
+    gstin:($('#ciGstin').value||'').trim(), sac:($('#ciSac').value||'').trim(),
+    pan:($('#ciPan').value||'').trim(), msme_no:($('#ciMsme').value||'').trim() };
+  if (!row.scope_key){ alert('Scope is required (use DEFAULT for the standard row).'); return; }
+  const btn=$('#ciAdd'); btn.disabled=true; btn.textContent='Saving…';
+  try {
+    await Cloud.saveCruxIdentity(row);
+    const ex=(window.__cruxIdentity||[]).find(x=>x.scope_key===row.scope_key);
+    if(ex) Object.assign(ex,row); else window.__cruxIdentity.push(row);
+    applyCruxIdentity(); renderCruxIdentity();
+    ['#ciScope','#ciLabel','#ciGstin','#ciSac','#ciPan','#ciMsme'].forEach(s=>{ if($(s)) $(s).value=''; });
+    log(`Identity row ${row.scope_key} saved.`,'ok');
+  } catch(e){ log('Could not save identity: '+e.message+' (is crux_identity.sql installed?)','er'); }
+  finally { btn.disabled=false; btn.textContent='Add / update'; }
+});
 window.editDistrictCode = (code) => {
   const k = String(code).toUpperCase();
   let c = (window.__districtCodes||[]).find(x=>String(x.code).toUpperCase()===k);
@@ -6557,7 +7071,7 @@ $('#dcAdd') && ($('#dcAdd').onclick = async () => {
   const code = ($('#dcCode').value||'').toUpperCase().trim();
   const location = ($('#dcDistrict').value||'').trim();
   const state = ($('#dcState').value||'').trim();
-  if (!/^[A-Z]{3}$/.test(code)) { alert('The code must be exactly 3 letters, e.g. PUN.'); return; }
+  if (!/^[A-Z]{2,}$/.test(code)) { alert('The code must be letters only, at least 2 (e.g. MP, PUN, DEL).'); return; }
   if (!location) { alert('Please enter the location name.'); return; }
   const btn=$('#dcAdd'); btn.disabled=true; btn.textContent='Saving…';
   try {
@@ -6669,14 +7183,34 @@ function renderAnalytics(){
     <line x1="${pad}" y1="${H-pad}" x2="${W-pad}" y2="${H-pad}" stroke="var(--line)"></line>${bars}</svg>
     <p class="dim" style="font-size:10.5px;margin:4px 0 0">Outstanding rupees grouped by how overdue they are. Red is the money most at risk.</p>`;
 
-  // ---- outstanding by client ----
-  const byC = {};
-  list.forEach(({r})=>{ const k=r.client_raw||'(unknown)'; byC[k]=byC[k]||{billed:0,out:0,n:0,outN:0};
-    byC[k].billed+=(r.total_paise||0); byC[k].n++;
-    if(isPend(r.settlement_status)){ byC[k].out+=(r.total_paise||0); byC[k].outN++; } });
-  const cRows = Object.entries(byC).sort((a,b)=>b[1].out-a[1].out).slice(0,20).map(([c,v])=>
+  // ---- flexible breakdown: location / client / client-branch / service ----
+  const groupBy = ($('#anGroupBy') && $('#anGroupBy').value) || 'client';
+  const keyFns = {
+    location: ({r,district}) => district || '(unknown location)',
+    client:   ({r}) => r.client_raw || '(unknown client)',
+    branch:   ({r}) => `${r.client_raw||'?'} — ${r.branch_raw||'(unknown branch)'}`,
+    service:  ({r}) => null   // service is per-line; handled specially below
+  };
+  const byG = {};
+  const addTo = (k, r, isP) => { byG[k]=byG[k]||{billed:0,out:0,n:0,outN:0};
+    byG[k].billed+=(r.total_paise||0); byG[k].n++; if(isP){ byG[k].out+=(r.total_paise||0); byG[k].outN++; } };
+  if (groupBy === 'service') {
+    // services live on applicant lines; attribute each line's amount to its service
+    const linesByHash = window.__linesByHash || {};
+    list.forEach(({r})=>{ const isP=isPend(r.settlement_status);
+      const lines = linesByHash[r.content_hash] || [];
+      if (lines.length) {
+        lines.forEach(l => { const k=(l.service_type||'(unspecified service)'); const amt=l.total_paise||l.amount_paise||0;
+          byG[k]=byG[k]||{billed:0,out:0,n:0,outN:0}; byG[k].billed+=amt; byG[k].n++; if(isP){ byG[k].out+=amt; byG[k].outN++; } });
+      } else { const k=r.service_type||'(unspecified service)'; addTo(k,r,isP); }
+    });
+  } else {
+    list.forEach(o => addTo(keyFns[groupBy](o), o.r, isPend(o.r.settlement_status)));
+  }
+  const gLabel = {location:'Location',client:'Client',branch:'Client branch',service:'Service'}[groupBy];
+  const gRows = Object.entries(byG).sort((a,b)=>b[1].out-a[1].out).slice(0,20).map(([c,v])=>
     `<tr><td>${esc(c)}</td><td style="text-align:right" class="mono">${v.n}</td><td style="text-align:right" class="mono">${money(v.billed)}</td><td style="text-align:right;color:var(--warn)" class="mono">${money(v.out)}</td><td style="text-align:right" class="mono">${v.billed?Math.round((1-v.out/v.billed)*100):100}%</td></tr>`).join('');
-  if ($('#anByClient')) $('#anByClient').innerHTML = `<table class="grid" style="font-size:11.5px"><thead><tr><th>Client</th><th style="text-align:right">Bills</th><th style="text-align:right">Billed</th><th style="text-align:right">Outstanding</th><th style="text-align:right">Collected</th></tr></thead><tbody>${cRows||'<tr><td colspan=5 class=dim>No data</td></tr>'}</tbody></table>${Object.keys(byC).length>20?`<p class="sub">Top 20 of ${Object.keys(byC).length} clients by outstanding.</p>`:''}`;
+  if ($('#anByClient')) $('#anByClient').innerHTML = `<table class="grid" style="font-size:11.5px"><thead><tr><th>${gLabel}</th><th style="text-align:right">${groupBy==='service'?'Lines':'Bills'}</th><th style="text-align:right">Billed</th><th style="text-align:right">Outstanding</th><th style="text-align:right">Collected</th></tr></thead><tbody>${gRows||'<tr><td colspan=5 class=dim>No data</td></tr>'}</tbody></table>${Object.keys(byG).length>20?`<p class="sub">Top 20 of ${Object.keys(byG).length} by outstanding.</p>`:''}`;
 
   // ---- billed vs collected by month (from invoice_date) ----
   const byM = {};
@@ -6756,7 +7290,7 @@ $('#anBulkWriteoff') && ($('#anBulkWriteoff').onclick = async () => {
   finally { btn.disabled=false; btn.textContent='Write off selected…'; }
 });
 // wire filters + checkbox selection
-['#anDistrict','#anClient','#anStatus','#anAge'].forEach(sel=>{ const el=$(sel); if(el) el.onchange=()=>renderAnalytics(); });
+['#anDistrict','#anClient','#anStatus','#anAge','#anGroupBy'].forEach(sel=>{ const el=$(sel); if(el) el.onchange=()=>renderAnalytics(); });
 $('#anTable') && $('#anTable').addEventListener('change', e => {
   const cb = e.target.closest('input[data-anh]'); if(!cb) return;
   window.__anSelected[cb.dataset.anh] = cb.checked; updateAnSelCount();
@@ -6784,8 +7318,8 @@ function runFindBill(){
 }
 $('#findGo') && ($('#findGo').onclick = runFindBill);
 $('#findInvoice') && ($('#findInvoice').onkeydown = (e) => { if (e.key==='Enter') runFindBill(); });
-window.addEditorLine = () => { editorState.lines.push({applicant_name:'',amount_paise:null,tax_paise:null,gross_paise:null,service_type:''}); syncEditorLinesFromDom(); document.getElementById('editorLines').innerHTML = renderEditorLines(); };
-window.removeEditorLine = (i) => { syncEditorLinesFromDom(); editorState.lines.splice(i,1); document.getElementById('editorLines').innerHTML = renderEditorLines(); };
+window.addEditorLine = () => { if(editorState) editorState.__linesChanged=true; editorState.lines.push({applicant_name:'',amount_paise:null,tax_paise:null,gross_paise:null,service_type:''}); syncEditorLinesFromDom(); document.getElementById('editorLines').innerHTML = renderEditorLines(); };
+window.removeEditorLine = (i) => { if(editorState) editorState.__linesChanged=true; syncEditorLinesFromDom(); editorState.lines.splice(i,1); document.getElementById('editorLines').innerHTML = renderEditorLines(); };
 
 function syncEditorLinesFromDom(){
   const tb = document.querySelectorAll('#editorLines tr[data-i]');
@@ -6847,9 +7381,19 @@ async function saveBillEditor(){
       await Cloud.updateOne(hash, patch);
       await Cloud.replaceLines(hash, editorState.lines);
       await Cloud.markVerified(hash);
+      // Delete the stored SOURCE FILE only when a CRITICAL field changed
+      // (amounts, customer/applicant names, services) — not for basic-detail
+      // edits. The bill's DATA always stays in the database (zero data loss);
+      // only the original upload is removed to free storage once it's done its job.
+      const CRIT = ['taxable_paise','tax_total_paise','total_paise','cgst_paise','sgst_paise','igst_paise',
+                    'client_raw','branch_raw','service_type'];
+      const orig = editorState.__original || {};
+      let criticalChanged = editorState.__linesChanged === true;   // applicant/line edits are critical
+      for (const k of CRIT) { if (k in patch && String(patch[k]) !== String(orig[k] ?? '')) { criticalChanged = true; break; } }
       const rfp = editorState.invoice.review_file_path;
-      if (rfp) { try { await fetch(`${Cloud.storageUrl}/object/bills/${rfp}`,
-        { method:'DELETE', headers:{ 'apikey':Cloud.key, 'Authorization':'Bearer '+Cloud.key } }); } catch(_){} }
+      if (rfp && criticalChanged) { try { await fetch(`${Cloud.storageUrl}/object/bills/${rfp}`,
+        { method:'DELETE', headers:{ 'apikey':Cloud.key, 'Authorization':'Bearer '+Cloud.key } });
+        DIAG && DIAG.ok('system', `source file removed after critical edit: ${hash}`); } catch(_){} }
     }
 
     // update local state so it drops out of Review immediately
