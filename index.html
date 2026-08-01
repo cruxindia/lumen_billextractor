@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='78dbd28e6f41';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='ae23a9bd6a38';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -1284,7 +1284,29 @@ function extractDetail(view) {
     return acc;
   };
 
-  const rows = harvest(grid, cols, hrow + 1);
+  let rows = harvest(grid, cols, hrow + 1);
+
+  /* Template-padding removal. The single-customer BOM service-bill template
+     carries a DESCRIPTION column pre-filled with ~15 blank line slots that read
+     0.00, plus ONE real "Service Charge Towards Verification Services" line with
+     the actual amount. Those 0.00 slots are not applicants — they are empty
+     template rows. Harvesting them makes the bill look like a broken annexure
+     (rows that don't sum to the total) and forces a false review. Drop any row
+     whose amount is exactly zero AND whose name is a generic service-charge /
+     description label, so a genuine zero-value applicant is never lost. */
+  const GENERIC_LINE = /^(service\s*charge|description|verification\s*service|charge\s*toward|total)/i;
+  const beforePad = rows.length;
+  rows = rows.filter(r => {
+    const amt = r.amount_paise;
+    const isZero = (amt === 0);
+    const isGeneric = GENERIC_LINE.test(String(r.applicant_name || '').trim());
+    return !(isZero && isGeneric);
+  });
+  if (rows.length !== beforePad) {
+    out.push({ field: '_padding_removed', raw: beforePad - rows.length, normalized: beforePad - rows.length,
+      valueType: 'number', confidence: .9, method: 'template_padding_filter',
+      locator: { sheet: grid.name }, evidence: `${beforePad - rows.length} zero-value template slot(s) ignored` });
+  }
 
   /* A long annexure runs over several pages and the header is printed only
      once. Continuation pages therefore have no header to anchor on, and each
@@ -1479,9 +1501,15 @@ function validate(rec) {
   if (sup && rcp && sup.length >= 2 && rcp.length >= 2) {
     const inter = sup.slice(0,2) !== rcp.slice(0,2);
     const hasIgst = v.igst_paise > 0, hasSplit = v.cgst_paise > 0 && v.sgst_paise > 0;
+    // If the amounts reconcile (taxable + tax = total within tolerance), the
+    // MONEY is correct and only the tax-type LABEL is off. That is worth a note,
+    // not a review-blocking error — so downgrade C5 to a warning in that case.
+    const arithmeticOk = (taxable != null && tax != null && total != null)
+      && Math.abs(total - (taxable + tax)) <= 100;
     if (!hasIgst && !hasSplit) skip('C5_place_of_supply', 'no tax component identified by type');
     else add('C5_place_of_supply', inter ? hasIgst : hasSplit,
-      `${STATES[sup.slice(0,2)]||sup.slice(0,2)} → ${STATES[rcp.slice(0,2)]||rcp.slice(0,2)}, ${inter?'inter':'intra'}-state, ${hasIgst?'IGST':'CGST+SGST'}`);
+      `${STATES[sup.slice(0,2)]||sup.slice(0,2)} → ${STATES[rcp.slice(0,2)]||rcp.slice(0,2)}, ${inter?'inter':'intra'}-state, ${hasIgst?'IGST':'CGST+SGST'}`,
+      arithmeticOk ? 'warn' : 'error');
   } else skip('C5_place_of_supply', 'both GSTINs required');
 
   const lines = v._lines || [];
@@ -7158,7 +7186,12 @@ function anFilteredRows(){
     .filter(({r,district,dpd}) => {
       if (fD && district!==fD) return false;
       if (fC && (r.client_raw||'')!==fC) return false;
-      if (fS==='__PENDING' && !/PENDING|PARTIAL/i.test(r.settlement_status||'')) return false;
+      // A blank/unknown settlement status means the bill is unpaid — i.e.
+      // outstanding. Freshly-extracted review bills have no status yet, so
+      // "outstanding" must include them, otherwise analytics looks empty.
+      const st = (r.settlement_status||'').toUpperCase();
+      const isOutstanding = st==='' || /PENDING|PARTIAL|OVERDUE|UNPAID|DUE/.test(st) || !/PAID|WRITTEN/.test(st);
+      if (fS==='__PENDING' && !isOutstanding) return false;
       else if (fS && fS!=='__PENDING' && (r.settlement_status||'')!==fS) return false;
       if (fA){ const cap=parseInt(fA,10); if(dpd==null) return false;
         if (cap===30 && !(dpd<=30)) return false;
@@ -7182,7 +7215,7 @@ function renderAnalytics(){
   if ($('#anCount')) $('#anCount').textContent = `${list.length} of ${rows.length}`;
   const money = p => '₹'+((p||0)/100).toLocaleString('en-IN',{minimumFractionDigits:0,maximumFractionDigits:0});
   const moneyF = p => '₹'+((p||0)/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
-  const isPend = s => /PENDING|PARTIAL/i.test(s||'');
+  const isPend = s => { const st=(s||'').toUpperCase(); return st==='' || (/PENDING|PARTIAL|OVERDUE|UNPAID|DUE/.test(st)) || !/PAID|WRITTEN/.test(st); };
   const isWo = r => /WRITTEN_OFF/i.test(r.settlement_status||'')||r.written_off;
 
   // ---- headline KPIs (with meaning) ----
