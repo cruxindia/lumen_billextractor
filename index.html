@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='3fabbfafcdca';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='9d8adc7c735f';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -931,6 +931,7 @@ function findTable(grid, headerPats, minHeaders) {
   let best = [0, {}];
   for (const r of Object.keys(rows).map(Number).sort((a, b) => a - b)) {
     const found = {};
+    const foundMeta = {};
     for (const [c, text] of rows[r]) {
       const t = text.trim();
       /* A PDF often emits several adjacent table headings as ONE text run,
@@ -939,10 +940,12 @@ function findTable(grid, headerPats, minHeaders) {
          each one over the data column it actually sits above. */
       const hits = [];
       for (const key in headerPats) {
-        if (key in found) continue;
+        // Don't skip keys already found: a later column with a stricter/more
+        // specific header (e.g. "APPLICANT NAME") must be able to override an
+        // earlier column that only matched loosely (e.g. "Cleint Name").
         for (const pat of headerPats[key]) {
           const m = pat.exec(t);
-          if (m) { hits.push({ key, at: m.index }); break; }
+          if (m) { hits.push({ key, at: m.index, strict: true, specificity: pat.source.length }); break; }
         }
       }
       /* Header patterns are anchored (/^amount$/) so a lone cell reading
@@ -957,12 +960,25 @@ function findTable(grid, headerPats, minHeaders) {
             const relaxed = new RegExp(
               pat.source.replace(/^\^/, '\\b').replace(/\$$/, '\\b'), 'i');
             const m = relaxed.exec(t);
-            if (m) { hits.push({ key, at: m.index }); break; }
+            if (m) { hits.push({ key, at: m.index, strict: false, specificity: pat.source.length }); break; }
           }
         }
       }
       if (!hits.length) continue;
-      if (hits.length === 1) { found[hits[0].key] = c; continue; }
+      const better = (h) => {
+        if (!(h.key in found)) return true;
+        const prev = foundMeta[h.key];
+        // a strict match beats a relaxed one; among same strictness, a more
+        // specific (longer) pattern wins. This stops a generic "\bname\b" on a
+        // "Cleint Name" column from claiming the applicant slot that the real
+        // "APPLICANT NAME" column (a stricter, more specific match) deserves.
+        if (h.strict !== prev.strict) return h.strict;
+        return h.specificity > prev.specificity;
+      };
+      if (hits.length === 1) {
+        if (better(hits[0])) { found[hits[0].key] = c; foundMeta[hits[0].key] = hits[0]; }
+        continue;
+      }
 
       hits.sort((a, b) => a.at - b.at);
       const cell = grid.cells[cref(r, c)];
@@ -972,10 +988,10 @@ function findTable(grid, headerPats, minHeaders) {
           const estX = cell.x + (h.at / Math.max(t.length, 1)) * cell.w;
           let bestCol = cols[0];
           for (const cc of cols) if (Math.abs(cc.x - estX) < Math.abs(bestCol.x - estX)) bestCol = cc;
-          if (!(h.key in found)) found[h.key] = bestCol.col;
+          if (better(h)) { found[h.key] = bestCol.col; foundMeta[h.key] = h; }
         }
       } else {
-        hits.forEach((h, k) => { if (!(h.key in found)) found[h.key] = c + k; });
+        hits.forEach((h, k) => { if (better(h)) { found[h.key] = c + k; foundMeta[h.key] = h; } });
       }
     }
     if (Object.keys(found).length > Object.keys(best[1]).length) best = [r, found];
@@ -5145,7 +5161,7 @@ const FIELD_MAP = {
   gross_amount:{perApplicant:1, n:1, l:'Gross Total Amount', g:(r,a)=>mGross(r,a)},
 };
 const PRESETS = {
-  'Pending bills (reference layout)': ['report_date','state','zone','bank_name','branch_name','branch_email','applicant_name','invoice_number','payment_date','amount','tax_total','total_amount','payment_status'],
+  'Pending bills (reference layout)': ['report_date','state','zone','bank_name','branch_name','branch_email','applicant_name','service_type','invoice_number','payment_date','amount','tax_total','total_amount','payment_status'],
   'Applicant billing detail': ['invoice_number','invoice_date','bank_name','branch_name','applicant_name','service_type','location','amount','tax_total','total_amount','allocation_method'],
   'Audit trail': ['invoice_number','invoice_date','branch_name','applicant_name','amount','total_amount','verdict','source_file'],
   'Bill check — face vs annexure': ['invoice_number','invoice_date','bank_name','branch_name','face_total','annexure_total','match_diff','match_status','rows_read','rows_printed','verdict','source_file'],
