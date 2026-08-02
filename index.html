@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='ae23a9bd6a38';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='5cc1423be6cc';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -3567,6 +3567,27 @@ const Pipeline = {
     // number and a total) still goes to the invoices table WITH its checks — so
     // it counts in the Report AND shows in Review for a person to verify. Only a
     // genuinely UNUSABLE bill (missing the identity/amount that make it a record
+    // Last-resort total recovery. An image/scanned bill often yields a clean
+    // taxable and line items but the printed TOTAL sits in a region OCR renders
+    // differently, so the grand-total label never matches and total stays null.
+    // Such a bill is NOT unusable — it has an invoice number and a money basis.
+    // Derive a working total so it becomes a proper record: taxable + tax when a
+    // tax figure exists, else the taxable itself (marked, so Review shows it must
+    // be verified). This keeps the bill in the main table (visible + editable)
+    // instead of dumping it to failed_uploads where it looks lost.
+    if (inv.total_paise == null && inv.taxable_paise != null) {
+      if (inv.tax_total_paise != null) {
+        inv.total_paise = inv.taxable_paise + inv.tax_total_paise;
+        inv._derived = {...(inv._derived||{}), total_paise:'taxable + tax (total not printed/OCR-read)'};
+      } else {
+        inv.total_paise = inv.taxable_paise;
+        inv._derived = {...(inv._derived||{}), total_paise:'taxable used as total — printed total not read, verify'};
+        checks.push({ check_id:'C17_total_provisional', status:'FAIL', severity:'warning',
+          detail:'Total not read from the bill — taxable shown as a provisional total. Verify and correct.' });
+      }
+      this.stats.derived_total = (this.stats.derived_total||0) + 1;
+    }
+
     // at all) is kicked to failed_uploads. This preserves MIS totals: flagged
     // bills are not lost from the main table.
     const stillFailing = checks.filter(c => c.status==='FAIL');
