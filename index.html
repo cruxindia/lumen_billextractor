@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='5cc1423be6cc';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='55b46d8f5350';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -1196,6 +1196,43 @@ function extractFace(view) {
   if (ro != null) push('round_off_paise', ro, paise(ro), 'paise', .8, 'label_row_scan', face.name, roc);
   const [gt, gtc] = numericForLabel(face, VOCAB.grand_total);
   if (gt != null) push('total_paise', gt, paise(gt), 'paise', .85, 'label_row_scan', face.name, gtc);
+
+  /* CRUX consolidated multi-applicant format recovery. These invoices (many
+     CHE/BGL/ODI/... bills) have NO recipient bank and a table headed
+     "SR.NO | NAME | OTHER | BASIC AMOUNT | GST@18% | GROSS TOTAL", ending in a
+     bare "TOTAL" row — not the BOM "TOTAL AMOUNT (In Figures)" label. So the
+     generic grand_total scan misses the printed total, and the date sits inline
+     as "DATED: 30-JUN-2026" on the invoice-number line. Recover both, but ONLY
+     when this format is positively identified, so BOM bills are untouched. */
+  const faceText = Object.values(face.cells || {})
+    .map(c => (c && typeof c.value === 'string') ? c.value : '').join(' \u2029 ');
+  const isCruxConsolidated = /gross\s*total/i.test(faceText) && /\bbasic\s*amount\b/i.test(faceText);
+  if (isCruxConsolidated) {
+    // (a) total from the bare "TOTAL" row: take the rightmost number on the row
+    //     whose description cell is exactly "TOTAL".
+    if (out.find(o => o.field === 'total_paise') == null) {
+      for (const key in face.cells) {
+        const c = face.cells[key];
+        if (c && typeof c.value === 'string' && /^\s*total\s*$/i.test(c.value)) {
+          const [r] = rc(key);
+          // scan that row for the largest number = gross total
+          let best = null;
+          for (const k2 in face.cells) {
+            const [r2] = rc(k2);
+            if (r2 !== r) continue;
+            const v2 = face.cells[k2] && face.cells[k2].value;
+            if (typeof v2 === 'number' && (best == null || v2 > best)) best = v2;
+          }
+          if (best != null) { push('total_paise', best, paise(best), 'paise', .8, 'crux_total_row', face.name, key); break; }
+        }
+      }
+    }
+    // (b) inline DATED: date anywhere on the face
+    if (out.find(o => o.field === 'invoice_date') == null) {
+      const m = /\bdated?\s*[:\-]?\s*(\d{1,2}[-/][A-Za-z]{3,}[-/]\d{2,4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})/i.exec(faceText);
+      if (m) { const d = parseDate(m[1]); if (d) push('invoice_date', m[1], iso(d), 'date', .8, 'crux_inline_dated', face.name, null); }
+    }
+  }
   return out;
 }
 
@@ -2075,10 +2112,15 @@ function processView(view) {
   if (!v.client_raw && view.filename) {
     const stem = String(view.filename).replace(/\.[a-z0-9]{2,4}$/i,'');
     let cust = stem
+      .replace(/^\s*invoice[-_\s]*/i, '')                 // drop a literal "invoice" prefix
+      .replace(/\b[A-Za-z]{2,}[-/]\d{3,4}[-/]\d{2,}\b/g,' ') // drop full ABBR-YYMM-NNNN invoice codes anywhere
       .replace(/^[A-Za-z]{2,}[-/]\d[\d-]*(?=[\s_]|$)/, '')   // drop a leading ABBR-xxxx invoice token only
       .replace(/\b\d{4,}\b/g,' ')                      // drop long number runs
       .replace(/[_-]+/g,' ').replace(/\s+/g,' ').trim();
-    if (cust && cust.length >= 3 && /[A-Za-z]/.test(cust)) {
+    // If nothing meaningful remains (filename was ONLY an invoice code), leave
+    // client blank rather than inventing "invoice CHE" — a blank is honest and
+    // the branch/master enrichment can still fill it.
+    if (cust && cust.length >= 3 && /[A-Za-z]/.test(cust) && !/^invoice$/i.test(cust)) {
       v.client_raw = cust; v._client_from_filename = true;
     }
   }
@@ -3064,6 +3106,7 @@ async function pdfToView(buf, filename){
   }).promise;
   const pages = [];
   let ocrUsed = false, hasImagePage = false;
+  let totalTextItems = 0;
   for (let n = 1; n <= doc.numPages; n++) {
     const page = await doc.getPage(n);
     const tc = await page.getTextContent();
@@ -3074,19 +3117,38 @@ async function pdfToView(buf, filename){
        returns is tagged _ocr so it's treated as a draft to verify, never trusted
        like a clean text layer. */
     const realText = items.filter(i => i.str && i.str.trim()).length;
+    totalTextItems += realText;
     if (realText < 5) {
-      /* This page is an image. During bulk ingest we do NOT OCR inline — OCR-ing
-         hundreds of pages serially would freeze the batch for a very long time.
-         We flag the page instead, and OCR runs as a separate, resumable pass the
-         user starts from the Ingest screen. This keeps ingest fast and never
-         hangs on a stuck page. */
-      hasImagePage = true;
+      /* Sparse page. But a sparse page is NOT necessarily an image — many bills
+         have a near-empty cover/letterhead page (e.g. "CRUX RISK MANAGEMENT PVT
+         LTD / Page 1 of 2") while the real invoice table sits on a later page as
+         clean text. Only treat it as a scanned image page if it ALSO carries real
+         drawing content (an embedded raster/vector image). Otherwise it's just a
+         thin cover page and must not drag the whole bill into OCR. */
+      let hasDrawing = false;
+      try {
+        const ops = await page.getOperatorList();
+        const F = (window.pdfjsLib && pdfjsLib.OPS) ? pdfjsLib.OPS : null;
+        if (F) {
+          hasDrawing = ops.fnArray.some(fn =>
+            fn === F.paintImageXObject || fn === F.paintInlineImageXObject ||
+            fn === F.paintImageMaskXObject || fn === F.paintJpegXObject);
+        } else {
+          // Fallback: if we can't inspect ops, be conservative and treat a
+          // truly empty page (0 text) as an image only when it's the sole page.
+          hasDrawing = (realText === 0 && doc.numPages === 1);
+        }
+      } catch(_) { hasDrawing = false; }
+      if (hasDrawing) hasImagePage = true;
     }
     pages.push({ items });
     page.cleanup();
   }
   await doc.destroy();
   const view = L.buildViewFromPages(pages, filename);
+  /* If the document as a whole yielded a healthy amount of text, it is a
+     text bill regardless of one thin page — never send it to OCR. */
+  if (totalTextItems >= 8) hasImagePage = false;
   if (hasImagePage) { view.metadata.hasImagePage = true; view._hasImagePage = true; }
   return view;
 }
