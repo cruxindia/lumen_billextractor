@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='55b46d8f5350';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='3fabbfafcdca';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -290,8 +290,10 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
     <span class="pill" id="libPill"><i class="dot"></i> Readers</span>
     <span class="pill" id="ocrPill" title="OCR reads image/scanned bills"><i class="dot"></i> OCR off</span>
     <span class="pill" id="ocrProgress" style="color:var(--warn)"></span>
+    <span class="pill" id="buildPill" title="This build's ID — check it matches the version you deployed" style="font-family:ui-monospace,monospace;opacity:.7">build …</span>
     <button class="icon-btn" id="themeBtn" title="Toggle theme" aria-label="Toggle theme">◐</button>
   </header>
+  <script>try{document.getElementById('buildPill').textContent='build '+(window.__LUMEN_BUILD||'unknown');}catch(_){}</script>
 
   <nav class="rail" id="rail">
     <div class="rail-head">WORK</div>
@@ -832,9 +834,9 @@ const APPLICANT_HEADERS = {
   pre_post: [/pre\s*\/?\s*post/i],
   loan_number: [/loan\s*(no|a\/?c|account)/i, /\blan\b/i],
   application_number: [/application\s*(no|number)/i, /proposal\s*no/i],
-  amount: [/^amount$/i, /^amt$/i, /^charges?$/i, /^fee$/i],
+  amount: [/^amount$/i, /^amt$/i, /^charges?$/i, /^fee$/i, /^cost$/i, /ogl\s*charges?/i],
   tax: [/^gst$/i, /^tax$/i, /^[csi]gst$/i],
-  gross: [/bill\s*am/i, /total\s*am/i, /gross/i]
+  gross: [/bill\s*am/i, /total\s*am/i, /gross/i, /^total$/i]
 };
 const LINE_HEADERS = {
   description: [/^description$/i, /^particulars$/i, /^service$/i, /^item$/i, /nature\s*of/i],
@@ -4001,7 +4003,12 @@ async function ingest(fileList){
           detail: 'Some of this bill was read from an image by OCR — the amounts especially need checking.' });
         if (r.verdict === 'PROVEN') r.verdict = 'UNPROVEN';
       }
-      if (!BIG_BATCH) { try { r._sourceBlob = new Blob([it.buf], { type: it.pdf ? 'application/pdf' : 'application/octet-stream' }); } catch(_){} }
+      // Keep the source blob available for the push/stash step so EVERY bill's
+      // original file gets stored for viewing — even in a big batch. Previously
+      // this was skipped when BIG_BATCH to save memory, which meant that on large
+      // ingests (the normal case here) text bills had no viewable file. We now
+      // always set it, then free it immediately after the push below.
+      if (!r._sourceBlob) { try { r._sourceBlob = new Blob([it.buf], { type: it.pdf ? 'application/pdf' : 'application/octet-stream' }); } catch(_){} }
       DB.docs.push(r); session.count++;   // hash already reserved above
 
       // push to the database as we go (every bill — the DB is the backing store).
@@ -4014,6 +4021,7 @@ async function ingest(fileList){
       // free heavy memory now that it's stored (keep buffer for image bills the OCR pass needs)
       if (!r._hasImagePage) { delete r._pdfBuf; }
       if (BIG_BATCH) { delete r._sourceBlob; if (r.candidates && !r._hasImagePage) r.candidates = {}; }
+
     } catch (e) { failed++; if (hash) DB.hashes.delete(hash); DIAG.error('worker', `${wname}: failed on ${it.name}`, { worker:wid, reason:e.message }); log(`${it.name} — ${e.message}`, 'er'); }
     finally {
       DIAG.info('worker', `${wname}: finished ${it.name} in ${((Date.now()-tItem)/1000).toFixed(1)}s`, { worker:wid });
