@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='3256962174e4';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='1663f6c26ff0';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -5240,8 +5240,8 @@ const FIELD_MAP = {
   service_type:{perApplicant:1, l:'TYPE', g:(r,a)=>a.service_type},
   location:{perApplicant:1, l:'LOCATION', g:(r,a)=>a.location},
   payment_date:{l:'PAYMENT DATE', g:r=>r.invoice.last_payment_date},
-  received_amount:{perApplicant:1, l:'RECEIVED AMOUNT', n:1, g:(r,a)=>{ if(a && a.__rowIdx>0) return ''; return r.invoice.received_paise==null?'':r.invoice.received_paise/100; }},
-  pending_amount:{perApplicant:1, l:'PENDING AMOUNT', n:1, g:(r,a)=>{ if(a && a.__rowIdx>0) return ''; const inv=r.invoice; if(inv.pending_paise!=null) return inv.pending_paise/100; const tot=inv.total_paise, rec=inv.received_paise; return (tot!=null)? (tot-(rec||0))/100 : ''; }},
+  received_amount:{l:'RECEIVED AMOUNT', n:1, invoiceLevel:1, g:r=>r.invoice.received_paise==null?'':r.invoice.received_paise/100},
+  pending_amount:{l:'PENDING AMOUNT', n:1, invoiceLevel:1, g:r=>{ const inv=r.invoice; if(inv.pending_paise!=null) return inv.pending_paise/100; const tot=inv.total_paise, rec=inv.received_paise; return (tot!=null)? (tot-(rec||0))/100 : ''; }},
   amount:{perApplicant:1, l:'AMOUNT', g:(r,a)=>mBasic(a), n:1},
   cgst:{perApplicant:1, l:'CGST', g:(r,a)=>mDiv(a.cgst_paise), n:1},
   sgst:{perApplicant:1, l:'SGST', g:(r,a)=>mDiv(a.sgst_paise), n:1},
@@ -5305,7 +5305,7 @@ function reportRows(){
                    igst_paise:r.invoice.tax_total_paise||0, total_paise:r.invoice.total_paise||0,
                    allocation_method:'—'};
     const rows = perApplicant ? (r.applicants.length ? r.applicants : [blank]) : [blank];
-    rows.forEach((a, __i) => { a.__rowIdx = __i; const row = reportCols.map(k => FIELD_MAP[k].g(r,a) ?? ''); row.__hash = r.hash || r.content_hash || (r.invoice && r.invoice.content_hash); out.push(row); });
+    rows.forEach(a => { const row = reportCols.map(k => FIELD_MAP[k].g(r,a) ?? ''); row.__hash = r.hash || r.content_hash || (r.invoice && r.invoice.content_hash); out.push(row); });
   });
   return out;
 }
@@ -6173,8 +6173,14 @@ $('#expXlsx').onclick = async () => { if(!window.XLSX) return log('Excel writer 
   const perApplicant = reportCols.some(k => FIELD_MAP[k].perApplicant);
   const grand = {};   // money column totals
 
-  const pushCells = (arr, style, zebra) => {
-    reportCols.forEach((k, i) => { if (FIELD_MAP[k].n && typeof arr[i] === 'number' && isFinite(arr[i])) grand[i] = (grand[i]||0) + arr[i]; });
+  const pushCells = (arr, style, zebra, invoiceFirst) => {
+    reportCols.forEach((k, i) => {
+      if (!(FIELD_MAP[k].n && typeof arr[i] === 'number' && isFinite(arr[i]))) return;
+      // invoice-level money (received/pending) is the same on every applicant row —
+      // add it to the grand total only ONCE per bill, on the first row of the bill.
+      if (FIELD_MAP[k].invoiceLevel && invoiceFirst === false) return;
+      grand[i] = (grand[i]||0) + arr[i];
+    });
     dataRows.push({ cells: arr, style, zebra });
   };
 
@@ -6194,21 +6200,28 @@ $('#expXlsx').onclick = async () => { if(!window.XLSX) return log('Excel writer 
       const groups = [];
       src.forEach(row => { const nm=(row.applicant_name||'(unnamed)').trim(); const last=groups[groups.length-1];
         if(last&&last.nm===nm) last.rows.push(row); else groups.push({nm, rows:[row]}); });
+      let docFirst = true;   // first output row of THIS invoice
       groups.forEach(({nm, rows}) => {
         sr += 1; z = !z;
         const sub = {};
         rows.forEach((row, idx) => {
           row.__sr = idx===0 ? String(sr).padStart(4,'0') : '';
           const cells = reportCols.map(k => FIELD_MAP[k].g(doc, row) ?? '');
-          reportCols.forEach((k,i)=>{ if(FIELD_MAP[k].n && typeof cells[i]==='number') sub[i]=(sub[i]||0)+cells[i]; });
-          pushCells(cells, 'body', z);
+          reportCols.forEach((k,i)=>{ if(FIELD_MAP[k].n && typeof cells[i]==='number') {
+            // invoice-level columns are identical on every row — take once per bill, don't sum
+            if (FIELD_MAP[k].invoiceLevel) { if (docFirst && idx===0) sub[i]=cells[i]; }
+            else sub[i]=(sub[i]||0)+cells[i];
+          }});
+          pushCells(cells, 'body', z, docFirst);
+          docFirst = false;
         });
         // sub total row
         const stotal = reportCols.map((k,i)=> i===0 ? 'Sub total' : (sub[i]!==undefined ? sub[i] : ''));
         dataRows.push({ cells: stotal, style:'subtotal' });
       });
     } else {
-      src.forEach(row => { z = !z; pushCells(reportCols.map(k => FIELD_MAP[k].g(doc,row) ?? ''), 'body', z); });
+      let docFirst = true;
+      src.forEach(row => { z = !z; pushCells(reportCols.map(k => FIELD_MAP[k].g(doc,row) ?? ''), 'body', z, docFirst); docFirst = false; });
     }
   });
 
@@ -6878,6 +6891,26 @@ async function openBillEditor(hash){
 
   const linesHtml = renderEditorLines();
 
+  // Build the bill-view HTML here (plain string concatenation) so we never nest
+  // template literals inside the body template — nested backticks silently break
+  // the whole editor view.
+  let billViewHtml;
+  if (billUrl) {
+    var _srcName = editorState.invoice.source_file || '';
+    var _urlExtM = billUrl.match(/\.(pdf|xlsx?|xlsm|jpe?g|png|gif|tiff?|webp)(\?|$)/i);
+    var _nameExtM = _srcName.match(/\.(pdf|xlsx?|xlsm|jpe?g|png|gif|tiff?|webp)$/i);
+    var _ext = (_urlExtM && _urlExtM[1]) || (_nameExtM && _nameExtM[1]) || 'pdf';
+    var _dlName = ((editorState.invoice.invoice_no || 'bill') + '.' + _ext).replace(/[\/\\:*?"<>|]/g, '_');
+    var _isImg = /\.(jpe?g|png|gif|tiff?|bmp|webp)(\?|$)/i.test(billUrl) || (_nameExtM && /jpe?g|png|gif|tiff?|bmp|webp/i.test(_nameExtM[1]));
+    var _link = '<a href="' + billUrl + '" target="_blank" rel="noopener" download="' + _dlName + '" class="dim" style="font-size:12px">\u2193 Download bill (' + _dlName + ')</a>';
+    var _viewer = _isImg
+      ? '<img src="' + billUrl + '" alt="original bill" style="width:100%;max-height:66vh;object-fit:contain;border:1px solid var(--line);border-radius:8px;background:#fff">'
+      : '<iframe src="' + billUrl + '" style="width:100%;height:66vh;border:1px solid var(--line);border-radius:8px"></iframe>';
+    billViewHtml = _viewer + '<div style="margin-top:6px">' + _link + '</div>';
+  } else {
+    billViewHtml = '<div class="editor-noview">No stored image for this bill — you can still edit every field on the right and save.<br><span class="dim">' + esc(window.__editorNoFileReason || '') + '</span></div>';
+  }
+
   const body = `
     <div class="editor-wrap">
       <div class="editor-head">
@@ -6888,21 +6921,7 @@ async function openBillEditor(hash){
       </div>
       <div class="editor-cols">
         <div class="editor-view">
-          ${billUrl ? (() => {
-            const srcName = editorState.invoice.source_file || '';
-            const urlExtM = billUrl.match(/\.(pdf|xlsx?|xlsm|jpe?g|png|gif|tiff?|webp)(\?|$)/i);
-            const nameExtM = srcName.match(/\.(pdf|xlsx?|xlsm|jpe?g|png|gif|tiff?|webp)$/i);
-            const ext = (urlExtM && urlExtM[1]) || (nameExtM && nameExtM[1]) || 'pdf';
-            const dlName = ((editorState.invoice.invoice_no || 'bill') + '.' + ext).replace(/[\/\\:*?"<>|]/g,'_');
-            const isImg = /\.(jpe?g|png|gif|tiff?|bmp|webp)(\?|$)/i.test(billUrl) || nameExtM && /jpe?g|png|gif|tiff?|bmp|webp/i.test(nameExtM[1]);
-            const link = `<a href="${billUrl}" target="_blank" rel="noopener" download="${dlName}" class="dim" style="font-size:12px">\u2193 Download bill (${dlName})</a>`;
-            return isImg
-              ? `<img src="${billUrl}" alt="original bill" style="width:100%;max-height:66vh;object-fit:contain;border:1px solid var(--line);border-radius:8px;background:#fff">
-                 <div style="margin-top:6px">${link}</div>`
-              : `<iframe src="${billUrl}" style="width:100%;height:66vh;border:1px solid var(--line);border-radius:8px"></iframe>
-                 <div style="margin-top:6px">${link}</div>`;
-          })()
-            : `<div class="editor-noview">No stored image for this bill — you can still edit every field on the right and save.<br><span class="dim">${esc(window.__editorNoFileReason||'')}</span></div>`}
+          ${billViewHtml}
         </div>
         <div class="editor-edit">
           ${checkSummaryHtml}
