@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='7b90fb2377bd';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='62d40adce2b2';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -443,7 +443,13 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
         <button class="btn" id="expCsv">Export CSV</button>
         <button class="btn" id="expXlsx">Export Excel</button>
         <button class="btn" id="expNeedsAttention" title="Export every bill that is unproven, has missing values, or needs OCR — with the reason for each, so they can be reviewed and fixed">⚠ Export bills needing attention</button>
-        <label class="chk" title="Group rows by applicant and add a Sub total line after each"><input type="checkbox" id="optSubtotal"> Group with sub-totals</label>
+        <label class="chk" title="Add sub-total lines to the exported Excel">Group sub-totals:
+          <select id="optGroupBy" style="margin-left:4px">
+            <option value="">None</option>
+            <option value="invoice" selected>By invoice number</option>
+            <option value="applicant">By applicant (same last name)</option>
+          </select></label>
+        <input type="checkbox" id="optSubtotal" style="display:none">
       </div>
       <div class="tblwrap" style="max-height:calc(100vh - 330px)"><table id="report"><thead></thead><tbody></tbody></table></div>
       </div><!-- /reportSubBody -->
@@ -6161,7 +6167,8 @@ const gross = basic + gst;   /* gross is basic+tax by definition; never a stray 
 }
 
 $('#expXlsx').onclick = async () => { if(!window.XLSX) return log('Excel writer unavailable offline','er');
-  const wantSub = $('#optSubtotal') && $('#optSubtotal').checked;
+  const groupBy = ($('#optGroupBy') && $('#optGroupBy').value) || '';   // '' | 'invoice' | 'applicant'
+  const wantSub = !!groupBy;
   const header = reportCols.map(k => ({ label: colLabel(k), money: !!FIELD_MAP[k].n }));
   const widths = reportCols.map(k => {
     const l = colLabel(k).length;
@@ -6172,47 +6179,89 @@ $('#expXlsx').onclick = async () => { if(!window.XLSX) return log('Excel writer 
   const dataRows = [];
   const perApplicant = reportCols.some(k => FIELD_MAP[k].perApplicant);
   const grand = {};   // money column totals
+  // indices of invoice-level money columns (received/pending) and the amount basis
+  const recvIdx = reportCols.indexOf('received_amount');
+  const pendIdx = reportCols.indexOf('pending_amount');
+  const amtIdx  = reportCols.indexOf('amount') !== -1 ? reportCols.indexOf('amount')
+                 : reportCols.indexOf('total_amount');
+  const lastName = s => { const p = String(s||'').trim().split(/\s+/).filter(Boolean); return p.length ? p[p.length-1].toUpperCase() : ''; };
 
   const pushCells = (arr, style, zebra, invoiceFirst) => {
     reportCols.forEach((k, i) => {
       if (!(FIELD_MAP[k].n && typeof arr[i] === 'number' && isFinite(arr[i]))) return;
       // invoice-level money (received/pending) is the same on every applicant row —
-      // add it to the grand total only ONCE per bill, on the first row of the bill.
-      if (FIELD_MAP[k].invoiceLevel && invoiceFirst === false) return;
+      // add it to the grand total only ONCE per bill, on the first row of the bill,
+      // UNLESS we've allocated it per entry (then each row already holds its share).
+      if (FIELD_MAP[k].invoiceLevel && invoiceFirst === false && !arr.__allocated) return;
       grand[i] = (grand[i]||0) + arr[i];
     });
     dataRows.push({ cells: arr, style, zebra });
+  };
+
+  // Build the per-entry cell rows for one invoice, allocating invoice-level
+  // received/pending across entries in proportion to each entry's amount so the
+  // figures reflect the actual pending for THAT entry, not the whole bill.
+  const buildInvoiceRows = (doc, src, allocatePerEntry) => {
+    const invPend = doc.invoice.pending_paise==null ? null : doc.invoice.pending_paise/100;
+    const invRecv = doc.invoice.received_paise==null ? null : doc.invoice.received_paise/100;
+    // basis = sum of each entry's amount (amtIdx column) so shares sum back to the invoice figure
+    let basis = 0; const rowCells = [];
+    src.forEach(row => { const cells = reportCols.map(k => FIELD_MAP[k].g(doc, row) ?? ''); rowCells.push(cells);
+      if (amtIdx>=0 && typeof cells[amtIdx]==='number') basis += cells[amtIdx]; });
+    let accP = 0, accR = 0;
+    rowCells.forEach((cells, idx) => {
+      if (allocatePerEntry) {
+        const share = (basis>0 && amtIdx>=0 && typeof cells[amtIdx]==='number') ? cells[amtIdx]/basis : (idx===0?1:0);
+        const last = idx === rowCells.length-1;
+        if (pendIdx>=0 && invPend!=null) { let v = last ? +(invPend-accP).toFixed(2) : +(invPend*share).toFixed(2); accP += v; cells[pendIdx] = v; }
+        if (recvIdx>=0 && invRecv!=null) { let v = last ? +(invRecv-accR).toFixed(2) : +(invRecv*share).toFixed(2); accR += v; cells[recvIdx] = v; }
+        cells.__allocated = true;
+      }
+    });
+    return rowCells;
   };
 
   let z = false, sr = 0;
   DB.docs.forEach(doc => {
     const blank = {applicant_name:'', taxable_paise:doc.invoice.taxable_paise||0, cgst_paise:0, sgst_paise:0,
                    igst_paise:doc.invoice.tax_total_paise||0, total_paise:doc.invoice.total_paise||0, allocation_method:'—'};
-    // choose source rows (raw per-verification if available and per-applicant view)
     let src;
     if (perApplicant) {
       const raw = ((doc.candidates && doc.candidates._applicant_rows || [])[0] || {}).normalized || [];
       src = raw.length ? raw : (doc.applicants.length ? doc.applicants : [blank]);
     } else src = [blank];
 
-    if (wantSub && perApplicant) {
-      // ONE sub-total per invoice (this doc), covering all its applicant/task rows.
-      sr += 1; z = !z;
-      const sub = {};
-      let docFirst = true;
+    if (wantSub && perApplicant && groupBy === 'applicant') {
+      // Group entries WITHIN this invoice by applicant last name; pending/received
+      // are allocated per entry, so each sub-total is the real pending for that
+      // applicant group, not the whole invoice.
+      const rowCells = buildInvoiceRows(doc, src, true);
+      const groups = new Map();   // lastName -> [cells,...]
+      rowCells.forEach((cells, i) => { const ln = lastName(src[i] && src[i].applicant_name); const key = ln || '(unnamed)';
+        if(!groups.has(key)) groups.set(key, []); groups.get(key).push(cells); });
+      groups.forEach((cellsList) => {
+        sr += 1; z = !z; const sub = {};
+        cellsList.forEach(cells => {
+          reportCols.forEach((k,i)=>{ if(FIELD_MAP[k].n && typeof cells[i]==='number') sub[i]=(sub[i]||0)+cells[i]; });
+          pushCells(cells, 'body', z, false);
+        });
+        const stotal = reportCols.map((k,i)=> i===0 ? 'Sub total' : (sub[i]!==undefined ? sub[i] : ''));
+        dataRows.push({ cells: stotal, style:'subtotal' });
+      });
+    } else if (wantSub && perApplicant && groupBy === 'invoice') {
+      // ONE sub-total per invoice, covering all its entries. Invoice-level
+      // received/pending shown once (not summed, not allocated).
+      sr += 1; z = !z; const sub = {}; let docFirst = true;
       src.forEach((row, idx) => {
         row.__sr = idx===0 ? String(sr).padStart(4,'0') : '';
         const cells = reportCols.map(k => FIELD_MAP[k].g(doc, row) ?? '');
         reportCols.forEach((k,i)=>{ if(FIELD_MAP[k].n && typeof cells[i]==='number') {
-          // invoice-level columns (received/pending) are identical on every row —
-          // take once per invoice, don't sum across rows
           if (FIELD_MAP[k].invoiceLevel) { if (docFirst) sub[i]=cells[i]; }
           else sub[i]=(sub[i]||0)+cells[i];
         }});
         pushCells(cells, 'body', z, docFirst);
         docFirst = false;
       });
-      // one sub-total row for the whole invoice
       const stotal = reportCols.map((k,i)=> i===0 ? 'Sub total' : (sub[i]!==undefined ? sub[i] : ''));
       dataRows.push({ cells: stotal, style:'subtotal' });
     } else {
@@ -6629,12 +6678,23 @@ window.wireReconcile = wireReconcile;
   // subscribe to live database changes — refreshes silently on any change,
   // INCLUDING runs happening on other machines/locations. The dashboard meter
   // updates live from those too.
+  const liveRefresh = () => {
+    // pull fresh data, then re-render whatever is on screen (numbers, report, review, dashboard)
+    syncFromDatabase(true).then(() => {
+      if (typeof renderReview==='function') renderReview();
+      if (typeof renderReport==='function') renderReport();
+      if (typeof renderLedger==='function') renderLedger();
+    }).catch(()=>{});
+    if (typeof refreshDashboard==='function') refreshDashboard();
+    if (typeof refreshReviewProgress==='function') refreshReviewProgress();
+  };
   if (typeof Cloud !== 'undefined' && Cloud.subscribeRealtime) {
-    Cloud.subscribeRealtime(() => { syncFromDatabase(true).then(()=>{ renderReview(); if(typeof renderLedger==='function') renderLedger(); }); refreshDashboard(); if(typeof refreshReviewProgress==='function') refreshReviewProgress(); });
+    Cloud.subscribeRealtime(liveRefresh);
   }
-  // periodic safety refresh (every 20s) in case a realtime event is missed, so
-  // the meter never goes stale even if the websocket drops.
-  setInterval(() => { if (document.getElementById('liveDash')) refreshDashboard(); }, 20000);
+  // periodic safety refresh (every 15s) in case a realtime event is missed or
+  // the websocket drops — pulls fresh data and re-renders the numbers AND the
+  // report, not just the meter, so live figures never go stale.
+  setInterval(liveRefresh, 15000);
 })();
 
 /* Danger zone — password-protected. Opens a dialog with two destructive options:
@@ -6898,7 +6958,7 @@ async function openBillEditor(hash){
     var _ext = (_urlExtM && _urlExtM[1]) || (_nameExtM && _nameExtM[1]) || 'pdf';
     var _dlName = ((editorState.invoice.invoice_no || 'bill') + '.' + _ext).replace(/[\/\\:*?"<>|]/g, '_');
     var _isImg = /\.(jpe?g|png|gif|tiff?|bmp|webp)(\?|$)/i.test(billUrl) || (_nameExtM && /jpe?g|png|gif|tiff?|bmp|webp/i.test(_nameExtM[1]));
-    var _link = '<a href="' + billUrl + '" target="_blank" rel="noopener" download="' + _dlName + '" class="dim" style="font-size:12px">\u2193 Download bill (' + _dlName + ')</a>';
+    var _link = '<a href="' + billUrl + '" target="_blank" rel="noopener" class="dim" style="font-size:12px">\u2197 Open bill in new tab</a>';
     var _viewer = _isImg
       ? '<img src="' + billUrl + '" alt="original bill" style="width:100%;max-height:66vh;object-fit:contain;border:1px solid var(--line);border-radius:8px;background:#fff">'
       : '<iframe src="' + billUrl + '" style="width:100%;height:66vh;border:1px solid var(--line);border-radius:8px"></iframe>';
