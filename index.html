@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='a9ee8160cc37';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='7c725ac6bea2';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -5211,6 +5211,8 @@ const FIELD_MAP = {
   service_type:{perApplicant:1, l:'TYPE', g:(r,a)=>a.service_type},
   location:{perApplicant:1, l:'LOCATION', g:(r,a)=>a.location},
   payment_date:{l:'PAYMENT DATE', g:r=>r.invoice.last_payment_date},
+  received_amount:{l:'RECEIVED AMOUNT', g:r=>r.invoice.received_paise==null?'':r.invoice.received_paise/100, n:1},
+  pending_amount:{l:'PENDING AMOUNT', g:r=>{ const inv=r.invoice; if(inv.pending_paise!=null) return inv.pending_paise/100; /* fall back to total-received when reconciliation didn't write pending explicitly */ const tot=inv.total_paise, rec=inv.received_paise; return (tot!=null)? (tot-(rec||0))/100 : ''; }, n:1},
   amount:{perApplicant:1, l:'AMOUNT', g:(r,a)=>mBasic(a), n:1},
   cgst:{perApplicant:1, l:'CGST', g:(r,a)=>mDiv(a.cgst_paise), n:1},
   sgst:{perApplicant:1, l:'SGST', g:(r,a)=>mDiv(a.sgst_paise), n:1},
@@ -5235,14 +5237,28 @@ const FIELD_MAP = {
   receipt_date:{perApplicant:1, l:'Case Receive Date', g:(r,a)=>a.receipt_date||''},
   gross_amount:{perApplicant:1, n:1, l:'Gross Total Amount', g:(r,a)=>mGross(r,a)},
 };
+/* Report layouts the team actually uses: three bill sets — All, Pending
+   (including partially received), Paid — each in two sub-types: one row per
+   BILL (total) or one row per APPLICANT. Each preset also sets the status
+   filter so picking it both chooses columns and shows the right bills.
+   `cols` = columns; `status` = settlement filter ('' = all). Applicant-wise
+   presets include applicant_name (a per-applicant column), which switches the
+   rows to one-per-applicant automatically. */
 const PRESETS = {
-  'Pending bills (reference layout)': ['report_date','state','zone','bank_name','branch_name','branch_email','applicant_name','service_type','invoice_number','payment_date','amount','tax_total','total_amount','payment_status'],
-  'Applicant billing detail': ['invoice_number','invoice_date','bank_name','branch_name','applicant_name','service_type','location','amount','tax_total','total_amount','allocation_method'],
-  'Audit trail': ['invoice_number','invoice_date','branch_name','applicant_name','amount','total_amount','verdict','source_file'],
-  'Bill check — face vs annexure': ['invoice_number','invoice_date','bank_name','branch_name','face_total','annexure_total','match_diff','match_status','rows_read','rows_printed','verdict','source_file'],
-  'Outstanding report': ['sr_no','receipt_date','sent_date','location','zone','bank_name','branch_name','branch_code','branch_email','applicant_name','service_type','invoice_number','invoice_date','visit_location','payment_date','amount','tax_total','gross_amount'],
+  'All Bills — total (one row per bill)': { status:'',
+    cols:['report_date','bank_name','segment','branch_name','branch_code','invoice_number','invoice_date','total_amount','received_amount','pending_amount','payment_status','payment_date'] },
+  'All Bills — applicant-wise': { status:'',
+    cols:['report_date','bank_name','branch_name','applicant_name','service_type','invoice_number','amount','tax_total','total_amount','received_amount','pending_amount','payment_status'] },
+  'Pending Bills (incl. partial) — total': { status:'__OUTSTANDING',
+    cols:['report_date','bank_name','segment','branch_name','branch_email','invoice_number','invoice_date','total_amount','received_amount','pending_amount','payment_status'] },
+  'Pending Bills (incl. partial) — applicant-wise': { status:'__OUTSTANDING',
+    cols:['report_date','bank_name','branch_name','branch_email','applicant_name','service_type','invoice_number','amount','tax_total','total_amount','received_amount','pending_amount','payment_status'] },
+  'Paid Bills — total': { status:'PAID',
+    cols:['report_date','bank_name','segment','branch_name','invoice_number','invoice_date','total_amount','received_amount','payment_date','payment_status'] },
+  'Paid Bills — applicant-wise': { status:'PAID',
+    cols:['report_date','bank_name','branch_name','applicant_name','service_type','invoice_number','amount','tax_total','total_amount','received_amount','payment_date'] },
 };
-let reportCols = PRESETS['Pending bills (reference layout)'].slice();
+let reportCols = PRESETS['All Bills — total (one row per bill)'].cols.slice();
 // The reference report labels a single ~18% column 'SGST'. That label is
 // preserved for audience familiarity, but it maps to tax_total — the canonical
 // fields stay distinct so GST validation is never corrupted by a source label.
@@ -5849,7 +5865,11 @@ $('#colChosen').addEventListener('drop', e => {
   reportCols = c; flashCol = __dragKey; __dragKey = null;
   renderReport();
 });
-$('#preset').onchange = e => { if(!e.target.value) return; reportCols = PRESETS[e.target.value].slice(); renderReport(); };
+$('#preset').onchange = e => { if(!e.target.value) return; const P = PRESETS[e.target.value]; if(!P) return;
+  reportCols = P.cols.slice();
+  if (typeof misFilter === 'object' && misFilter) misFilter.settlement = P.status || '';
+  if (typeof buildMisFilters === 'function') buildMisFilters();
+  renderReport(); };
 $('#expCsv').onclick = () => { const h = reportCols.map(colLabel);
   download('lumen-report.csv', new Blob([toCsv(h, reportRows())], {type:'text/csv'})); };
 /* One workbook, four sheets. The raw applicant rows are what you reconcile
