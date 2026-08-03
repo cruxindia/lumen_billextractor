@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='1663f6c26ff0';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='7b90fb2377bd';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2888,11 +2888,11 @@ const Cloud = {
     let storagePath = null;
     try {
       if (doc._pdfBuf || doc._sourceBlob) {
-        const { ext, mime } = this.billFileMeta(doc);
-        const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type: mime });
+        const { ext } = this.billFileMeta(doc);
+        const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type:'application/pdf' });
         storagePath = `${hash}.${ext}`;
         const up = await fetch(`${this.storageUrl}/object/bills/${storagePath}`, {
-          method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'Content-Type': mime, 'x-upsert':'true' },
+          method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key },
           body: blob });
         if (!up.ok) storagePath = null;
       }
@@ -3022,12 +3022,12 @@ const Cloud = {
      so the editor knows where to find it. One file, uploaded then dropped. */
   async stashReviewFile(doc){
     if (!doc._sourceBlob && !doc._pdfBuf) return false;
-    const { ext, mime } = this.billFileMeta(doc);
+    const { ext } = this.billFileMeta(doc);
     const path = `review/${doc.hash}.${ext}`;
-    const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type: mime });
+    const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type:'application/pdf' });
     try {
       const r = await fetch(`${this.storageUrl}/object/bills/${path}`, {
-        method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'Content-Type': mime, 'x-upsert':'true' },
+        method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'x-upsert':'true' },
         body: blob });
       if (r.ok) { doc._reviewFilePath = path;
         if (doc.invoice) doc.invoice.review_file_path = path;
@@ -3042,11 +3042,11 @@ const Cloud = {
 
   async stashBillFile(doc){
     if (!doc._pdfBuf && !doc._sourceBlob) return false;
-    const { ext, mime } = this.billFileMeta(doc);
+    const { ext } = this.billFileMeta(doc);
     const path = `ocr-pending/${doc.hash}.${ext}`;
-    const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type: mime });
+    const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type: 'application/pdf' });
     const r = await fetch(`${this.storageUrl}/object/bills/${path}`, {
-      method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'Content-Type': mime, 'x-upsert':'true' },
+      method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'x-upsert':'true' },
       body: blob });
     if (r.ok) { doc._stashPath = path; return true; }
     return false;
@@ -6196,29 +6196,25 @@ $('#expXlsx').onclick = async () => { if(!window.XLSX) return log('Excel writer 
     } else src = [blank];
 
     if (wantSub && perApplicant) {
-      // group consecutive rows by applicant
-      const groups = [];
-      src.forEach(row => { const nm=(row.applicant_name||'(unnamed)').trim(); const last=groups[groups.length-1];
-        if(last&&last.nm===nm) last.rows.push(row); else groups.push({nm, rows:[row]}); });
-      let docFirst = true;   // first output row of THIS invoice
-      groups.forEach(({nm, rows}) => {
-        sr += 1; z = !z;
-        const sub = {};
-        rows.forEach((row, idx) => {
-          row.__sr = idx===0 ? String(sr).padStart(4,'0') : '';
-          const cells = reportCols.map(k => FIELD_MAP[k].g(doc, row) ?? '');
-          reportCols.forEach((k,i)=>{ if(FIELD_MAP[k].n && typeof cells[i]==='number') {
-            // invoice-level columns are identical on every row — take once per bill, don't sum
-            if (FIELD_MAP[k].invoiceLevel) { if (docFirst && idx===0) sub[i]=cells[i]; }
-            else sub[i]=(sub[i]||0)+cells[i];
-          }});
-          pushCells(cells, 'body', z, docFirst);
-          docFirst = false;
-        });
-        // sub total row
-        const stotal = reportCols.map((k,i)=> i===0 ? 'Sub total' : (sub[i]!==undefined ? sub[i] : ''));
-        dataRows.push({ cells: stotal, style:'subtotal' });
+      // ONE sub-total per invoice (this doc), covering all its applicant/task rows.
+      sr += 1; z = !z;
+      const sub = {};
+      let docFirst = true;
+      src.forEach((row, idx) => {
+        row.__sr = idx===0 ? String(sr).padStart(4,'0') : '';
+        const cells = reportCols.map(k => FIELD_MAP[k].g(doc, row) ?? '');
+        reportCols.forEach((k,i)=>{ if(FIELD_MAP[k].n && typeof cells[i]==='number') {
+          // invoice-level columns (received/pending) are identical on every row —
+          // take once per invoice, don't sum across rows
+          if (FIELD_MAP[k].invoiceLevel) { if (docFirst) sub[i]=cells[i]; }
+          else sub[i]=(sub[i]||0)+cells[i];
+        }});
+        pushCells(cells, 'body', z, docFirst);
+        docFirst = false;
       });
+      // one sub-total row for the whole invoice
+      const stotal = reportCols.map((k,i)=> i===0 ? 'Sub total' : (sub[i]!==undefined ? sub[i] : ''));
+      dataRows.push({ cells: stotal, style:'subtotal' });
     } else {
       let docFirst = true;
       src.forEach(row => { z = !z; pushCells(reportCols.map(k => FIELD_MAP[k].g(doc,row) ?? ''), 'body', z, docFirst); docFirst = false; });
