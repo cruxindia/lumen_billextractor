@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='9d8adc7c735f';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='a9ee8160cc37';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2143,8 +2143,81 @@ function processView(view) {
     }
   }
 
+  /* --- Canonicalise the addressee so the SAME bank/branch reads identically
+     across every bill, instead of "BANK OF MAHARASHTRA-RETAIL" on one and
+     "MSME BANK OF MAHARASHTRA" on the next. The segment (Retail/MSME/etc.) is
+     PRESERVED separately in client_segment, never discarded — it just stops
+     polluting the client name and breaking master lookups. Branch prefixes the
+     bill generator adds ("BRANCH:-", ":- ", leading branch codes) are stripped
+     so the branch reads as a real place name. All original values remain in the
+     field_confidence evidence; nothing is invented. */
+  (function normalizeAddressee(){
+    let seg = null;
+    const pullSeg = (s) => {
+      if (!s) return s;
+      // capture and remove a Retail / MSME / Housing-Finance segment marker
+      const m = s.match(/\b(RETAIL|MSME|HFB|HOUSING\s*FINANCE)\b/i);
+      if (m) { seg = seg || m[1].toUpperCase().replace(/\s+/g,' '); }
+      return s;
+    };
+    if (v.client_raw) {
+      let c = String(v.client_raw).trim();
+      pullSeg(c);
+      // Canonical bank name: collapse "MSME BANK OF MAHARASHTRA",
+      // "BANK OF MAHARASHTRA-RETAIL", "BANK OF MAHARASHTRA- RETAIL" -> the bare
+      // "BANK OF MAHARASHTRA". Detect the "(X )BANK OF X" core and keep only it.
+      const bm = /\b((?:[A-Z][A-Za-z]+\s+)?BANK\s+OF\s+[A-Za-z]+)\b/i.exec(c);
+      if (bm) {
+        // canonical bank name: drop any leading segment word (MSME/RETAIL/HFB)
+        // that got pulled into the match, so "MSME BANK OF MAHARASHTRA" and
+        // "BANK OF MAHARASHTRA-RETAIL" both land on "BANK OF MAHARASHTRA".
+        c = bm[1].replace(/^\s*(MSME|RETAIL|HFB|HOUSING\s*FINANCE)\s+/i,'')
+                 .replace(/\s+/g,' ').trim().toUpperCase();
+      } else {
+        // not a bank: just trim trailing segment noise like "- RETAIL"
+        c = c.replace(/[\s,\-]+(RETAIL|MSME|HFB|HOUSING\s*FINANCE)\s*$/i,'').replace(/[\s,\-]+$/,'').trim();
+      }
+      if (c && c !== v.client_raw) { v.client_raw = c; v._client_normalized = true; }
+    }
+    if (v.branch_raw) {
+      let b = String(v.branch_raw).trim();
+      pullSeg(b);
+      b = b
+        .replace(/^\s*BRANCH\s*[:\-]+\s*/i,'')      // "BRANCH:-UDGIR" -> "UDGIR"
+        .replace(/^\s*[:\-]+\s*/,'')                 // ":- RETAIL HFB..." leading ":-"
+        .replace(/^\s*(RETAIL|MSME)\s+/i,'')         // leading segment word on branch
+        .replace(/\bBRANCH\s*NAME\s*(AND\s*CODE)?\b/i,'') // placeholder "BRANCH NAME"
+        .replace(/\s+/g,' ').replace(/^[\s,\-]+|[\s,\-]+$/g,'').trim();
+      /* A branch code is a standalone 1-4 digit number that leads or trails the
+         name — "38 LATUR MAIN" (38 = code, LATUR MAIN = name), "GUWAHATI 1275",
+         "CHINCHWAD PUNE BRANCH - 127". Pull it out into branch_code and drop it
+         from the name, so the same branch reads the same whichever side the code
+         sits. A number in the MIDDLE of a name is left alone — only the very
+         first or very last token counts, and only if the remainder still has a
+         letter (so a code-only branch keeps its digits as the name). */
+      let code = null;
+      // parenthetical numeric code: "BOM KARAD (188)" -> code 188, name "BOM KARAD".
+      // Only when the parens hold digits ONLY, so "(SAWALIKHEDA)" is never touched.
+      let paren = b.match(/^(.*\S)\s*\((\d{1,5})\)\s*$/);
+      if (paren) { code = paren[2]; b = paren[1].trim(); }
+      let lead = b.match(/^(\d{1,4})\s+(.*\S.*)$/);   // "38 LATUR MAIN"
+      let trail = b.match(/^(.*\S.*?)\s*[-\s]\s*(\d{1,4})$/); // "GUWAHATI 1275" / "... - 127"
+      if (!code && lead && /[A-Za-z]/.test(lead[2])) { code = lead[1]; b = lead[2].trim(); }
+      else if (!code && trail && /[A-Za-z]/.test(trail[1])) {
+        code = trail[2];
+        // "CHINCHWAD PUNE BRANCH - 127" -> drop the now-dangling "BRANCH" left
+        // behind by the code. Only here (code was after BRANCH), never on a bare
+        // "HALDIA BRANCH" that carries no code, so master names stay matchable.
+        b = trail[1].replace(/\s+BRANCH\s*$/i,'').replace(/[\s,\-]+$/,'').trim();
+      }
+      if (code) v.branch_code = code;
+      if (b && b !== v.branch_raw) { v.branch_raw = b; v._branch_normalized = true; }
+      else if (!b) { v.branch_raw = null; }   // was pure placeholder noise
+    }
+    if (seg) v.client_segment = seg;
+  })();
+
   return {
-    id: newId('doc'), filename: view.filename,
     documentType: docType, typeConfidence: cls ? cls.confidence : 0, classificationEvidence: cls ? cls.evidence : '',
     invoice: {
       id: newId('inv'),
@@ -2152,7 +2225,8 @@ function processView(view) {
       invoice_no_normalized: v.invoice_no ? String(v.invoice_no).toUpperCase().replace(/\s+/g,'') : null,
       invoice_date: v.invoice_date || null, due_date: v.due_date || null, period: v.period || null,
       client_raw: v.client_raw || null, branch_raw: v.branch_raw || null,
-      branch_code: (function(b){ if(!b) return null; var m=b.match(/(?:-\s*|\b)(\d{1,4})\s*$/); return m?m[1]:null; })(v.branch_raw) || null,
+      client_segment: v.client_segment || null,
+      branch_code: v.branch_code || (function(b){ if(!b) return null; var m=b.match(/(?:-\s*|\b)(\d{1,4})\s*$/); return m?m[1]:null; })(v.branch_raw) || null,
       branch_email: v.branch_email || null, sac_hsn: v.sac_hsn || null,
       supplier_gstin: v.supplier_gstin || null, recipient_gstin: v.recipient_gstin || null, supplier_pan: v.supplier_pan || null,
       taxable_paise: v.taxable_paise ?? null, cgst_paise: v.cgst_paise ?? null, sgst_paise: v.sgst_paise ?? null,
@@ -5126,6 +5200,7 @@ const FIELD_MAP = {
   state:{l:'STATE', g:r=>L.STATES[(r.invoice.recipient_gstin||'').slice(0,2)]||''},
   zone:{l:'ZONE', g:()=>''},
   bank_name:{l:'BANK NAME', g:r=>r.invoice.client_raw},
+  segment:{l:'SEGMENT', g:r=>r.invoice.client_segment||''},
   branch_name:{l:'BRANCH NAME', g:r=>r.invoice.branch_raw},
   branch_email:{l:'BRANCH MAIL ID', g:r=>r.invoice.branch_email},
   applicant_name:{perApplicant:1, l:'APPLICANT NAME', g:(r,a)=>a.applicant_name},
