@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='7c725ac6bea2';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='3256962174e4';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -1313,7 +1313,23 @@ function extractDetail(view) {
         }
       }
       if (!nc || nc.value == null || typeof nc.value !== 'string' || !nc.value.trim()) continue;
-      const name = nc.value.trim();
+      let name = nc.value.trim();
+      /* Date-guard. On some layouts (e.g. the MP annexure "Date of Reciept |
+         Applicant Name") the applicant column resolves one cell too far left and
+         captures the receipt DATE as the name. A bare date is never a name: if
+         the whole cell parses as a date, step right to find the real name. */
+      const looksLikeBareDate = s => { const t = String(s).trim();
+        return /^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}$/.test(t) || /^\d{4}-\d{1,2}-\d{1,2}$/.test(t) || (parseDate(t) != null && !/[A-Za-z]{2,}/.test(t)); };
+      if (looksLikeBareDate(name)) {
+        let fixed = null;
+        for (let dc = colMap.applicant + 1; dc <= colMap.applicant + 2; dc++) {
+          const nx = g.cells[cref(r, dc)];
+          const nv = nx && nx.value != null ? String(nx.value).trim() : '';
+          if (nv && /[A-Za-z]{2,}/.test(nv) && !looksLikeBareDate(nv) && !TERMINATORS.some(p => p.test(nv))) { fixed = nv; break; }
+        }
+        if (fixed) name = fixed;
+        else continue; /* still a date and no name to the right — skip this row rather than record a date as a customer */
+      }
       if (TERMINATORS.some(p => p.test(name))) break;
       const rec = { applicant_name: name, locator: { sheet: g.name, row: r } };
       for (const k in colMap) {
@@ -2853,17 +2869,30 @@ const Cloud = {
      its details in failed_uploads, so a human can fix it while viewing the bill. */
   storageUrl: 'https://czdjbbhxboweawqbjywr.supabase.co/storage/v1',
 
+  /* Resolve a real file extension + MIME for a bill. Never returns 'bill' —
+     a file stored as <hash>.bill will not open. Falls back to pdf. */
+  billFileMeta(doc){
+    const MIME = { pdf:'application/pdf', xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      xlsm:'application/vnd.ms-excel.sheet.macroEnabled.12', xls:'application/vnd.ms-excel',
+      png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif', tif:'image/tiff', tiff:'image/tiff', webp:'image/webp' };
+    let ext = ((doc.filename||'').split('.').pop()||'').toLowerCase();
+    if (!ext || !MIME[ext]) {
+      const t = (doc._sourceBlob && doc._sourceBlob.type) || (doc._pdfBuf ? 'application/pdf' : '');
+      ext = Object.keys(MIME).find(k => MIME[k] === t) || 'pdf';
+    }
+    return { ext, mime: MIME[ext] || 'application/pdf' };
+  },
+
   async saveFailedBill(doc, errorReason){
     const hash = doc.hash;
     let storagePath = null;
-    // upload the original file to the `bills` bucket so it can be viewed later
     try {
       if (doc._pdfBuf || doc._sourceBlob) {
-        const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type:'application/pdf' });
-        const ext = (doc.filename||'bill').split('.').pop() || 'pdf';
+        const { ext, mime } = this.billFileMeta(doc);
+        const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type: mime });
         storagePath = `${hash}.${ext}`;
         const up = await fetch(`${this.storageUrl}/object/bills/${storagePath}`, {
-          method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key },
+          method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'Content-Type': mime, 'x-upsert':'true' },
           body: blob });
         if (!up.ok) storagePath = null;
       }
@@ -2993,12 +3022,12 @@ const Cloud = {
      so the editor knows where to find it. One file, uploaded then dropped. */
   async stashReviewFile(doc){
     if (!doc._sourceBlob && !doc._pdfBuf) return false;
-    const ext = (doc.filename||'bill').split('.').pop() || 'pdf';
+    const { ext, mime } = this.billFileMeta(doc);
     const path = `review/${doc.hash}.${ext}`;
-    const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type:'application/pdf' });
+    const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type: mime });
     try {
       const r = await fetch(`${this.storageUrl}/object/bills/${path}`, {
-        method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'x-upsert':'true' },
+        method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'Content-Type': mime, 'x-upsert':'true' },
         body: blob });
       if (r.ok) { doc._reviewFilePath = path;
         if (doc.invoice) doc.invoice.review_file_path = path;
@@ -3013,11 +3042,11 @@ const Cloud = {
 
   async stashBillFile(doc){
     if (!doc._pdfBuf && !doc._sourceBlob) return false;
-    const ext = (doc.filename||'bill').split('.').pop() || 'pdf';
+    const { ext, mime } = this.billFileMeta(doc);
     const path = `ocr-pending/${doc.hash}.${ext}`;
-    const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type: 'application/pdf' });
+    const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type: mime });
     const r = await fetch(`${this.storageUrl}/object/bills/${path}`, {
-      method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'x-upsert':'true' },
+      method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'Content-Type': mime, 'x-upsert':'true' },
       body: blob });
     if (r.ok) { doc._stashPath = path; return true; }
     return false;
@@ -5211,8 +5240,8 @@ const FIELD_MAP = {
   service_type:{perApplicant:1, l:'TYPE', g:(r,a)=>a.service_type},
   location:{perApplicant:1, l:'LOCATION', g:(r,a)=>a.location},
   payment_date:{l:'PAYMENT DATE', g:r=>r.invoice.last_payment_date},
-  received_amount:{l:'RECEIVED AMOUNT', g:r=>r.invoice.received_paise==null?'':r.invoice.received_paise/100, n:1},
-  pending_amount:{l:'PENDING AMOUNT', g:r=>{ const inv=r.invoice; if(inv.pending_paise!=null) return inv.pending_paise/100; /* fall back to total-received when reconciliation didn't write pending explicitly */ const tot=inv.total_paise, rec=inv.received_paise; return (tot!=null)? (tot-(rec||0))/100 : ''; }, n:1},
+  received_amount:{perApplicant:1, l:'RECEIVED AMOUNT', n:1, g:(r,a)=>{ if(a && a.__rowIdx>0) return ''; return r.invoice.received_paise==null?'':r.invoice.received_paise/100; }},
+  pending_amount:{perApplicant:1, l:'PENDING AMOUNT', n:1, g:(r,a)=>{ if(a && a.__rowIdx>0) return ''; const inv=r.invoice; if(inv.pending_paise!=null) return inv.pending_paise/100; const tot=inv.total_paise, rec=inv.received_paise; return (tot!=null)? (tot-(rec||0))/100 : ''; }},
   amount:{perApplicant:1, l:'AMOUNT', g:(r,a)=>mBasic(a), n:1},
   cgst:{perApplicant:1, l:'CGST', g:(r,a)=>mDiv(a.cgst_paise), n:1},
   sgst:{perApplicant:1, l:'SGST', g:(r,a)=>mDiv(a.sgst_paise), n:1},
@@ -5276,7 +5305,7 @@ function reportRows(){
                    igst_paise:r.invoice.tax_total_paise||0, total_paise:r.invoice.total_paise||0,
                    allocation_method:'—'};
     const rows = perApplicant ? (r.applicants.length ? r.applicants : [blank]) : [blank];
-    rows.forEach(a => { const row = reportCols.map(k => FIELD_MAP[k].g(r,a) ?? ''); row.__hash = r.hash || r.content_hash || (r.invoice && r.invoice.content_hash); out.push(row); });
+    rows.forEach((a, __i) => { a.__rowIdx = __i; const row = reportCols.map(k => FIELD_MAP[k].g(r,a) ?? ''); row.__hash = r.hash || r.content_hash || (r.invoice && r.invoice.content_hash); out.push(row); });
   });
   return out;
 }
@@ -6859,12 +6888,20 @@ async function openBillEditor(hash){
       </div>
       <div class="editor-cols">
         <div class="editor-view">
-          ${billUrl ? (
-            /\.(jpe?g|png|gif|tiff?|bmp|webp)(\?|$)/i.test(billUrl) || (editorState.invoice.source_file||'').match(/\.(jpe?g|png|gif|tiff?|bmp|webp)$/i)
+          ${billUrl ? (() => {
+            const srcName = editorState.invoice.source_file || '';
+            const urlExtM = billUrl.match(/\.(pdf|xlsx?|xlsm|jpe?g|png|gif|tiff?|webp)(\?|$)/i);
+            const nameExtM = srcName.match(/\.(pdf|xlsx?|xlsm|jpe?g|png|gif|tiff?|webp)$/i);
+            const ext = (urlExtM && urlExtM[1]) || (nameExtM && nameExtM[1]) || 'pdf';
+            const dlName = ((editorState.invoice.invoice_no || 'bill') + '.' + ext).replace(/[\/\\:*?"<>|]/g,'_');
+            const isImg = /\.(jpe?g|png|gif|tiff?|bmp|webp)(\?|$)/i.test(billUrl) || nameExtM && /jpe?g|png|gif|tiff?|bmp|webp/i.test(nameExtM[1]);
+            const link = `<a href="${billUrl}" target="_blank" rel="noopener" download="${dlName}" class="dim" style="font-size:12px">\u2193 Download bill (${dlName})</a>`;
+            return isImg
               ? `<img src="${billUrl}" alt="original bill" style="width:100%;max-height:66vh;object-fit:contain;border:1px solid var(--line);border-radius:8px;background:#fff">
-                 <div style="margin-top:6px"><a href="${billUrl}" target="_blank" rel="noopener" class="dim" style="font-size:12px">↗ Open bill in new tab</a></div>`
+                 <div style="margin-top:6px">${link}</div>`
               : `<iframe src="${billUrl}" style="width:100%;height:66vh;border:1px solid var(--line);border-radius:8px"></iframe>
-                 <div style="margin-top:6px"><a href="${billUrl}" target="_blank" rel="noopener" class="dim" style="font-size:12px">↗ Open bill in new tab (if it doesn't show above)</a></div>`)
+                 <div style="margin-top:6px">${link}</div>`;
+          })()
             : `<div class="editor-noview">No stored image for this bill — you can still edit every field on the right and save.<br><span class="dim">${esc(window.__editorNoFileReason||'')}</span></div>`}
         </div>
         <div class="editor-edit">
