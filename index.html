@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='e244472ef5eb';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='510dd181655a';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -7263,6 +7263,35 @@ $('#cloudCountFiles') && ($('#cloudCountFiles').onclick = async () => {
       lines.push(`  ${prefix||'(root)'} : ${names.length} file(s)`);
     }
     lines.push('', `TOTAL: ${grand} file(s)`);
+    // Reconcile against the review set: which review bills have / don't have a
+    // stored file. This explains any gap between the file count and the review
+    // count (a review bill with no stored file simply shows no viewable file).
+    try {
+      const hashOf = n => String(n).replace(/^.*\//,'').replace(/\.[a-z0-9]+$/i,'');
+      const stored = new Set();
+      for (const prefix of folders) (await Cloud.listBillFiles(prefix)).forEach(n => stored.add(hashOf(n)));
+      const rows = await Cloud.pullAll();
+      const checks = {};
+      try { const cr = await fetch(`${Cloud.url}/checks?select=content_hash,status,severity&status=eq.FAIL`,
+        { headers: Cloud.headers({ 'Range':'0-199999' }) });
+        if (cr.ok) (await cr.json()).forEach(c => { (checks[c.content_hash]=checks[c.content_hash]||[]).push(c); }); } catch(_){}
+      let reviewBills = 0, withFile = 0, noFile = [];
+      (rows||[]).forEach(r => {
+        const needs = (r.verdict && r.verdict !== 'PROVEN')
+          || (checks[r.content_hash]||[]).some(c => c.severity!=='warn' && c.severity!=='warning' && c.severity!=='info');
+        if (!needs) return;
+        reviewBills++;
+        if (stored.has(r.content_hash)) withFile++; else noFile.push(r.invoice_no || r.content_hash);
+      });
+      let failedNoFile = 0;
+      try { const fr = await Cloud.fetchFailed(); (fr||[]).forEach(f => { reviewBills++; if (stored.has(f.content_hash)) withFile++; else { failedNoFile++; noFile.push(f.invoice_no || f.content_hash); } }); } catch(_){}
+      lines.push('', 'REVIEW SET vs STORED FILES', '',
+        `  review bills (DB + failed): ${reviewBills}`,
+        `  with a stored file:         ${withFile}`,
+        `  with NO stored file:        ${noFile.length}`);
+      if (noFile.length) lines.push('', '  bills missing a file (still reviewable, just no preview):',
+        ...noFile.slice(0,20).map(x=>`    • ${x}`), noFile.length>20?`    …and ${noFile.length-20} more`:'');
+    } catch(_){}
   } catch(e){ lines.push('Count failed: '+e.message); }
   $('#cloudBody').innerHTML = `<pre style="white-space:pre-wrap;font-size:12px;line-height:1.5">${esc(lines.join('\n'))}</pre>`;
   btn.disabled = false; btn.textContent = 'Count stored files';
