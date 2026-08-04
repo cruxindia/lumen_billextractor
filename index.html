@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='62d40adce2b2';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='0d41dab9fe76';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -6222,13 +6222,19 @@ $('#expXlsx').onclick = async () => { if(!window.XLSX) return log('Excel writer 
   };
 
   let z = false, sr = 0;
-  DB.docs.forEach(doc => {
+  // Use the SAME source the on-screen report uses (database rows via misFiltered),
+  // not raw DB.docs — otherwise a session with data loaded from the database
+  // (a fresh open, after clearing, or another user) exports completely blank.
+  const exportSource = (typeof misFiltered === 'function')
+    ? misFiltered()
+    : ((window.misRows && window.misRows.length) ? window.misRows : DB.docs);
+  exportSource.forEach(doc => {
     const blank = {applicant_name:'', taxable_paise:doc.invoice.taxable_paise||0, cgst_paise:0, sgst_paise:0,
                    igst_paise:doc.invoice.tax_total_paise||0, total_paise:doc.invoice.total_paise||0, allocation_method:'—'};
     let src;
     if (perApplicant) {
       const raw = ((doc.candidates && doc.candidates._applicant_rows || [])[0] || {}).normalized || [];
-      src = raw.length ? raw : (doc.applicants.length ? doc.applicants : [blank]);
+      src = raw.length ? raw : (doc.applicants && doc.applicants.length ? doc.applicants : [blank]);
     } else src = [blank];
 
     if (wantSub && perApplicant && groupBy === 'applicant') {
