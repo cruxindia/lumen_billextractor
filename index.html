@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='0d41dab9fe76';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='81017d4182b1';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -551,12 +551,15 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
       </div><!-- /dbSyncBody -->
 
       <div id="dbReconcileBody" style="display:none">
-        <p class="sub">Upload a bank statement / collection sheet. Each credit is matched to its invoice,
-           totalled, and compared to the invoice's real total in the database — then each invoice is marked
-           <b>Paid</b>, <b>Partially Paid</b> or <b>Pending</b>, with the pending amount. Nothing is written
-           until you review the preview and confirm.</p>
+        <p class="sub">Reconcile the database against a file. Choose what kind of file you are uploading,
+           review the preview, then confirm. Nothing is written until you confirm.</p>
+        <div class="row" style="gap:16px;margin:12px 0;flex-wrap:wrap">
+          <label class="chk"><input type="radio" name="recMode" value="pending" checked> <b>Pending-invoice list</b> — invoices still owed</label>
+          <label class="chk"><input type="radio" name="recMode" value="received"> <b>Received-payments file</b> — payments/credits received</label>
+        </div>
+        <div class="assure" id="recModeHelp" style="margin:0 0 12px"><span>ℹ</span><span id="recModeHelpText">A <b>pending list</b> contains only the invoices that are still owed. Invoices <b>not in the file</b> are marked fully <b>Paid</b> (Received = Total, Pending = 0). Invoices <b>in the file</b> take their pending/received amount from the file.</span></div>
         <div class="row" style="gap:8px;margin:14px 0;flex-wrap:wrap">
-          <button class="btn pri" id="recPick">Choose statement file</button>
+          <button class="btn pri" id="recPick">Choose file</button>
           <input type="file" id="recFile" accept=".xlsx,.xls,.csv" hidden>
           <span class="dim" id="recStatus"></span>
         </div>
@@ -3057,6 +3060,14 @@ const Cloud = {
     if (r.ok) { doc._stashPath = path; return true; }
     return false;
   },
+  /* Delete the temporary ocr-pending stash file for a bill, if any. Used after
+     OCR so a bill never keeps a file it doesn't need (storage scope). */
+  async deleteStash(doc){
+    if (!doc || !doc._stashPath) return false;
+    try { await fetch(`${this.storageUrl}/object/bills/${doc._stashPath}`,
+      { method:'DELETE', headers:{ 'apikey':this.key, 'Authorization':'Bearer '+this.key } }); } catch(_){}
+    doc._stashPath = null; return true;
+  },
   async fetchBillFile(path){
     try {
       const signed = await this.signedBillUrl(path);
@@ -4184,18 +4195,19 @@ async function ingest(fileList){
     }
     try {
       await Cloud.enrichFromMaster(r);
-      await Cloud.pushOne(r);
-      r._pushed = true; pushedCount++;
-      if (typeof Pipeline!=='undefined') Pipeline.stats.pushed++;   // confirmed
-      // Store the ORIGINAL file so it can be viewed when someone opens this bill
-      // to fix it. Previously only image/OCR bills were stored, so most bills had
-      // no viewable file in the editor. Now every bill keeps its source. Best-
-      // effort: a storage failure never blocks the (already-succeeded) data push.
+      // Store the ORIGINAL file FIRST, so its path is written into the invoice row
+      // by pushOne. (Previously the stash ran AFTER pushOne, so review_file_path
+      // was set only in memory and never persisted — which is why bills loaded
+      // from the database showed no file link.) Best-effort: a storage failure
+      // never blocks the data push.
       try {
         if ((r._sourceBlob || r._pdfBuf) && !r.invoice.review_file_path) {
           await Cloud.stashReviewFile(r);
         }
       } catch(_){}
+      await Cloud.pushOne(r);
+      r._pushed = true; pushedCount++;
+      if (typeof Pipeline!=='undefined') Pipeline.stats.pushed++;   // confirmed
       DIAG.info('push', `${wname}: saved ${r.filename}`, { worker:wid, invoice: r.invoice.invoice_no });
       return 'pushed';
     } catch(e){
@@ -4394,10 +4406,30 @@ async function runOcrPass(){
           await Cloud.saveFailedBill(d, reason);
           DIAG && DIAG.warn('push', `QA sent ${d.filename} back for rectification (P1) — saved to database`);
         } catch(e){ DIAG && DIAG.error('push', `QA kick but could NOT save ${d.filename}`, { reason:e.message }); }
+        // saveFailedBill stored the file at the root path; remove the temporary
+        // ocr-pending copy so we don't keep two files for one bill.
+        await Cloud.deleteStash(d);
         delete d._pdfBuf; d._hasImagePage = false;
         return true;   // processed; now persisted and waiting in Review
       }
-      try { await Cloud.enrichFromMaster(d); await Cloud.pushOne(d); d._pushed = true;
+      // STORAGE SCOPE: only bills that NEED REVIEW keep a stored file. A bill that
+      // is proven with no blocking checks does not need review, so its file is not
+      // kept — we delete the temporary ocr-pending stash and store nothing.
+      const ocrNeedsReview = (d.verdict && d.verdict !== 'PROVEN')
+        || ((d.checks||[]).some(c => c.status === 'FAIL' && c.severity !== 'warn' && c.severity !== 'warning' && c.severity !== 'info'));
+      try {
+        await Cloud.enrichFromMaster(d);
+        if (ocrNeedsReview) {
+          // move the file into the review area (one copy), then push so the row
+          // carries review_file_path
+          try { if ((d._sourceBlob || d._pdfBuf || d._stashPath) && !d.invoice.review_file_path) {
+            if (!d._sourceBlob && !d._pdfBuf && d._stashPath) {
+              const b = await Cloud.fetchBillFile(d._stashPath); if (b) d._pdfBuf = b;
+            }
+            await Cloud.stashReviewFile(d);
+          } } catch(_){}
+        }
+        await Cloud.pushOne(d); d._pushed = true;
         Pipeline.stats.pushed++;   // confirmed only
       } catch(e){
         Pipeline.stats.saveFailed = (Pipeline.stats.saveFailed||0)+1;
@@ -4405,8 +4437,10 @@ async function runOcrPass(){
         try { await Cloud.saveFailedBill(d, 'Push failed (OCR): '+e.message); } catch(_){}
       }
       delete d._pdfBuf; d._hasImagePage = false;
-      if (d._stashPath) { try { await fetch(`${Cloud.storageUrl}/object/bills/${d._stashPath}`,
-        { method:'DELETE', headers:{ 'apikey':Cloud.key, 'Authorization':'Bearer '+Cloud.key } }); } catch(_){} d._stashPath = null; }
+      // always remove the temporary ocr-pending stash: for review bills the file
+      // now lives under review/ (or root via saveFailedBill); for clean bills we
+      // keep nothing at all.
+      await Cloud.deleteStash(d);
       if (done < 3) log(`  ${d.filename}: ${((Date.now()-tFile)/1000).toFixed(1)}s`
         + (diag ? ` (render ${diag.render}ms + OCR ${diag.ocr}ms)` : ''), 'dim');
       return true;
@@ -5247,7 +5281,7 @@ const FIELD_MAP = {
   location:{perApplicant:1, l:'LOCATION', g:(r,a)=>a.location},
   payment_date:{l:'PAYMENT DATE', g:r=>r.invoice.last_payment_date},
   received_amount:{l:'RECEIVED AMOUNT', n:1, invoiceLevel:1, g:r=>r.invoice.received_paise==null?'':r.invoice.received_paise/100},
-  pending_amount:{l:'PENDING AMOUNT', n:1, invoiceLevel:1, g:r=>{ const inv=r.invoice; if(inv.pending_paise!=null) return inv.pending_paise/100; const tot=inv.total_paise, rec=inv.received_paise; return (tot!=null)? (tot-(rec||0))/100 : ''; }},
+  pending_amount:{l:'PENDING AMOUNT', n:1, invoiceLevel:1, g:r=>{ const inv=r.invoice; const tot=inv.total_paise; if(tot==null) return ''; const rec=inv.received_paise||0; return (tot-rec)/100; }},
   amount:{perApplicant:1, l:'AMOUNT', g:(r,a)=>mBasic(a), n:1},
   cgst:{perApplicant:1, l:'CGST', g:(r,a)=>mDiv(a.cgst_paise), n:1},
   sgst:{perApplicant:1, l:'SGST', g:(r,a)=>mDiv(a.sgst_paise), n:1},
@@ -6583,6 +6617,308 @@ function reconcilePending(parsed, invoices){
 window.parseStatement = parseStatement;
 window.reconcilePending = reconcilePending;
 
+/* ---------- RECEIVED-PAYMENTS reconciliation ----------
+   The uploaded file is a list of payments/credits actually received. For each
+   payment we must find WHICH invoice it settles, then set that invoice's
+   received amount (and pending = total - received).
+
+   Matching order for each payment:
+     1) explicit invoice-number column, if present
+     2) invoice number(s) found INSIDE the narrative long text (there can be
+        several invoice numbers in one narration)
+     3) by amount received — allowing net/gross, with/without TDS (2% u/s 194C),
+        and small GST/rounding differences
+   GROUND RULE (all methods): the payment's "received from" client AND branch
+   must EXACTLY match the invoice's client and branch. A match that fails the
+   client/branch check is rejected. */
+
+// invoice-number shapes seen across clients, e.g. PUN-2508-1360, ROMG-2603-319425,
+// HYD-2512-3026, MP-2605-0098, CHE-2505-0883, INVOICE-LUK-2604, KLP-2601-1772
+const INV_IN_TEXT_RX = /\b([A-Z]{2,6}(?:-[A-Z]{2,6})?-\d{3,6}-\d{2,6}|[A-Z]{2,6}-\d{3,4})\b/gi;
+
+function invoicesInText(text){
+  if (!text) return [];
+  const found = new Set();
+  let m; INV_IN_TEXT_RX.lastIndex = 0;
+  while ((m = INV_IN_TEXT_RX.exec(String(text))) !== null) found.add(normInv(m[1]));
+  return [...found];
+}
+
+/* Infer what each column is from its DATA (and header, if any is clear). The
+   payments file format changes constantly, so we never rely on header names:
+   we profile every column's values and assign roles by the strongest evidence.
+   Roles: invoice, amount(received), narration, client, branch, date, tds. */
+function profilePaymentColumns(rows, hdrIdx, invoices){
+  const headerRow = hdrIdx>=0 ? rows[hdrIdx].map(x=>String(x==null?'':x).toLowerCase().trim()) : [];
+  const dataRows = rows.slice(hdrIdx+1).filter(r=>r && r.some(c=>c!=null && String(c).trim()!==''));
+  const nCols = rows.reduce((m,r)=>Math.max(m, r?r.length:0), 0);
+  const numOf = v => { if(v==null||String(v).trim()==='')return null; const n=Number(String(v).replace(/[,₹\s]/g,'')); return isFinite(n)?n:null; };
+  const looksDate = v => { if(v==null)return false; if(v instanceof Date)return true; const s=String(v).trim();
+    return /^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}$/.test(s) || /^\d{4}-\d{1,2}-\d{1,2}/.test(s) || /\d{1,2}[-\s][A-Za-z]{3}[-\s]\d{2,4}/.test(s); };
+  const hasInvNo = v => v!=null && invoicesInText(v).length>0;
+  // known client & branch names from the database, normalised, for content matching
+  const kc = s => String(s||'').toUpperCase().replace(/[^A-Z0-9]+/g,' ').trim();
+  const clientSet = new Set((invoices||[]).map(iv=>kc(iv.client_raw)).filter(Boolean));
+  const branchSet = new Set((invoices||[]).map(iv=>kc(iv.branch_raw)).filter(Boolean));
+  const matchFrac = (vals, set) => { if(!set.size||!vals.length) return 0; let hit=0; vals.forEach(v=>{ if(set.has(kc(v))) hit++; }); return hit/vals.length; };
+
+  const stats = [];
+  for (let c=0;c<nCols;c++){
+    const vals = dataRows.map(r=>r[c]).filter(v=>v!=null && String(v).trim()!=='');
+    const n = vals.length || 1;
+    const nums = vals.map(numOf).filter(v=>v!=null);
+    stats.push({
+      c, filled: vals.length, total: dataRows.length,
+      numFrac: nums.length/n,
+      dateFrac: vals.filter(looksDate).length/n,
+      invFrac: vals.filter(hasInvNo).length/n,
+      avgLen: vals.reduce((a,v)=>a+String(v).length,0)/n,
+      wordyFrac: vals.filter(v=>/\s/.test(String(v).trim()) && /[A-Za-z]/.test(String(v))).length/n,
+      alphaFrac: vals.filter(v=>/[A-Za-z]/.test(String(v))).length/n,
+      maxNum: nums.length? Math.max(...nums.map(Math.abs)) : 0,
+      medNum: nums.length? nums.map(Math.abs).sort((a,b)=>a-b)[Math.floor(nums.length/2)] : 0,
+      header: headerRow[c]||'',
+      distinct: new Set(vals.map(v=>String(v).trim().toUpperCase())).size,
+      clientMatch: matchFrac(vals, clientSet),   // fraction of cells equal to a known DB client
+      branchMatch: matchFrac(vals, branchSet),   // fraction equal to a known DB branch
+    });
+  }
+
+  const hMatch = (h, re) => h && re.test(h);
+  const used = new Set();
+  const pick = (scorer) => {
+    let best=-1, bestScore=0;
+    stats.forEach(s => { if(used.has(s.c)) return; const sc = scorer(s); if(sc>bestScore){bestScore=sc; best=s.c;} });
+    if(best>=0 && bestScore>0){ used.add(best); return best; }
+    return -1;
+  };
+
+  const cInv = pick(s => (s.invFrac>0.4?s.invFrac:0) + (hMatch(s.header,/invoice|inv\b|bill\s*no/)?0.3:0));
+  const cDate = pick(s => (s.dateFrac>0.6?s.dateFrac:0) + (hMatch(s.header,/date/)?0.2:0));
+  // CLIENT first, by strong content evidence (values equal known DB clients), else header hint
+  const cClient = pick(s => {
+    if (s.alphaFrac < 0.4) return 0;
+    let sc = s.clientMatch * 1.2;                       // content match dominates
+    if (hMatch(s.header,/client|bank|received\s*from|payer|remitter|customer|party/)) sc += 0.5;
+    return sc;
+  });
+  // BRANCH next, by content match to known DB branches, else header hint
+  const cBranch = pick(s => {
+    if (s.alphaFrac < 0.4) return 0;
+    let sc = s.branchMatch * 1.2;
+    if (hMatch(s.header,/branch|location|place|city/)) sc += 0.6;
+    return sc;
+  });
+  // AMOUNT / received
+  const cRecv = pick(s => {
+    if (s.numFrac < 0.7) return 0;
+    let sc = s.numFrac*0.5;
+    if (s.medNum >= 50 && s.medNum <= 5e7) sc += 0.4;
+    if (s.distinct > Math.max(2, s.filled*0.3)) sc += 0.1;
+    if (hMatch(s.header,/received|credit|amount|paid|deposit|collection|value|neft|imps|rtgs|cr\b/)) sc += 0.5;
+    if (hMatch(s.header,/tds|gst|tax|rate|sr\.?\s*no|s\.?\s*no|serial/)) sc -= 0.6;
+    return sc;
+  });
+  const cTds = pick(s => (s.numFrac>0.6 && s.medNum>0 && s.medNum < (stats[cRecv]?.medNum||1e9) ? 0.15:0) + (hMatch(s.header,/tds/)?0.6:0));
+  // NARRATION: the longest wordy free-text column left
+  const cNarr = pick(s => {
+    if (s.alphaFrac < 0.5) return 0;
+    let sc = 0;
+    if (s.avgLen >= 12) sc += Math.min(s.avgLen/60, 0.6);
+    if (s.wordyFrac > 0.4) sc += 0.3;
+    if (s.invFrac > 0.3) sc += 0.2;   // narration often carries invoice refs
+    if (hMatch(s.header,/narrat|descript|detail|remark|particular|purpose|memo|reference|note/)) sc += 0.5;
+    return sc;
+  });
+
+  return { cInv, cRecv, cNarr, cClient, cBranch, cDate, cTds, stats };
+}
+
+async function parsePayments(file, invoices){
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type:'array' });
+  let best=null, bestRows=0;
+  wb.SheetNames.forEach(n=>{ const ws=wb.Sheets[n]; const ref=ws['!ref']; if(!ref)return;
+    const rows = XLSX.utils.decode_range(ref).e.r; if(rows>bestRows){bestRows=rows;best=n;} });
+  const ws = wb.Sheets[best];
+  const rows = XLSX.utils.sheet_to_json(ws, { header:1, defval:null });
+  if (!rows.length) throw new Error('The file is empty.');
+
+  // Find the header row heuristically: the first row (within the first 15) whose
+  // cells are mostly short text labels and that is followed by data. If none is
+  // obvious, treat row 0 as data (hdr=-1) — detection works on data alone.
+  let hdr=-1;
+  for (let i=0;i<Math.min(15,rows.length);i++){
+    const r=(rows[i]||[]);
+    const cells = r.map(x=>String(x==null?'':x).trim()).filter(Boolean);
+    if (cells.length<2) continue;
+    // a header row is labels only: NO invoice numbers, NO money-sized numbers in it
+    const hasInv = r.some(x=>x!=null && invoicesInText(x).length>0);
+    const hasMoney = r.some(x=>{ const n=Number(String(x==null?'':x).replace(/[,₹\s]/g,'')); return isFinite(n) && Math.abs(n)>=50; });
+    if (hasInv || hasMoney) break;   // this row is data → there is no header above the data
+    const labelish = cells.filter(c=>/[A-Za-z]/.test(c) && c.length<=28 && !/^\d/.test(c)).length;
+    const nextRow = rows[i+1]||[];
+    const nextFilled = nextRow.filter(x=>x!=null && String(x).trim()!=='').length;
+    if (labelish >= Math.max(2, cells.length*0.5) && nextFilled >= 2){ hdr=i; break; }
+  }
+  // If the first data-bearing row itself contains an invoice number or a money value,
+  // there may be no header at all — keep hdr where it is (or -1) and let content win.
+
+  const prof = profilePaymentColumns(rows, hdr, invoices || window.dbRows || []);
+  const { cInv, cRecv, cNarr, cClient, cBranch, cDate, cTds } = prof;
+  if (cRecv < 0) throw new Error('Could not find an amount/received column from the data. Every column looked non-numeric.');
+
+  const num = (v) => { if (v===null||v===undefined||String(v).trim()==='') return null;
+    const n = Number(String(v).replace(/[,₹\s]/g,'')); return isFinite(n) ? n : null; };
+  const dataStart = hdr+1;
+  const items=[];
+  for (let i=dataStart;i<rows.length;i++){
+    const row=rows[i]; if(!row) continue;
+    const recv = cRecv>=0 ? num(row[cRecv]) : null;
+    const narr = cNarr>=0 && row[cNarr]!=null ? String(row[cNarr]) : '';
+    // invoice number: explicit column, else scan the WHOLE row's text (any cell may hold it)
+    let invCol = cInv>=0 ? normInv(row[cInv]) : null;
+    const rowText = row.map(v=>v==null?'':String(v)).join(' ');
+    const invsInRow = invoicesInText(narr || rowText);
+    if (recv==null && !invCol && invsInRow.length===0) continue;   // empty/irrelevant row
+    items.push({
+      received_amount: recv,
+      tds_amount: cTds>=0 ? num(row[cTds]) : null,
+      narration: narr || (cNarr<0 ? rowText : ''),   // if no narration column, expose the row text so number-in-text matching still works
+      invoice_no_col: invCol,
+      invoice_nos_in_narr: invsInRow,
+      client_raw: cClient>=0 && row[cClient]!=null ? String(row[cClient]).trim() : '',
+      branch_raw: cBranch>=0 && row[cBranch]!=null ? String(row[cBranch]).trim() : '',
+      paid_date: cDate>=0 ? row[cDate] : null,
+      _row: i+1
+    });
+  }
+  return { items, columns:{ hasInvoice:cInv>=0, hasNarration:cNarr>=0, hasClient:cClient>=0, hasBranch:cBranch>=0, hasTds:cTds>=0, hasDate:cDate>=0 },
+    detected: { invoice:cInv, received:cRecv, narration:cNarr, client:cClient, branch:cBranch, date:cDate, tds:cTds } };
+}
+
+// normalise a client/branch string for EXACT (case/space/punct-insensitive) comparison
+function keyCB(s){ return String(s||'').toUpperCase().replace(/[^A-Z0-9]+/g,' ').trim(); }
+
+/* Does a payment's client & branch EXACTLY match this invoice's? The payment's
+   client/branch may be blank (e.g. only a narration) — in that case we can only
+   accept the match when the narration carried the invoice NUMBER (an explicit
+   identity), never on amount alone. */
+function clientBranchMatches(pay, iv){
+  const payC = keyCB(pay.client_raw), payB = keyCB(pay.branch_raw);
+  const ivC  = keyCB(iv.client_raw), ivB = keyCB(iv.branch_raw);
+  // if the payment carries a client, it must equal the invoice client
+  if (payC && ivC && payC !== ivC) return false;
+  if (payB && ivB && payB !== ivB) return false;
+  // require at least ONE of client/branch to be present & equal on the payment,
+  // so amount-only matches can't cross client/branch boundaries
+  const cOk = payC && ivC && payC === ivC;
+  const bOk = payB && ivB && payB === ivB;
+  return { cOk, bOk, any: cOk || bOk };
+}
+
+/* Match received-payments to invoices. Returns updates (per matched invoice),
+   plus the unmatched payments so the user can see what didn't land. */
+function reconcileReceived(parsed, invoices){
+  // index invoices by normalised number and by (client|branch) for amount fallback
+  const byNo = new Map();
+  invoices.forEach(iv => { if (iv.invoice_no) byNo.set(normInv(iv.invoice_no), iv); });
+
+  // accumulate received per invoice (multiple payments can hit one invoice)
+  const recvByHash = new Map();   // content_hash -> {received_paise, matched:[{method,amount}]}
+  const addRecv = (iv, paise, method, pay) => {
+    const cur = recvByHash.get(iv.content_hash) || { iv, received_paise:0, matched:[] };
+    cur.received_paise += paise; cur.matched.push({ method, amount:paise, row:pay._row });
+    recvByHash.set(iv.content_hash, cur);
+  };
+
+  const unmatched = [];
+  const TDS_RATE = 0.02;      // 2% u/s 194C
+  const near = (a,b,tol) => Math.abs(a-b) <= tol;
+
+  parsed.items.forEach(pay => {
+    if (pay.received_amount == null) { unmatched.push({ pay, reason:'no received amount' }); return; }
+    const recvPaise = Math.round(pay.received_amount*100);
+
+    // candidate invoice numbers: explicit column first, then any found in narration
+    const candNos = [];
+    if (pay.invoice_no_col) candNos.push(pay.invoice_no_col);
+    pay.invoice_nos_in_narr.forEach(n => { if (!candNos.includes(n)) candNos.push(n); });
+
+    // 1 & 2: match by invoice number (column or narrative), guarded by client/branch
+    let placed = false;
+    for (const no of candNos){
+      const iv = byNo.get(no);
+      if (!iv) continue;
+      const cb = clientBranchMatches(pay, iv);
+      // when we matched by an explicit invoice number, client/branch must not
+      // CONTRADICT (a blank on the payment is allowed); when both present they must equal
+      if (cb === false) { continue; }
+      // if the narration lists several invoices, we still credit THIS invoice the
+      // whole payment only when it's the sole candidate; multiple candidates are
+      // split later — here credit each named invoice that matches, dividing equally
+      addRecv(iv, recvPaise, candNos.length>1 ? 'narrative_multi' : (pay.invoice_no_col?'invoice_col':'narrative'), pay);
+      placed = true;
+      if (candNos.length>1) { /* multi: handled by dividing below */ }
+      else break;
+    }
+    // if multiple candidates matched, redistribute equally across the matched ones
+    if (placed && candNos.length>1){
+      // undo the full-amount adds we just did for this pay and split equally
+      const matchedIvs = candNos.map(no=>byNo.get(no)).filter(iv=>iv && clientBranchMatches(pay,iv)!==false);
+      if (matchedIvs.length){
+        matchedIvs.forEach(iv=>{ const cur=recvByHash.get(iv.content_hash); if(cur){ cur.received_paise -= recvPaise; cur.matched=cur.matched.filter(m=>m.row!==pay._row); }});
+        const share = Math.floor(recvPaise/matchedIvs.length); let resid = recvPaise - share*matchedIvs.length;
+        matchedIvs.forEach((iv,idx)=> addRecv(iv, share + (idx<resid?1:0), 'narrative_multi', pay));
+      }
+    }
+    if (placed) return;
+
+    // 3: match by amount — try the payment amount against each invoice's total in
+    // several interpretations: gross, net-of-TDS, +TDS, ±GST/rounding. Guarded by
+    // client/branch EXACT match (amount-only cannot cross client/branch).
+    let amtMatch = null, amtAmbiguous = false;
+    for (const iv of invoices){
+      const cb = clientBranchMatches(pay, iv);
+      if (cb === false || !cb.any) continue;   // amount match REQUIRES client/branch to match
+      const total = iv.total_paise || 0; if (total<=0) continue;
+      const taxable = iv.taxable_paise || 0;
+      const tol = Math.max(200, Math.round(total*0.005));   // ₹2 or 0.5%
+      const gross = total;
+      const netTds = Math.round(total*(1-TDS_RATE));
+      const plusTds = Math.round(total*(1+TDS_RATE));
+      const bases = [gross, netTds, plusTds];
+      if (taxable>0){ bases.push(taxable, Math.round(taxable*(1-TDS_RATE))); }
+      if (bases.some(b=>near(recvPaise,b,tol))){
+        if (amtMatch && amtMatch.content_hash!==iv.content_hash) amtAmbiguous = true;
+        amtMatch = iv;
+      }
+    }
+    if (amtMatch && !amtAmbiguous){ addRecv(amtMatch, recvPaise, 'amount', pay); return; }
+    unmatched.push({ pay, reason: amtAmbiguous ? 'amount matched more than one invoice (same client/branch) — cannot tell which' : (candNos.length? 'invoice number(s) found but client/branch did not match, and no amount match' : 'no invoice number in row or narration, and no unique amount match') });
+  });
+
+  // build updates: for each touched invoice, received = min(sum, total), pending = total - received
+  const updates = []; let paid=0, partial=0, pending=0, totalReceived=0;
+  recvByHash.forEach(({ iv, received_paise, matched }) => {
+    const total = iv.total_paise || 0;
+    const received = Math.min(received_paise, total);
+    const pend = Math.max(total - received, 0);
+    let status; if (pend<=0){status='PAID';paid++;} else if(received>0){status='PARTIAL';partial++;} else {status='PENDING';pending++;}
+    totalReceived += received;
+    updates.push({ content_hash: iv.content_hash, invoice_no: iv.invoice_no,
+      settlement_status: status, received_paise: received, pending_paise: pend,
+      _matched: matched });
+  });
+
+  return { updates, unmatched, summary:{
+    dbInvoices: invoices.length, payments: parsed.items.length,
+    matchedInvoices: updates.length, unmatchedPayments: unmatched.length,
+    paid, partial, pending, totalReceived } };
+}
+window.parsePayments = parsePayments;
+window.reconcileReceived = reconcileReceived;
+
 window.showDbSub = (sub) => {
   $$('#dbSubtabs button').forEach(x => x.classList.toggle('on', x.dataset.sub === sub));
   $('#dbSyncBody').style.display = sub==='sync' ? '' : 'none';
@@ -6590,27 +6926,45 @@ window.showDbSub = (sub) => {
 };
 
 let recUpdates = null;   // computed status updates awaiting confirmation
+function recMode(){ const el = document.querySelector('input[name="recMode"]:checked'); return el ? el.value : 'pending'; }
 function wireReconcile(){
   const pick = $('#recPick'), fileIn = $('#recFile');
   if (!pick || !fileIn) return;
+  // update the help text when the mode changes
+  document.querySelectorAll('input[name="recMode"]').forEach(r => r.onchange = () => {
+    const t = $('#recModeHelpText'); if (!t) return;
+    t.innerHTML = recMode()==='received'
+      ? 'A <b>received-payments</b> file lists payments actually received. Each payment is matched to its invoice by invoice number (in a column or inside the narration text), or by amount (net/gross, with/without TDS, GST/rounding differences). <b>Ground rule:</b> the payment\u2019s client and branch must exactly match the invoice\u2019s. Received = amount received; Pending = Total \u2212 Received.'
+      : 'A <b>pending list</b> contains only the invoices that are still owed. Invoices <b>not in the file</b> are marked fully <b>Paid</b> (Received = Total, Pending = 0). Invoices <b>in the file</b> take their pending/received amount from the file.';
+    $('#recPreview').innerHTML=''; $('#recStatus').textContent='';
+  });
   pick.onclick = () => fileIn.click();
   fileIn.onchange = async (e) => {
     const file = e.target.files[0]; if (!file) return;
-    $('#recStatus').textContent = 'Reading the pending list…';
+    const mode = recMode();
+    $('#recStatus').textContent = mode==='received' ? 'Reading the payments file\u2026' : 'Reading the pending list\u2026';
     $('#recPreview').innerHTML = '';
     try {
-      // make sure we have the full database to reconcile against
-      if (!(window.dbRows||[]).length) { $('#recStatus').textContent = 'Loading invoices from the database first…';
+      if (!(window.dbRows||[]).length) { $('#recStatus').textContent = 'Loading invoices from the database first\u2026';
         await syncFromDatabase(true); }
+      if (mode==='received') { await previewReceived(file); }
+      else { await previewPending(file); }
+    } catch(err){ $('#recStatus').textContent = 'Could not read the file: ' + err.message;
+      DIAG && DIAG.error('system','reconcile parse failed',{reason:err.message}); }
+    fileIn.value='';
+  };
+}
+
+async function previewPending(file){
       const parsed = await parseStatement(file);
       const recResult = reconcilePending(parsed, window.dbRows || []);
       const { updates, summary } = recResult;
       recUpdates = updates;
-      const fmt = n => '₹' + (n/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+      const fmt = n => '\u20b9' + (n/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
       const amtNote = parsed.columns.hasPending ? 'pending amount' : (parsed.columns.hasReceived ? 'received amount' : 'no amount column — treated as fully pending');
       $('#recStatus').textContent = `${summary.inFile} invoice(s) in the pending list, from ${esc(file.name)}`;
       $('#recPreview').innerHTML = `
-        <div class="assure" style="margin:0 0 14px"><span>ℹ</span><span>This file is a <b>pending list</b>.
+        <div class="assure" style="margin:0 0 14px"><span>\u2139</span><span>This file is a <b>pending list</b>.
           Invoices <b>in the file</b> are still owed; invoices <b>not in the file</b> are marked
           <b>fully PAID</b>. Amount source: <b>${amtNote}</b>. Only invoices already in the database are updated.</span></div>
         <div class="recgrid">
@@ -6629,16 +6983,55 @@ function wireReconcile(){
           <div class="reccard"><div class="reclabel">Gaps filled from file</div><div class="recval" style="color:${summary.enriched?'var(--proof)':'inherit'}">${summary.enriched}</div></div>
           <div class="reccard"><div class="reclabel">Flagged for review</div><div class="recval" style="color:${summary.flagged?'var(--warn)':'inherit'}">${summary.flagged}</div></div>
         </div>
-        ${(recResult.flags && recResult.flags.length) ? `<div class="assure" style="margin:12px 0;border-color:var(--warn)"><span>⚑</span><span><b>${recResult.flags.length} entr${recResult.flags.length===1?'y':'ies'} flagged during reconciliation:</b><br>${recResult.flags.slice(0,6).map(f=>`&nbsp;&nbsp;• ${esc(f.invoice_no)} — ${esc(f.reason)}`).join('<br>')}${recResult.flags.length>6?`<br>&nbsp;&nbsp;…and ${recResult.flags.length-6} more`:''}</span></div>` : ''}
-        <div class="assure" style="margin:14px 0"><span>⚠</span><span>Review these numbers before confirming.
+        ${(recResult.flags && recResult.flags.length) ? `<div class="assure" style="margin:12px 0;border-color:var(--warn)"><span>\u2691</span><span><b>${recResult.flags.length} entr${recResult.flags.length===1?'y':'ies'} flagged during reconciliation:</b><br>${recResult.flags.slice(0,6).map(f=>`&nbsp;&nbsp;\u2022 ${esc(f.invoice_no)} — ${esc(f.reason)}`).join('<br>')}${recResult.flags.length>6?`<br>&nbsp;&nbsp;…and ${recResult.flags.length-6} more`:''}</span></div>` : ''}
+        <div class="assure" style="margin:14px 0"><span>\u26a0</span><span>Review these numbers before confirming.
           ${summary.unmatchedInFile ? `<b>${summary.unmatchedInFile}</b> row(s) in the file don't match any database invoice and are ignored (not applied).` : 'Every file row matched a database invoice.'}
           ${summary.enriched?`<b>${summary.enriched}</b> missing field(s) will be filled from the file.`:''}</span></div>
         <button class="btn pri" id="recConfirm">Confirm — update statuses${summary.enriched?' &amp; fill gaps':''}</button>`;
       $('#recConfirm').onclick = confirmReconcile;
-    } catch(err){ $('#recStatus').textContent = 'Could not read the file: ' + err.message;
-      DIAG && DIAG.error('system','reconcile parse failed',{reason:err.message}); }
-    fileIn.value='';
-  };
+}
+
+async function previewReceived(file){
+  const parsed = await parsePayments(file, window.dbRows || []);
+  const result = reconcileReceived(parsed, window.dbRows || []);
+  const { updates, unmatched, summary } = result;
+  recUpdates = updates;
+  const fmt = n => '\u20b9' + (n/100).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+  const cols = parsed.columns;
+  const det = parsed.detected || {};
+  const colLetter = i => (i==null||i<0) ? '—' : String.fromCharCode(65 + (i%26)) + (i>=26?String.fromCharCode(65+Math.floor(i/26)-1):'');
+  const colNote = [
+    det.invoice>=0?`invoice = col ${colLetter(det.invoice)}`:null,
+    det.received>=0?`received = col ${colLetter(det.received)}`:null,
+    det.narration>=0?`narration = col ${colLetter(det.narration)}`:null,
+    det.client>=0?`client = col ${colLetter(det.client)}`:null,
+    det.branch>=0?`branch = col ${colLetter(det.branch)}`:null,
+    det.tds>=0?`TDS = col ${colLetter(det.tds)}`:null,
+  ].filter(Boolean).join(' \u00b7 ') || 'amount only';
+  $('#recStatus').textContent = `${summary.payments} payment(s) read from ${esc(file.name)}`;
+  const methodTally = {};
+  updates.forEach(u => (u._matched||[]).forEach(m => methodTally[m.method]=(methodTally[m.method]||0)+1));
+  const methodLabel = { invoice_col:'by invoice-number column', narrative:'by invoice no in narration', narrative_multi:'by narration (multiple invoices, split)', amount:'by amount (net/gross/TDS/GST)' };
+  $('#recPreview').innerHTML = `
+    <div class="assure" style="margin:0 0 14px"><span>\u2139</span><span>This file is a <b>received-payments</b> list. Columns detected: <b>${esc(colNote)}</b>.
+      Each payment is matched to its invoice by invoice number (column or narration) or by amount, and only when the
+      <b>client and branch match exactly</b>. Received = amount received; Pending = Total \u2212 Received.</span></div>
+    <div class="recgrid">
+      <div class="reccard"><div class="reclabel">Payments in file</div><div class="recval">${summary.payments}</div></div>
+      <div class="reccard"><div class="reclabel">Invoices matched</div><div class="recval" style="color:var(--proof)">${summary.matchedInvoices}</div></div>
+      <div class="reccard"><div class="reclabel">Payments not matched</div><div class="recval" style="color:${summary.unmatchedPayments?'var(--fail)':'inherit'}">${summary.unmatchedPayments}</div></div>
+    </div>
+    <div class="recgrid" style="margin-top:10px">
+      <div class="reccard"><div class="reclabel">→ Now PAID</div><div class="recval" style="color:var(--proof)">${summary.paid}</div></div>
+      <div class="reccard"><div class="reclabel">→ Partially paid</div><div class="recval" style="color:var(--warn)">${summary.partial}</div></div>
+      <div class="reccard"><div class="reclabel">Still pending</div><div class="recval">${summary.pending}</div></div>
+      <div class="reccard"><div class="reclabel">Total received</div><div class="recval">${fmt(summary.totalReceived)}</div></div>
+    </div>
+    ${Object.keys(methodTally).length?`<div class="assure" style="margin:12px 0"><span>\u2713</span><span><b>How they matched:</b> ${Object.entries(methodTally).map(([k,v])=>`${v} ${methodLabel[k]||k}`).join(' \u00b7 ')}</span></div>`:''}
+    ${unmatched.length?`<div class="assure" style="margin:12px 0;border-color:var(--warn)"><span>\u2691</span><span><b>${unmatched.length} payment(s) could not be matched:</b><br>${unmatched.slice(0,6).map(u=>`&nbsp;&nbsp;\u2022 row ${u.pay._row} (${u.pay.received_amount!=null?fmt(Math.round(u.pay.received_amount*100)):'no amount'}) — ${esc(u.reason)}`).join('<br>')}${unmatched.length>6?`<br>&nbsp;&nbsp;…and ${unmatched.length-6} more`:''}</span></div>`:''}
+    <div class="assure" style="margin:14px 0"><span>\u26a0</span><span>Review before confirming. Unmatched payments are <b>not</b> applied. Matched invoices will be set to their received amount, with Pending = Total \u2212 Received.</span></div>
+    <button class="btn pri" id="recConfirm">Confirm — apply received amounts</button>`;
+  $('#recConfirm').onclick = confirmReconcile;
 }
 
 async function confirmReconcile(){
@@ -6703,6 +7096,58 @@ window.wireReconcile = wireReconcile;
   setInterval(liveRefresh, 15000);
 })();
 
+/* Targeted storage cleanup (storage scope): delete stored files whose bill does
+   NOT need review — i.e. proven/clean bills, or hashes not in the review set at
+   all. Review bills keep their file. Returns {scanned, deleted, kept}. */
+async function cleanupOrphanFiles(){
+  const B = Cloud.storageUrl, H = { apikey: Cloud.key, Authorization: 'Bearer '+Cloud.key, 'Content-Type':'application/json' };
+  // Build the set of hashes that legitimately need a file: bills in the database
+  // that need review (non-PROVEN verdict OR a blocking FAIL check), plus anything
+  // in failed_uploads (those are review items by definition).
+  const keep = new Set();
+  try {
+    const rows = await Cloud.pullAll();
+    const checks = {};
+    try { const cr = await fetch(Cloud.url + '/checks?select=content_hash,status,severity&status=eq.FAIL',
+      { headers: Cloud.headers({ 'Range':'0-199999' }) });
+      if (cr.ok) (await cr.json()).forEach(c => { (checks[c.content_hash]=checks[c.content_hash]||[]).push(c); }); } catch(_){}
+    (rows||[]).forEach(r => {
+      const needs = (r.verdict && r.verdict !== 'PROVEN')
+        || (checks[r.content_hash]||[]).some(c => c.severity!=='warn' && c.severity!=='warning' && c.severity!=='info');
+      if (needs) keep.add(r.content_hash);
+    });
+  } catch(_){}
+  try { const fr = await Cloud.fetchFailed(); (fr||[]).forEach(f => keep.add(f.content_hash)); } catch(_){}
+
+  const hashOf = name => String(name).replace(/^.*\//,'').replace(/\.[a-z0-9]+$/i,'');
+  let scanned=0, deleted=0, kept=0;
+  for (const prefix of ['', 'review', 'ocr-pending']) {
+    let r;
+    try { r = await fetch(`${B}/object/list/bills`, { method:'POST', headers:H, body: JSON.stringify({ prefix, limit: 100000 }) }); }
+    catch(_){ continue; }
+    const items = await r.json().catch(()=>[]);
+    const toDelete = [];
+    (items||[]).forEach(o => {
+      const name = prefix ? `${prefix}/${o.name}` : o.name;
+      if (name.endsWith('/')) return;
+      scanned++;
+      const h = hashOf(o.name);
+      // ocr-pending is always temporary — delete any leftover regardless
+      if (prefix==='ocr-pending' || !keep.has(h)) toDelete.push(name);
+      else kept++;
+    });
+    if (toDelete.length) {
+      // delete in chunks
+      for (let i=0;i<toDelete.length;i+=500){
+        const chunk = toDelete.slice(i,i+500);
+        try { await fetch(`${B}/object/bills`, { method:'DELETE', headers:H, body: JSON.stringify({ prefixes: chunk }) }); deleted += chunk.length; } catch(_){}
+      }
+    }
+  }
+  return { scanned, deleted, kept };
+}
+window.cleanupOrphanFiles = cleanupOrphanFiles;
+
 /* Danger zone — password-protected. Opens a dialog with two destructive options:
    (1) clear only the stored bill FILES (PDFs/images), or (2) wipe the WHOLE
    database (the reset). Both require the password before anything happens. */
@@ -6736,10 +7181,20 @@ $('#cloudDanger') && ($('#cloudDanger').onclick = () => {
     '        The bill records in the database are kept.\n\n' +
     '  2  \u2014 WIPE THE WHOLE DATABASE (runs the reset). This deletes ALL\n' +
     '        bills, lines, checks, payments and logs. Cannot be undone.\n\n' +
-    'Type 1 or 2 (or Cancel):');
+    '  3  \u2014 CLEAN UP storage (recommended). Deletes stored files for bills\n' +
+    '        that no longer need review (proven/clean bills) and any leftover\n' +
+    '        temporary files. Review bills keep their file. Records are untouched.\n\n' +
+    'Type 1, 2 or 3 (or Cancel):');
   if (choice === null) return;
   const btn = $('#cloudDanger');
-  if (choice.trim() === '1') {
+  if (choice.trim() === '3') {
+    btn.disabled = true; btn.textContent = 'Cleaning up storage\u2026';
+    cleanupOrphanFiles().then(res => {
+      log(`Storage cleanup done — scanned ${res.scanned} file(s), deleted ${res.deleted}, kept ${res.kept} for review bills.`, 'ok');
+      DIAG && DIAG.ok('system', `storage cleanup: deleted ${res.deleted}, kept ${res.kept}`);
+    }).catch(e => log('Storage cleanup failed: '+e.message, 'er'))
+      .finally(() => { btn.disabled = false; btn.textContent = '\u26a0 Danger zone\u2026'; });
+  } else if (choice.trim() === '1') {
     if (!confirm('Clear all stored bill FILES?\n\nThis removes the original PDFs/images kept for viewing. The bill records themselves stay in the database. Continue?')) return;
     btn.disabled = true; btn.textContent = 'Clearing files\u2026';
     clearStoredFiles().then(n => { log(`Cleared ${n} stored bill file(s).`, 'ok'); DIAG && DIAG.ok('system', `cleared ${n} stored bill files`); })
