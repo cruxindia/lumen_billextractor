@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='81017d4182b1';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='0d0ef63e4729';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -3067,6 +3067,34 @@ const Cloud = {
     try { await fetch(`${this.storageUrl}/object/bills/${doc._stashPath}`,
       { method:'DELETE', headers:{ 'apikey':this.key, 'Authorization':'Bearer '+this.key } }); } catch(_){}
     doc._stashPath = null; return true;
+  },
+  /* List EVERY file under a folder prefix in the bills bucket. The Supabase
+     Storage list API caps a page at 100 items and ignores larger limits, so we
+     must paginate with offset until a short page comes back. Returns an array of
+     full paths (prefix/name), excluding folder placeholders. */
+  async listBillFiles(prefix){
+    const H = { apikey:this.key, Authorization:'Bearer '+this.key, 'Content-Type':'application/json' };
+    const PAGE = 100; let offset = 0; const out = [];
+    for (let guard=0; guard<100000; guard++){   // hard stop at 10M files
+      let items;
+      try {
+        const r = await fetch(`${this.storageUrl}/object/list/bills`, { method:'POST', headers:H,
+          body: JSON.stringify({ prefix, limit: PAGE, offset, sortBy:{ column:'name', order:'asc' } }) });
+        if (!r.ok) break;
+        items = await r.json();
+      } catch(_){ break; }
+      if (!Array.isArray(items) || items.length===0) break;
+      items.forEach(o => {
+        if (!o || !o.name) return;
+        // a folder placeholder has id === null; skip it and any trailing-slash names
+        if (o.id === null) return;
+        const name = prefix ? `${prefix}/${o.name}` : o.name;
+        if (!name.endsWith('/')) out.push(name);
+      });
+      if (items.length < PAGE) break;   // last page
+      offset += PAGE;
+    }
+    return out;
   },
   async fetchBillFile(path){
     try {
@@ -7122,22 +7150,17 @@ async function cleanupOrphanFiles(){
   const hashOf = name => String(name).replace(/^.*\//,'').replace(/\.[a-z0-9]+$/i,'');
   let scanned=0, deleted=0, kept=0;
   for (const prefix of ['', 'review', 'ocr-pending']) {
-    let r;
-    try { r = await fetch(`${B}/object/list/bills`, { method:'POST', headers:H, body: JSON.stringify({ prefix, limit: 100000 }) }); }
-    catch(_){ continue; }
-    const items = await r.json().catch(()=>[]);
+    let names;
+    try { names = await Cloud.listBillFiles(prefix); } catch(_){ continue; }
     const toDelete = [];
-    (items||[]).forEach(o => {
-      const name = prefix ? `${prefix}/${o.name}` : o.name;
-      if (name.endsWith('/')) return;
+    names.forEach(name => {
       scanned++;
-      const h = hashOf(o.name);
+      const h = hashOf(name);
       // ocr-pending is always temporary — delete any leftover regardless
       if (prefix==='ocr-pending' || !keep.has(h)) toDelete.push(name);
       else kept++;
     });
     if (toDelete.length) {
-      // delete in chunks
       for (let i=0;i<toDelete.length;i+=500){
         const chunk = toDelete.slice(i,i+500);
         try { await fetch(`${B}/object/bills`, { method:'DELETE', headers:H, body: JSON.stringify({ prefixes: chunk }) }); deleted += chunk.length; } catch(_){}
@@ -7156,12 +7179,11 @@ async function clearStoredFiles(){
   const B = Cloud.storageUrl, H = { apikey: Cloud.key, Authorization: 'Bearer '+Cloud.key, 'Content-Type':'application/json' };
   let total = 0;
   for (const prefix of ['', 'review', 'ocr-pending']) {
-    const r = await fetch(`${B}/object/list/bills`, { method:'POST', headers:H, body: JSON.stringify({ prefix, limit: 100000 }) });
-    const items = await r.json();
-    const names = (items||[]).map(o => prefix ? `${prefix}/${o.name}` : o.name).filter(n => !n.endsWith('/'));
-    if (names.length) {
-      await fetch(`${B}/object/bills`, { method:'DELETE', headers:H, body: JSON.stringify({ prefixes: names }) });
-      total += names.length;
+    let names = [];
+    try { names = await Cloud.listBillFiles(prefix); } catch(_){ continue; }
+    for (let i=0;i<names.length;i+=500){
+      const chunk = names.slice(i,i+500);
+      if (chunk.length) { try { await fetch(`${B}/object/bills`, { method:'DELETE', headers:H, body: JSON.stringify({ prefixes: chunk }) }); total += chunk.length; } catch(_){} }
     }
   }
   return total;
