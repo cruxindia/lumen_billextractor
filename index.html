@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='368032d70f54';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='36e72d795f2a';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -7444,10 +7444,42 @@ async function openBillEditor(hash){
   // failed bills store their file at storage_path; OCR/review bills at review_file_path
   const storedPath = (failedRow && failedRow.storage_path) || row.review_file_path
     || (held && held._reviewFilePath);
+  let _blobType = 'application/pdf';
   if (!billUrl && storedPath) {
-    try { billUrl = await Cloud.signedBillUrl(storedPath); } catch(_){}
+    // Fetch the bytes and re-wrap them in a correctly-typed Blob. Files stored by
+    // older builds may have no content-type (or a bare-hash path with no
+    // extension), which makes the browser's PDF viewer fail with "Failed to load
+    // PDF document" even though the bytes are fine. Re-typing the blob fixes that.
+    try {
+      const signed = await Cloud.signedBillUrl(storedPath);
+      if (signed) {
+        const extm = String(storedPath).match(/\.(pdf|xlsx?|xlsm|jpe?g|png|gif|tiff?|webp)$/i);
+        const ext = (extm && extm[1] ? extm[1] : 'pdf').toLowerCase();
+        const TYPES = { pdf:'application/pdf', xls:'application/vnd.ms-excel',
+          xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          xlsm:'application/vnd.ms-excel.sheet.macroEnabled.12',
+          jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif',
+          tif:'image/tiff', tiff:'image/tiff', webp:'image/webp' };
+        _blobType = TYPES[ext] || 'application/pdf';
+        try {
+          const resp = await fetch(signed);
+          if (resp.ok) {
+            const buf = await resp.arrayBuffer();
+            // sniff: a real PDF starts with "%PDF". If the path had no extension
+            // but the bytes are a PDF, force the PDF type so it opens.
+            const head = new Uint8Array(buf.slice(0,5));
+            const isPdf = head[0]===0x25 && head[1]===0x50 && head[2]===0x44 && head[3]===0x46; // %PDF
+            if (isPdf) _blobType = 'application/pdf';
+            billUrl = URL.createObjectURL(new Blob([buf], { type: _blobType }));
+          } else {
+            billUrl = signed;   // fall back to the raw signed URL
+          }
+        } catch(_){ billUrl = signed; }
+      }
+    } catch(_){}
     if (!billUrl && typeof DIAG!=='undefined') DIAG.warn('system', `bill file path exists but couldn't be fetched: ${storedPath}`);
   }
+  editorState.__blobType = _blobType;
   window.__editorNoFileReason = !storedPath
     ? 'This bill has no stored file — it was processed before file-storing was enabled, or the Storage bucket isn\'t set up. Re-ingest it to store the file.'
     : (!billUrl ? 'The file is recorded but couldn\'t be fetched from Storage — check the bucket policy.' : '');
@@ -7502,13 +7534,15 @@ async function openBillEditor(hash){
   // the whole editor view.
   let billViewHtml;
   if (billUrl) {
-    var _srcName = editorState.invoice.source_file || '';
-    var _urlExtM = billUrl.match(/\.(pdf|xlsx?|xlsm|jpe?g|png|gif|tiff?|webp)(\?|$)/i);
-    var _nameExtM = _srcName.match(/\.(pdf|xlsx?|xlsm|jpe?g|png|gif|tiff?|webp)$/i);
-    var _ext = (_urlExtM && _urlExtM[1]) || (_nameExtM && _nameExtM[1]) || 'pdf';
+    var _bt = editorState.__blobType || 'application/pdf';
+    var _TYPE_EXT = { 'application/pdf':'pdf', 'image/jpeg':'jpg', 'image/png':'png', 'image/gif':'gif',
+      'image/tiff':'tif', 'image/webp':'webp',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':'xlsx',
+      'application/vnd.ms-excel':'xls', 'application/vnd.ms-excel.sheet.macroEnabled.12':'xlsm' };
+    var _ext = _TYPE_EXT[_bt] || 'pdf';
     var _dlName = ((editorState.invoice.invoice_no || 'bill') + '.' + _ext).replace(/[\/\\:*?"<>|]/g, '_');
-    var _isImg = /\.(jpe?g|png|gif|tiff?|bmp|webp)(\?|$)/i.test(billUrl) || (_nameExtM && /jpe?g|png|gif|tiff?|bmp|webp/i.test(_nameExtM[1]));
-    var _link = '<a href="' + billUrl + '" target="_blank" rel="noopener" class="dim" style="font-size:12px">\u2197 Open bill in new tab</a>';
+    var _isImg = /^image\//.test(_bt);
+    var _link = '<a href="' + billUrl + '" target="_blank" rel="noopener" download="' + _dlName + '" class="dim" style="font-size:12px">\u2193 Download bill (' + _dlName + ')</a>';
     var _viewer = _isImg
       ? '<img src="' + billUrl + '" alt="original bill" style="width:100%;max-height:66vh;object-fit:contain;border:1px solid var(--line);border-radius:8px;background:#fff">'
       : '<iframe src="' + billUrl + '" style="width:100%;height:66vh;border:1px solid var(--line);border-radius:8px"></iframe>';
