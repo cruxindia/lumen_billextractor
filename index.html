@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='0d0ef63e4729';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='e244472ef5eb';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -487,6 +487,7 @@ table.edlines input{width:100%;padding:4px 6px;border:1px solid var(--line);bord
       <div class="row" style="margin:14px 0;flex-wrap:wrap">
         <button class="btn" id="cloudBranches">View branches learned</button>
         <button class="btn" id="cloudClients">View clients</button>
+        <button class="btn" id="cloudCountFiles" title="Count every stored bill file per folder (paginated — the true total)">Count stored files</button>
         <button class="btn danger" id="cloudDanger" title="Password-protected destructive actions: clear stored files or wipe the whole database">⚠ Danger zone…</button>
         <span class="pill" id="cloudStatus"><i class="dot"></i> Ready</span>
       </div>
@@ -3074,21 +3075,24 @@ const Cloud = {
      full paths (prefix/name), excluding folder placeholders. */
   async listBillFiles(prefix){
     const H = { apikey:this.key, Authorization:'Bearer '+this.key, 'Content-Type':'application/json' };
+    // Supabase lists the CONTENTS of a folder when the prefix ends in '/'. For a
+    // subfolder we must pass 'review/' (not 'review'); for the root we pass ''.
+    const listPrefix = prefix ? (prefix.endsWith('/') ? prefix : prefix + '/') : '';
+    const folder = listPrefix.replace(/\/$/, '');   // 'review' or '' for building full paths
     const PAGE = 100; let offset = 0; const out = [];
     for (let guard=0; guard<100000; guard++){   // hard stop at 10M files
       let items;
       try {
         const r = await fetch(`${this.storageUrl}/object/list/bills`, { method:'POST', headers:H,
-          body: JSON.stringify({ prefix, limit: PAGE, offset, sortBy:{ column:'name', order:'asc' } }) });
+          body: JSON.stringify({ prefix: listPrefix, limit: PAGE, offset, sortBy:{ column:'name', order:'asc' } }) });
         if (!r.ok) break;
         items = await r.json();
       } catch(_){ break; }
       if (!Array.isArray(items) || items.length===0) break;
       items.forEach(o => {
         if (!o || !o.name) return;
-        // a folder placeholder has id === null; skip it and any trailing-slash names
-        if (o.id === null) return;
-        const name = prefix ? `${prefix}/${o.name}` : o.name;
+        if (o.id === null) return;   // a subfolder placeholder — skip
+        const name = folder ? `${folder}/${o.name}` : o.name;
         if (!name.endsWith('/')) out.push(name);
       });
       if (items.length < PAGE) break;   // last page
@@ -7239,6 +7243,29 @@ $('#cloudDanger') && ($('#cloudDanger').onclick = () => {
   } else {
     alert('No valid option chosen. No changes made.');
   }
+});
+
+$('#cloudCountFiles') && ($('#cloudCountFiles').onclick = async () => {
+  const btn = $('#cloudCountFiles'); btn.disabled = true; btn.textContent = 'Counting…';
+  const B = Cloud.storageUrl, H = { apikey: Cloud.key, Authorization: 'Bearer '+Cloud.key, 'Content-Type':'application/json' };
+  const lines = ['STORED FILES IN THE bills BUCKET', ''];
+  let grand = 0;
+  try {
+    // discover ALL top-level folders (older builds may have used other names)
+    const folders = new Set(['', 'review', 'ocr-pending']);
+    try {
+      const rootProbe = await fetch(`${B}/object/list/bills`, { method:'POST', headers:H, body: JSON.stringify({ prefix:'', limit:100, offset:0, sortBy:{column:'name',order:'asc'} }) });
+      if (rootProbe.ok){ (await rootProbe.json()||[]).forEach(o=>{ if(o && o.id===null && o.name) folders.add(o.name.replace(/\/$/,'')); }); }
+    } catch(_){}
+    for (const prefix of folders) {
+      const names = await Cloud.listBillFiles(prefix);
+      grand += names.length;
+      lines.push(`  ${prefix||'(root)'} : ${names.length} file(s)`);
+    }
+    lines.push('', `TOTAL: ${grand} file(s)`);
+  } catch(e){ lines.push('Count failed: '+e.message); }
+  $('#cloudBody').innerHTML = `<pre style="white-space:pre-wrap;font-size:12px;line-height:1.5">${esc(lines.join('\n'))}</pre>`;
+  btn.disabled = false; btn.textContent = 'Count stored files';
 });
 
 $('#cloudSelfTest') && ($('#cloudSelfTest').onclick = async () => {
