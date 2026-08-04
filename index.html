@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='510dd181655a';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='368032d70f54';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -3112,7 +3112,7 @@ const Cloud = {
 
   async fetchLines(hash){
     try {
-      const r = await fetch(this.url + '/invoice_lines?content_hash=eq.' + encodeURIComponent(hash) + '&order=line_no',
+      const r = await fetch(this.url + '/applicant_lines?content_hash=eq.' + encodeURIComponent(hash) + '&order=line_no',
         { headers: this.headers() });
       if (r.ok) return await r.json();
     } catch(_){}
@@ -3123,7 +3123,7 @@ const Cloud = {
      editor saves edited/added customers. */
   async replaceLines(hash, lines){
     // delete existing
-    await fetch(this.url + '/invoice_lines?content_hash=eq.' + encodeURIComponent(hash),
+    await fetch(this.url + '/applicant_lines?content_hash=eq.' + encodeURIComponent(hash),
       { method:'DELETE', headers: this.headers({'Prefer':'return=minimal'}) });
     if (lines && lines.length) {
       const rows = lines.map((l,i)=>({ content_hash: hash, line_no: i+1,
@@ -3132,7 +3132,7 @@ const Cloud = {
         tax_paise: l.tax_paise!=null?l.tax_paise:null,
         gross_paise: l.gross_paise!=null?l.gross_paise:null,
         service_type: l.service_type||null, receipt_date: this.toISODate(l.receipt_date) }));
-      const r = await fetch(this.url + '/invoice_lines',
+      const r = await fetch(this.url + '/applicant_lines',
         { method:'POST', headers: this.headers({'Prefer':'return=minimal'}), body: JSON.stringify(rows) });
       if (!r.ok){ const t=await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
     }
@@ -3143,7 +3143,7 @@ const Cloud = {
      it's been fully verified and no longer needed as a raw record. */
   async deleteOne(hash){
     const h = encodeURIComponent(hash);
-    for (const tbl of ['invoice_lines','checks','invoices']) {
+    for (const tbl of ['applicant_lines','checks','invoices']) {
       try { await fetch(this.url + '/' + tbl + '?content_hash=eq.' + h,
         { method:'DELETE', headers: this.headers({'Prefer':'return=minimal'}) }); } catch(_){}
     }
@@ -7153,6 +7153,12 @@ async function cleanupOrphanFiles(){
 
   const hashOf = name => String(name).replace(/^.*\//,'').replace(/\.[a-z0-9]+$/i,'');
   let scanned=0, deleted=0, kept=0;
+  // First pass: learn which hashes already have a file under review/ — those are
+  // the canonical review copies. A root-level file for the same hash is a
+  // duplicate (older saveFailedBill copy) and should be removed.
+  let reviewHashes = new Set();
+  try { (await Cloud.listBillFiles('review')).forEach(n => reviewHashes.add(hashOf(n))); } catch(_){}
+
   for (const prefix of ['', 'review', 'ocr-pending']) {
     let names;
     try { names = await Cloud.listBillFiles(prefix); } catch(_){ continue; }
@@ -7160,9 +7166,14 @@ async function cleanupOrphanFiles(){
     names.forEach(name => {
       scanned++;
       const h = hashOf(name);
-      // ocr-pending is always temporary — delete any leftover regardless
-      if (prefix==='ocr-pending' || !keep.has(h)) toDelete.push(name);
-      else kept++;
+      if (prefix==='ocr-pending') { toDelete.push(name); return; }          // always temporary
+      if (prefix==='') {
+        // root file: delete if it's a duplicate of a review/ copy OR not in the review set
+        if (reviewHashes.has(h) || !keep.has(h)) toDelete.push(name); else kept++;
+        return;
+      }
+      // review/ : keep if the bill still needs review, else delete
+      if (!keep.has(h)) toDelete.push(name); else kept++;
     });
     if (toDelete.length) {
       for (let i=0;i<toDelete.length;i+=500){
