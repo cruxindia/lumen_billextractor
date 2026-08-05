@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='36e72d795f2a';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='b22103a24961';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -844,8 +844,8 @@ const APPLICANT_HEADERS = {
   pre_post: [/pre\s*\/?\s*post/i],
   loan_number: [/loan\s*(no|a\/?c|account)/i, /\blan\b/i],
   application_number: [/application\s*(no|number)/i, /proposal\s*no/i],
-  amount: [/^amount$/i, /^amt$/i, /^charges?$/i, /^fee$/i, /^cost$/i, /ogl\s*charges?/i],
-  tax: [/^gst$/i, /^tax$/i, /^[csi]gst$/i],
+  amount: [/^amount$/i, /^amt$/i, /^charges?$/i, /^fee$/i, /^cost$/i, /^basic\s*am/i, /base\s*am/i],
+  tax: [/^gst$/i, /^tax$/i, /^[csi]gst$/i, /gst\s*@?\s*\d/i],
   gross: [/bill\s*am/i, /total\s*am/i, /gross/i, /^total$/i]
 };
 const LINE_HEADERS = {
@@ -1679,7 +1679,17 @@ function validate(rec) {
     const rounded = Math.round(rowSum / 100) * 100 === stated;
     const amts = detailRows.map(r => r.amount_paise).filter(a => typeof a === 'number');
     const linesWhole = amts.length > 0 && amts.every(a => a % 100 === 0);
-    const tol = Math.max(2, linesWhole ? 50 * amts.length : 2);
+    /* Tolerance must absorb cumulative rounding. When the annexure's line
+       amounts are fractional rupees (e.g. 127.11, 260.333), each row's paise is
+       rounded independently, so the sum of N rows can drift from the annexure's
+       own printed total by up to ~1 paise per row. A GENUINELY missing line is
+       always at least the smallest real charge (₹100+ = 10 000+ paise), so a
+       per-row paise allowance never hides a dropped row while it does stop false
+       alarms on pure rounding drift. Whole-rupee lines keep the ₹0.50/line
+       allowance for the shared-total formats. */
+    const tol = linesWhole
+      ? Math.max(2, 50 * amts.length)
+      : Math.max(2, 1 * amts.length + 2);
     const ok = d <= tol || rounded;
     add('C14_row_completeness', ok,
         ok ? `${detailRows.length} row(s) read, summing to the annexure's own stated total`
@@ -7448,31 +7458,45 @@ async function openBillEditor(hash){
   if (!billUrl && storedPath) {
     // Fetch the bytes and re-wrap them in a correctly-typed Blob. Files stored by
     // older builds may have no content-type (or a bare-hash path with no
-    // extension), which makes the browser's PDF viewer fail with "Failed to load
-    // PDF document" even though the bytes are fine. Re-typing the blob fixes that.
+    // extension). We detect the REAL type from the file's magic bytes so an Excel
+    // bill isn't mislabelled as .pdf (which makes Acrobat report "damaged").
     try {
       const signed = await Cloud.signedBillUrl(storedPath);
       if (signed) {
-        const extm = String(storedPath).match(/\.(pdf|xlsx?|xlsm|jpe?g|png|gif|tiff?|webp)$/i);
-        const ext = (extm && extm[1] ? extm[1] : 'pdf').toLowerCase();
+        const extm = String(storedPath).match(/\.(pdf|xlsx|xlsm|xls|jpe?g|png|gif|tiff?|webp)$/i);
+        const pathExt = extm && extm[1] ? extm[1].toLowerCase() : '';
         const TYPES = { pdf:'application/pdf', xls:'application/vnd.ms-excel',
           xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
           xlsm:'application/vnd.ms-excel.sheet.macroEnabled.12',
           jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', gif:'image/gif',
           tif:'image/tiff', tiff:'image/tiff', webp:'image/webp' };
-        _blobType = TYPES[ext] || 'application/pdf';
         try {
           const resp = await fetch(signed);
           if (resp.ok) {
             const buf = await resp.arrayBuffer();
-            // sniff: a real PDF starts with "%PDF". If the path had no extension
-            // but the bytes are a PDF, force the PDF type so it opens.
-            const head = new Uint8Array(buf.slice(0,5));
-            const isPdf = head[0]===0x25 && head[1]===0x50 && head[2]===0x44 && head[3]===0x46; // %PDF
-            if (isPdf) _blobType = 'application/pdf';
+            const b = new Uint8Array(buf.slice(0, 16));
+            // magic-byte detection
+            const is = (arr, off=0) => arr.every((v,i)=>b[off+i]===v);
+            let sniffedExt = '';
+            if (is([0x25,0x50,0x44,0x46])) sniffedExt = 'pdf';                       // %PDF
+            else if (is([0x50,0x4B,0x03,0x04]) || is([0x50,0x4B,0x05,0x06])) {       // PK zip → OOXML
+              // xlsx and xlsm are both zip; keep the stored extension if it says so,
+              // otherwise default to xlsx. (xlsm only differs by a macro part.)
+              sniffedExt = (pathExt==='xlsm') ? 'xlsm' : 'xlsx';
+            }
+            else if (is([0xD0,0xCF,0x11,0xE0])) sniffedExt = 'xls';                  // OLE → legacy xls
+            else if (is([0xFF,0xD8,0xFF])) sniffedExt = 'jpg';                       // JPEG
+            else if (is([0x89,0x50,0x4E,0x47])) sniffedExt = 'png';                  // PNG
+            else if (is([0x47,0x49,0x46,0x38])) sniffedExt = 'gif';                  // GIF8
+            else if (is([0x49,0x49,0x2A,0x00]) || is([0x4D,0x4D,0x00,0x2A])) sniffedExt = 'tif'; // TIFF
+            else if (b[0]===0x52&&b[1]===0x49&&b[2]===0x46&&b[3]===0x46 && b[8]===0x57&&b[9]===0x45&&b[10]===0x42&&b[11]===0x50) sniffedExt='webp'; // RIFF….WEBP
+            // prefer the sniffed type; else the stored extension; else pdf
+            const finalExt = sniffedExt || pathExt || 'pdf';
+            _blobType = TYPES[finalExt] || 'application/pdf';
+            editorState.__fileExt = finalExt;
             billUrl = URL.createObjectURL(new Blob([buf], { type: _blobType }));
           } else {
-            billUrl = signed;   // fall back to the raw signed URL
+            billUrl = signed; _blobType = TYPES[pathExt] || 'application/pdf'; editorState.__fileExt = pathExt || 'pdf';
           }
         } catch(_){ billUrl = signed; }
       }
@@ -7535,17 +7559,23 @@ async function openBillEditor(hash){
   let billViewHtml;
   if (billUrl) {
     var _bt = editorState.__blobType || 'application/pdf';
-    var _TYPE_EXT = { 'application/pdf':'pdf', 'image/jpeg':'jpg', 'image/png':'png', 'image/gif':'gif',
-      'image/tiff':'tif', 'image/webp':'webp',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':'xlsx',
-      'application/vnd.ms-excel':'xls', 'application/vnd.ms-excel.sheet.macroEnabled.12':'xlsm' };
-    var _ext = _TYPE_EXT[_bt] || 'pdf';
-    var _dlName = ((editorState.invoice.invoice_no || 'bill') + '.' + _ext).replace(/[\/\\:*?"<>|]/g, '_');
+    var _fext = editorState.__fileExt || 'pdf';
+    var _dlName = ((editorState.invoice.invoice_no || 'bill') + '.' + _fext).replace(/[\/\\:*?"<>|]/g, '_');
     var _isImg = /^image\//.test(_bt);
-    var _link = '<a href="' + billUrl + '" target="_blank" rel="noopener" download="' + _dlName + '" class="dim" style="font-size:12px">\u2193 Download bill (' + _dlName + ')</a>';
-    var _viewer = _isImg
-      ? '<img src="' + billUrl + '" alt="original bill" style="width:100%;max-height:66vh;object-fit:contain;border:1px solid var(--line);border-radius:8px;background:#fff">'
-      : '<iframe src="' + billUrl + '" style="width:100%;height:66vh;border:1px solid var(--line);border-radius:8px"></iframe>';
+    var _isPdf = _bt === 'application/pdf';
+    var _isSheet = /(excel|spreadsheet)/i.test(_bt) || /^(xlsx|xlsm|xls)$/i.test(_fext);
+    var _link = '<a href="' + billUrl + '" download="' + _dlName + '" class="dim" style="font-size:12px">\u2193 Download bill (' + _dlName + ')</a>';
+    var _viewer;
+    if (_isImg) {
+      _viewer = '<img src="' + billUrl + '" alt="original bill" style="width:100%;max-height:66vh;object-fit:contain;border:1px solid var(--line);border-radius:8px;background:#fff">';
+    } else if (_isPdf) {
+      _viewer = '<iframe src="' + billUrl + '" style="width:100%;height:66vh;border:1px solid var(--line);border-radius:8px"></iframe>';
+    } else {
+      // spreadsheets / other office files can't preview in an iframe — offer download
+      _viewer = '<div class="editor-noview" style="height:auto;padding:24px">This bill is a '
+        + esc((_fext||'file').toUpperCase()) + ' file, which can\'t be previewed in the browser.<br>'
+        + 'Use the download link below to open it in Excel.</div>';
+    }
     billViewHtml = _viewer + '<div style="margin-top:6px">' + _link + '</div>';
   } else {
     billViewHtml = '<div class="editor-noview">No stored image for this bill — you can still edit every field on the right and save.<br><span class="dim">' + esc(window.__editorNoFileReason || '') + '</span></div>';
