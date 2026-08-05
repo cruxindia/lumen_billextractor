@@ -17,7 +17,7 @@
 <meta name="theme-color" content="#4C2082">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
-<script>window.__LUMEN_BUILD='b22103a24961';</script><title>Lumen — Document Intelligence</title>
+<script>window.__LUMEN_BUILD='220e268a005d';</script><title>Lumen — Document Intelligence</title>
 <meta name="description" content="Offline document intelligence platform. Proves every figure or says why it can't.">
 <style>
 :root{
@@ -2752,7 +2752,10 @@ const Cloud = {
       body: JSON.stringify({ p_client: client, p_branch: branch }) });
     if(!r.ok) return null;
     const rows = await r.json();
-    return (Array.isArray(rows) ? rows[0] : rows) || null;
+    // lookup_branch now RETURNS TABLE(...) so the result is an array; take the
+    // single row it yields (exact or a confident fuzzy match), or null.
+    const row = Array.isArray(rows) ? rows[0] : rows;
+    return row || null;
   },
 
   /* Resolve a raw addressee against the clients master table. Returns
@@ -2784,9 +2787,11 @@ const Cloud = {
     if(!r.ok){ const t=await r.text(); throw new Error(`${r.status} ${t.slice(0,160)}`); }
     return await r.json();
   },
-  // Save (upsert) one branch master row. branch_key = normalized client|branch.
+  // Save (upsert) one branch master row. branch_key = normalized client|branch,
+  // stripping ALL non-alphanumerics so it matches lookup_branch's normalization.
   async saveBranch(b){
-    const key = (String(b.client_raw||'').trim()+'|'+String(b.branch_raw||'').trim()).toUpperCase().replace(/\s+/g,' ');
+    const norm = s => String(s||'').toUpperCase().replace(/[^A-Z0-9]+/g,'');
+    const key = norm(b.client_raw) + '|' + norm(b.branch_raw);
     const body = { branch_key:key, client_raw:b.client_raw||null, branch_raw:b.branch_raw||null,
       branch_code:b.branch_code||null, branch_email:b.branch_email||null, recipient_gstin:b.recipient_gstin||null,
       updated_at:new Date().toISOString() };
@@ -2797,12 +2802,13 @@ const Cloud = {
   },
   // Bulk upsert branch rows (from Excel). Returns count written.
   async saveBranchesBulk(rows){
+    const norm = s => String(s||'').toUpperCase().replace(/[^A-Z0-9]+/g,'');
     const payload = rows.map(b => {
-      const key = (String(b.client_raw||'').trim()+'|'+String(b.branch_raw||'').trim()).toUpperCase().replace(/\s+/g,' ');
+      const key = norm(b.client_raw) + '|' + norm(b.branch_raw);
       return { branch_key:key, client_raw:b.client_raw||null, branch_raw:b.branch_raw||null,
         branch_code:b.branch_code||null, branch_email:b.branch_email||null, recipient_gstin:b.recipient_gstin||null,
         updated_at:new Date().toISOString() };
-    }).filter(x => x.branch_key !== '|');
+    }).filter(x => x.branch_key !== '|' && !x.branch_key.startsWith('|') && !x.branch_key.endsWith('|'));
     if (!payload.length) return 0;
     const r = await fetch(this.url + '/branches', { method:'POST',
       headers: this.headers({ 'Prefer':'resolution=merge-duplicates,return=minimal' }), body: JSON.stringify(payload) });
@@ -2874,13 +2880,29 @@ const Cloud = {
     await this.learnClient(i.client_raw);
 
     // STEP 2 — fill missing branch details from the branches master table
-    if (i.branch_email && i.recipient_gstin) return;
+    if (i.branch_email && i.recipient_gstin && i.branch_code) return;
     const m = await this.lookupBranch(i.client_raw, i.branch_raw);
     if (!m) return;
     doc.enriched = doc.enriched || {};
     if (!i.branch_email && m.branch_email) { i.branch_email = m.branch_email; doc.enriched.branch_email = 'master'; }
     if (!i.recipient_gstin && m.recipient_gstin) { i.recipient_gstin = m.recipient_gstin; doc.enriched.recipient_gstin = 'master'; }
     if (!i.branch_code && m.branch_code) { i.branch_code = m.branch_code; doc.enriched.branch_code = 'master'; }
+    // Normalise a NOISY branch name to the master's clean value (e.g.
+    // "1025 TPS PARALI VAIJNATH" -> "TPS PARALI VAIJNATH"). Only when the master
+    // name actually differs and the match is trustworthy. Keep the original in
+    // branch_raw_reported so nothing is lost and the correction is auditable.
+    if (m.branch_raw && m.branch_raw !== i.branch_raw) {
+      const conf = (m.match_confidence != null) ? Number(m.match_confidence) : 1;
+      const method = m.match_method || 'exact';
+      if (method === 'exact' || conf >= 0.72) {
+        i.branch_raw_reported = i.branch_raw;
+        i.branch_raw = m.branch_raw;
+        doc.enriched.branch_raw = method === 'exact' ? 'master' : ('master~' + conf.toFixed(2));
+      }
+    }
+    if (m.match_method === 'fuzzy' && m.match_confidence != null) {
+      doc.enriched.branch_match = 'fuzzy ' + Number(m.match_confidence).toFixed(2);
+    }
   },
 
   /* Fetch the applicant/customer rows for one bill from the database. */
@@ -7935,9 +7957,9 @@ $('#bmUpload') && ($('#bmUpload').onchange = async (e) => {
     // map headers flexibly
     const norm = s => String(s||'').toLowerCase().replace(/[^a-z]/g,'');
     const rows = json.map(r => { const o={}; Object.keys(r).forEach(k=>{ const n=norm(k);
-      if(/client/.test(n)) o.client_raw=String(r[k]).trim();
-      else if(/branchcode|code/.test(n)) o.branch_code=String(r[k]).trim();
-      else if(/branch/.test(n)&&!o.branch_raw) o.branch_raw=String(r[k]).trim();
+      if(/client|bank(?!.*code)|customer|party/.test(n) && !o.client_raw) o.client_raw=String(r[k]).trim();
+      else if(/branchcode|ifsccode|^code$|code$/.test(n)) o.branch_code=String(r[k]).trim();
+      else if(/branch|location/.test(n)&&!o.branch_raw) o.branch_raw=String(r[k]).trim();
       else if(/email|mail/.test(n)) o.branch_email=String(r[k]).trim();
       else if(/gst/.test(n)) o.recipient_gstin=String(r[k]).trim();
     }); return o; }).filter(o=>o.client_raw && o.branch_raw);
