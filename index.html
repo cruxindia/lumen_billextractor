@@ -2512,7 +2512,7 @@ const Cloud = {
   key: 'sb_publishable_J7fFRVLVB_h5SHZcquWfXA_p_O30PkF',
 
   headers(extra){ return Object.assign({
-    'apikey': this.key, 'Authorization': 'Bearer ' + this.key,
+    'apikey': this.key,
     'Content-Type': 'application/json' }, extra || {}); },
 
   /* ---- Realtime: subscribe to database changes over a websocket so the tool
@@ -2934,7 +2934,7 @@ const Cloud = {
         const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type:'application/pdf' });
         storagePath = `${hash}.${ext}`;
         const up = await fetch(`${this.storageUrl}/object/bills/${storagePath}`, {
-          method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key },
+          method:'POST', headers: { 'apikey':this.key },
           body: blob });
         if (!up.ok) storagePath = null;
       }
@@ -3053,7 +3053,7 @@ const Cloud = {
     try { await fetch(this.url + '/rpc/resolve_failed_upload', {
       method:'POST', headers: this.headers(), body: JSON.stringify({ p_hash: doc.hash }) }); } catch(_){}
     if (storagePath) { try { await fetch(`${this.storageUrl}/object/bills/${storagePath}`,
-      { method:'DELETE', headers:{ 'apikey':this.key, 'Authorization':'Bearer '+this.key } }); } catch(_){} }
+      { method:'DELETE', headers:{ 'apikey':this.key } }); } catch(_){} }
     return true;
   },
 
@@ -3069,7 +3069,7 @@ const Cloud = {
     const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type:'application/pdf' });
     try {
       const r = await fetch(`${this.storageUrl}/object/bills/${path}`, {
-        method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'x-upsert':'true' },
+        method:'POST', headers: { 'apikey':this.key, 'x-upsert':'true' },
         body: blob });
       if (r.ok) { doc._reviewFilePath = path;
         if (doc.invoice) doc.invoice.review_file_path = path;
@@ -3088,7 +3088,7 @@ const Cloud = {
     const path = `ocr-pending/${doc.hash}.${ext}`;
     const blob = doc._sourceBlob || new Blob([doc._pdfBuf], { type: 'application/pdf' });
     const r = await fetch(`${this.storageUrl}/object/bills/${path}`, {
-      method:'POST', headers: { 'apikey':this.key, 'Authorization':'Bearer '+this.key, 'x-upsert':'true' },
+      method:'POST', headers: { 'apikey':this.key, 'x-upsert':'true' },
       body: blob });
     if (r.ok) { doc._stashPath = path; return true; }
     return false;
@@ -3098,7 +3098,7 @@ const Cloud = {
   async deleteStash(doc){
     if (!doc || !doc._stashPath) return false;
     try { await fetch(`${this.storageUrl}/object/bills/${doc._stashPath}`,
-      { method:'DELETE', headers:{ 'apikey':this.key, 'Authorization':'Bearer '+this.key } }); } catch(_){}
+      { method:'DELETE', headers:{ 'apikey':this.key } }); } catch(_){}
     doc._stashPath = null; return true;
   },
   /* List EVERY file under a folder prefix in the bills bucket. The Supabase
@@ -3106,7 +3106,7 @@ const Cloud = {
      must paginate with offset until a short page comes back. Returns an array of
      full paths (prefix/name), excluding folder placeholders. */
   async listBillFiles(prefix){
-    const H = { apikey:this.key, Authorization:'Bearer '+this.key, 'Content-Type':'application/json' };
+    const H = { apikey:this.key, 'Content-Type':'application/json' };
     // Supabase lists the CONTENTS of a folder when the prefix ends in '/'. For a
     // subfolder we must pass 'review/' (not 'review'); for the root we pass ''.
     const listPrefix = prefix ? (prefix.endsWith('/') ? prefix : prefix + '/') : '';
@@ -7164,7 +7164,7 @@ window.wireReconcile = wireReconcile;
    NOT need review — i.e. proven/clean bills, or hashes not in the review set at
    all. Review bills keep their file. Returns {scanned, deleted, kept}. */
 async function cleanupOrphanFiles(){
-  const B = Cloud.storageUrl, H = { apikey: Cloud.key, Authorization: 'Bearer '+Cloud.key, 'Content-Type':'application/json' };
+  const B = Cloud.storageUrl, H = { apikey: Cloud.key, 'Content-Type':'application/json' };
   // Build the set of hashes that legitimately need a file: bills in the database
   // that need review (non-PROVEN verdict OR a blocking FAIL check), plus anything
   // in failed_uploads (those are review items by definition).
@@ -7223,7 +7223,7 @@ window.cleanupOrphanFiles = cleanupOrphanFiles;
    database (the reset). Both require the password before anything happens. */
 const DANGER_PW = 'Shan@4612';
 async function clearStoredFiles(){
-  const B = Cloud.storageUrl, H = { apikey: Cloud.key, Authorization: 'Bearer '+Cloud.key, 'Content-Type':'application/json' };
+  const B = Cloud.storageUrl, H = { apikey: Cloud.key, 'Content-Type':'application/json' };
   let total = 0;
   for (const prefix of ['', 'review', 'ocr-pending']) {
     let names = [];
@@ -7290,7 +7290,7 @@ $('#cloudDanger') && ($('#cloudDanger').onclick = () => {
 
 $('#cloudCountFiles') && ($('#cloudCountFiles').onclick = async () => {
   const btn = $('#cloudCountFiles'); btn.disabled = true; btn.textContent = 'Counting…';
-  const B = Cloud.storageUrl, H = { apikey: Cloud.key, Authorization: 'Bearer '+Cloud.key, 'Content-Type':'application/json' };
+  const B = Cloud.storageUrl, H = { apikey: Cloud.key, 'Content-Type':'application/json' };
   const lines = ['STORED FILES IN THE bills BUCKET', ''];
   let grand = 0;
   try {
@@ -8426,7 +8426,7 @@ async function saveBillEditor(){
       for (const k of CRIT) { if (k in patch && String(patch[k]) !== String(orig[k] ?? '')) { criticalChanged = true; break; } }
       const rfp = editorState.invoice.review_file_path;
       if (rfp && criticalChanged) { try { await fetch(`${Cloud.storageUrl}/object/bills/${rfp}`,
-        { method:'DELETE', headers:{ 'apikey':Cloud.key, 'Authorization':'Bearer '+Cloud.key } });
+        { method:'DELETE', headers:{ 'apikey':Cloud.key } });
         DIAG && DIAG.ok('system', `source file removed after critical edit: ${hash}`); } catch(_){} }
     }
 
