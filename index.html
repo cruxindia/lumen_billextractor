@@ -2670,7 +2670,37 @@ const Cloud = {
       agreement:  typeof a[field]==='number' ? a[field] : null }));
   },
 
+  /* Look up whether an invoice number already exists in the database. Returns
+     the existing row's {content_hash, invoice_no, source_file} or null. Used
+     to block duplicate invoice numbers that arrive as a DIFFERENT file (a
+     re-scan, a re-export, or an ingest from a different browser session) —
+     content_hash dedup only catches byte-identical re-uploads, not this. */
+  async findByInvoiceNo(normNo){
+    if (!normNo) return null;
+    try {
+      const r = await fetch(this.url + '/invoices?invoice_no_normalized=eq.' + encodeURIComponent(normNo)
+        + '&select=content_hash,invoice_no,source_file&limit=1', { headers: this.headers() });
+      if (!r.ok) return null;
+      const rows = await r.json();
+      return (rows && rows[0]) || null;
+    } catch(_){ return null; }   // a lookup failure never blocks a push — fail open
+  },
+
   async pushOne(doc){
+    // Duplicate-invoice-number guard: if this invoice number is already in the
+    // database under a DIFFERENT content_hash, this is a second file for a
+    // bill we already have — skip it rather than create a duplicate row.
+    const normNo = doc.invoice && doc.invoice.invoice_no_normalized;
+    if (normNo) {
+      const existing = await this.findByInvoiceNo(normNo);
+      if (existing && existing.content_hash && existing.content_hash !== doc.hash) {
+        if (typeof DIAG !== 'undefined') DIAG.warn('push',
+          `Skipped: invoice ${doc.invoice.invoice_no || normNo} already exists in the database as a different file`,
+          { existing_hash: existing.content_hash.slice(0,16), existing_source: existing.source_file, new_hash: doc.hash.slice(0,16), new_source: doc.filename });
+        doc._duplicateInvoiceNo = true;
+        return 'duplicate_invoice_no';
+      }
+    }
     const body = { p: this.invoiceRow(doc), lines: this.lineRows(doc),
                    chk: this.checkRows(doc), conf: this.confRows(doc) };
     const r = await fetch(this.url + '/rpc/sync_invoice', {
@@ -2687,6 +2717,35 @@ const Cloud = {
   _batchOk: null,   // null=unknown, true/false once probed
   async pushMany(docs, onProgress, chunkSize = 200, concurrency = 3){
     if (!docs || !docs.length) return { ok:0, fail:0 };
+
+    // Duplicate-invoice-number guard (bulk): one lookup per DISTINCT invoice
+    // number in this batch — not per file — so large ingests stay fast. Any
+    // doc whose invoice number already exists under a different content_hash
+    // is pulled out here, before it ever reaches the insert RPC. Marked
+    // _pushed=true so callers (e.g. autoSync) treat it as handled, not a
+    // failure to retry.
+    const self0 = this;
+    const uniqueNos = [...new Set(docs.map(d => d.invoice && d.invoice.invoice_no_normalized).filter(Boolean))];
+    const existingByNo = {};
+    await Promise.all(uniqueNos.map(async n => {
+      const row = await self0.findByInvoiceNo(n);
+      if (row) existingByNo[n] = row.content_hash;
+    }));
+    let blocked = 0;
+    docs = docs.filter(d => {
+      const n = d.invoice && d.invoice.invoice_no_normalized;
+      const existingHash = n && existingByNo[n];
+      if (existingHash && existingHash !== d.hash) {
+        d._duplicateInvoiceNo = true; d._pushed = true; blocked++;
+        if (typeof DIAG !== 'undefined') DIAG.warn('push',
+          `Skipped: invoice ${(d.invoice && d.invoice.invoice_no) || n} already exists in the database as a different file`,
+          { existing_hash: existingHash.slice(0,16), new_hash: d.hash.slice(0,16) });
+        return false;
+      }
+      return true;
+    });
+    if (!docs.length) return { ok: 0, fail: 0, blocked };
+
     const chunks = [];
     for (let i=0;i<docs.length;i+=chunkSize) chunks.push(docs.slice(i,i+chunkSize));
     let ok=0, fail=0, done=0;
@@ -2720,7 +2779,7 @@ const Cloud = {
     let next = 0;
     async function worker(){ while (next < chunks.length){ const c = chunks[next++]; await sendChunk(c); } }
     await Promise.all(Array.from({length: Math.min(concurrency, chunks.length)}, worker));
-    return { ok, fail };
+    return { ok, fail, blocked };
   },
 
   async pullAll(){
@@ -4269,8 +4328,13 @@ async function ingest(fileList){
           await Cloud.stashReviewFile(r);
         }
       } catch(_){}
-      await Cloud.pushOne(r);
-      r._pushed = true; pushedCount++;
+      const pushResult = await Cloud.pushOne(r);
+      r._pushed = true;
+      if (pushResult === 'duplicate_invoice_no') {
+        if (typeof Pipeline!=='undefined') Pipeline.stats.duplicateInvoiceNo = (Pipeline.stats.duplicateInvoiceNo||0) + 1;
+        return 'duplicate_invoice_no';
+      }
+      pushedCount++;
       if (typeof Pipeline!=='undefined') Pipeline.stats.pushed++;   // confirmed
       DIAG.info('push', `${wname}: saved ${r.filename}`, { worker:wid, invoice: r.invoice.invoice_no });
       return 'pushed';
@@ -4493,8 +4557,12 @@ async function runOcrPass(){
             await Cloud.stashReviewFile(d);
           } } catch(_){}
         }
-        await Cloud.pushOne(d); d._pushed = true;
-        Pipeline.stats.pushed++;   // confirmed only
+        const ocrPushResult = await Cloud.pushOne(d); d._pushed = true;
+        if (ocrPushResult === 'duplicate_invoice_no') {
+          Pipeline.stats.duplicateInvoiceNo = (Pipeline.stats.duplicateInvoiceNo||0) + 1;
+        } else {
+          Pipeline.stats.pushed++;   // confirmed only
+        }
       } catch(e){
         Pipeline.stats.saveFailed = (Pipeline.stats.saveFailed||0)+1;
         DIAG && DIAG.error('push', `OCR bill save FAILED: ${d.filename}`, { reason:e.message });
@@ -4820,19 +4888,22 @@ async function autoSync(docs){
   // BATCHED push — 200 bills per request, a few requests in flight. Scales to
   // Lakhs. Falls back to one-by-one automatically if the batch RPC isn't
   // installed yet.
-  const { ok, fail } = await Cloud.pushMany(toPush, (done,total)=>{
+  const { ok, fail, blocked } = await Cloud.pushMany(toPush, (done,total)=>{
     setCloud(`Saving ${done} of ${total} to database…`, 'dim');
   });
   // any that failed even after batching: keep them for Review, don't lose them
+  // (docs blocked as duplicate invoice numbers are marked _pushed already, so
+  // they're excluded here — they were skipped on purpose, not a failure)
   const failedDocs = toPush.filter(d => !d._pushed);
   for (const d of failedDocs){
     try { if (d._pdfBuf || d._sourceBlob) await Cloud.saveFailedBill(d, 'Push failed during batch save');
       else await Cloud.saveFailedBill(d, 'Push failed during batch save (no file)'); } catch(_){}
   }
-  if (fail || failedDocs.length) { setCloud(`Saved ${ok}, ${fail} failed`, 'er');
+  const blockedNote = blocked ? ` · ${blocked} skipped (duplicate invoice no.)` : '';
+  if (fail || failedDocs.length) { setCloud(`Saved ${ok}, ${fail} failed${blockedNote}`, 'er');
     log(`${fail} document(s) could not be saved — kept in Review to retry.`, 'er');
     try { window.failedBills = await Cloud.fetchFailed(); renderReview(); } catch(_){} }
-  else setCloud(`All ${ok} saved to the database`, 'ok');
+  else setCloud(`All ${ok} saved to the database${blockedNote}`, 'ok');
   // refresh the MIS pull so Report/Review reflect the new data immediately
   try { if (window.misRows !== null) { window.misRows = null; if(window.__misSource==='database') await setMisSource('database'); } } catch(_){}
   renderReview();
@@ -8415,19 +8486,15 @@ async function saveBillEditor(){
       await Cloud.updateOne(hash, patch);
       await Cloud.replaceLines(hash, editorState.lines);
       await Cloud.markVerified(hash);
-      // Delete the stored SOURCE FILE only when a CRITICAL field changed
-      // (amounts, customer/applicant names, services) — not for basic-detail
-      // edits. The bill's DATA always stays in the database (zero data loss);
-      // only the original upload is removed to free storage once it's done its job.
-      const CRIT = ['taxable_paise','tax_total_paise','total_paise','cgst_paise','sgst_paise','igst_paise',
-                    'client_raw','branch_raw','service_type'];
-      const orig = editorState.__original || {};
-      let criticalChanged = editorState.__linesChanged === true;   // applicant/line edits are critical
-      for (const k of CRIT) { if (k in patch && String(patch[k]) !== String(orig[k] ?? '')) { criticalChanged = true; break; } }
+      // Delete the stored SOURCE FILE (PDF/Excel) whenever a review save/update
+      // completes, if one exists. The bill's DATA always stays in the database
+      // (zero data loss) — only the original uploaded file is removed from
+      // Storage, since the bill has now been reviewed and verified and the
+      // file has done its job.
       const rfp = editorState.invoice.review_file_path;
-      if (rfp && criticalChanged) { try { await fetch(`${Cloud.storageUrl}/object/bills/${rfp}`,
+      if (rfp) { try { await fetch(`${Cloud.storageUrl}/object/bills/${rfp}`,
         { method:'DELETE', headers:{ 'apikey':Cloud.key } });
-        DIAG && DIAG.ok('system', `source file removed after critical edit: ${hash}`); } catch(_){} }
+        DIAG && DIAG.ok('system', `source file removed after review save: ${hash}`); } catch(_){} }
     }
 
     // update local state so it drops out of Review immediately
